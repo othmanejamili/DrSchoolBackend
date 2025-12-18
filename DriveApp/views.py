@@ -1723,3 +1723,527 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         return distribution
 
         
+class VehicleViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing vehicles in driving schools.
+    
+    Access Control:
+    - Platform Admins (A + is_staff): Full access to all vehicles
+    - School Owners (A): Manage vehicles in their schools
+    - Instructors (I): View vehicles in their school
+    - Students (S): View vehicles in their school (read-only)
+    """
+    serializer_class = VehicleSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['school', 'status', 'transmission', 'make', 'year']
+    search_fields = ['school__name', 'make', 'model', 'color', 'plate_number']
+    ordering_fields = ['year', 'created_at', 'next_maintenance', 'make', 'model']
+    ordering = ['-created_at']
+
+    def get_queryset(self):
+        """
+        Filter vehicles based on user role and school association.
+        Multi-tenancy: Users only see vehicles from their own school.
+        """
+        user = self.request.user
+        if not user.is_authenticated:
+            return Vehicle.objects.none()
+        
+        # Platform Admin (staff) sees all vehicles
+        if user.role == 'A' and user.is_staff:
+            queryset = Vehicle.objects.all()
+        
+        # School Owner sees vehicles in their schools
+        elif user.role == 'A' and not user.is_staff:
+            queryset = Vehicle.objects.filter(school__owner=user)
+        
+        # Instructor sees vehicles in their school
+        elif user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                queryset = Vehicle.objects.filter(school=instructor_profile.school)
+            else:
+                queryset = Vehicle.objects.none()
+        
+        # Student sees vehicles in their school
+        elif user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                queryset = Vehicle.objects.filter(school=student_profile.school)
+            else:
+                queryset = Vehicle.objects.none()
+        
+        else:
+            queryset = Vehicle.objects.none()
+        
+        # Prefetch related data for performance
+        return queryset.select_related('school').prefetch_related('pictures')
+
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action == 'create':
+            # Only platform admins and school owners can add vehicles
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['update', 'partial_update']:
+            # Platform admins, school owners, and instructors can update
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action == 'destroy':
+            # Only platform admins and school owners can delete
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['upload_pictures', 'delete_picture', 'set_primary_picture']:
+            # Image management: admins, owners, instructors
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['schedule_maintenance', 'complete_maintenance']:
+            # Maintenance: admins, owners, instructors
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        return [IsAuthenticated()]
+
+    def get_serializer_context(self):
+        """Add request to serializer context"""
+        context = super().get_serializer_context()
+        
+        # Control image loading for list view (optimization)
+        if self.action == 'list':
+            context['include_images'] = self.request.query_params.get('include_images', 'false').lower() == 'true'
+        else:
+            context['include_images'] = True
+        
+        return context
+
+    def perform_create(self, serializer):
+        """Create vehicle with permission checks"""
+        user = self.request.user
+        school = serializer.validated_data.get('school')
+        
+        # Platform admin can create for any school
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+
+        # School owner can only create for their own schools
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only add vehicles to your own schools")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to create vehicles")
+
+    def perform_update(self, serializer):
+        """Update vehicle with permission checks"""
+        user = self.request.user
+        instance = self.get_object()
+
+        # Platform admin can update any vehicle
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+
+        # School owner can update vehicles in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.school.owner != user:
+                raise PermissionDenied("You can only update vehicles in your own schools")
+            serializer.save()
+            return
+        
+        # Instructor can update vehicles in their school (limited fields)
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != instance.school:
+                raise PermissionDenied("You can only update vehicles in your school")
+            
+            # Instructors can only update status and maintenance dates
+            allowed_fields = {'status', 'last_maintenance', 'next_maintenance'}
+            requested_fields = set(serializer.validated_data.keys())
+            
+            if not requested_fields.issubset(allowed_fields):
+                raise PermissionDenied(f"Instructors can only update: {', '.join(allowed_fields)}")
+            
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to update this vehicle")
+
+    def perform_destroy(self, instance):
+        """Delete vehicle with permission checks"""
+        user = self.request.user
+
+        # Platform admin can delete any vehicle
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+
+        # School owner can delete vehicles in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.school.owner != user:
+                raise PermissionDenied("You can only delete vehicles in your own schools")
+            instance.delete()
+            return
+        
+        raise PermissionDenied("You don't have permission to delete this vehicle")
+
+    # ==================== CUSTOM ACTIONS ====================
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def pictures(self, request, pk=None):
+        """Get all pictures for a vehicle"""
+        vehicle = self.get_object()
+        pictures = vehicle.pictures.all()
+        serializer = VehiclePictureSerializer(pictures, many=True, context={'request': request})
+        
+        return Response({
+            'vehicle': {
+                'id': vehicle.id,
+                'plate_number': vehicle.plate_number,
+                'make': vehicle.make,
+                'model': vehicle.model
+            },
+            'total_pictures': pictures.count(),
+            'pictures': serializer.data
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def upload_pictures(self, request, pk=None):
+        """
+        Upload multiple pictures for a vehicle
+        POST /api/vehicles/{id}/upload_pictures/
+        Body: multipart/form-data with 'images' field containing files
+        """
+        vehicle = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if not VehicleService.can_modify_vehicle(user, vehicle):
+            raise PermissionDenied("You don't have permission to upload pictures for this vehicle")
+        
+        # Get uploaded files
+        images = request.FILES.getlist('images')
+        
+        if not images:
+            return Response(
+                {'error': 'No images provided. Please upload at least one image.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate images
+        is_valid, error = VehicleService.validate_multiple_images(images, vehicle)
+        if not is_valid:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get captions if provided
+        captions = request.data.getlist('captions', [])
+        
+        # Upload images
+        uploaded_pictures = []
+        current_count = vehicle.pictures.count()
+        has_primary = vehicle.pictures.filter(is_primary=True).exists()
+        
+        for idx, image in enumerate(images):
+            # Validate individual image
+            is_valid, error = VehicleService.validate_image_file(image)
+            if not is_valid:
+                return Response(
+                    {'error': f'Image {idx + 1}: {error}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create picture
+            caption = captions[idx] if idx < len(captions) else f"Image {current_count + idx + 1}"
+            
+            picture = VehiclePicture.objects.create(
+                vehicle=vehicle,
+                image=image,
+                caption=caption,
+                is_primary=(not has_primary and idx == 0),
+                uploaded_by=user
+            )
+            uploaded_pictures.append(picture)
+        
+        # Serialize and return
+        serializer = VehiclePictureSerializer(uploaded_pictures, many=True, context={'request': request})
+        
+        return Response({
+            'message': f'Successfully uploaded {len(uploaded_pictures)} images',
+            'pictures': serializer.data
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['delete'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def delete_picture(self, request, pk=None):
+        """
+        Delete a specific picture
+        DELETE /api/vehicles/{id}/delete_picture/?picture_id=123
+        """
+        vehicle = self.get_object()
+        picture_id = request.query_params.get('picture_id')
+        
+        if not picture_id:
+            return Response(
+                {'error': 'picture_id query parameter is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        success, message = VehicleService.delete_picture(vehicle, picture_id, request.user)
+        
+        if success:
+            return Response({'message': message}, status=status.HTTP_200_OK)
+        else:
+            return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def set_primary_picture(self, request, pk=None):
+        """
+        Set a picture as primary
+        POST /api/vehicles/{id}/set_primary_picture/
+        Body: {"picture_id": 123}
+        """
+        vehicle = self.get_object()
+        picture_id = request.data.get('picture_id')
+        
+        if not picture_id:
+            return Response(
+                {'error': 'picture_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check permissions
+        if not VehicleService.can_modify_vehicle(request.user, vehicle):
+            raise PermissionDenied("You don't have permission to modify this vehicle")
+        
+        success, message = VehicleService.set_primary_picture(vehicle, picture_id)#this line it's make a problem 
+        
+        if success:
+            return Response({'message': message}, status=status.HTTP_200_OK)
+        else:
+            return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def available(self, request):
+        """
+        Get all available vehicles for the user's school
+        GET /api/vehicles/available/
+        """
+        queryset = self.get_queryset().filter(status='available')
+        
+        # Apply additional filters if provided
+        date = request.query_params.get('date')  # Future: check schedule conflicts
+        transmission = request.query_params.get('transmission')
+        
+        if transmission:
+            queryset = queryset.filter(transmission=transmission)
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def maintenance_due(self, request):
+        """
+        Get vehicles that need maintenance soon (within 30 days)
+        GET /api/vehicles/maintenance_due/
+        """
+        user = request.user
+        today = timezone.now().date()
+        threshold_date = today + timedelta(days=30)
+        
+        queryset = self.get_queryset().filter(
+            Q(next_maintenance__lte=threshold_date, next_maintenance__gte=today) |
+            Q(next_maintenance__lt=today)  # Overdue
+        ).order_by('next_maintenance')
+        
+        # Categorize
+        overdue = queryset.filter(next_maintenance__lt=today)
+        upcoming = queryset.filter(next_maintenance__gte=today, next_maintenance__lte=threshold_date)
+        
+        return Response({
+            'overdue': {
+                'count': overdue.count(),
+                'vehicles': self.get_serializer(overdue, many=True).data
+            },
+            'upcoming': {
+                'count': upcoming.count(),
+                'vehicles': self.get_serializer(upcoming, many=True).data
+            }
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def schedule_maintenance(self, request, pk=None):
+        """
+        Schedule maintenance for a vehicle
+        POST /api/vehicles/{id}/schedule_maintenance/
+        Body: {"next_maintenance": "2024-12-31"}
+        """
+        vehicle = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if not VehicleService.can_modify_vehicle(user, vehicle):
+            raise PermissionDenied("You don't have permission to schedule maintenance")
+        
+        next_maintenance = request.data.get('next_maintenance')
+        notes = request.data.get('notes', '')
+        
+        if not next_maintenance:
+            return Response(
+                {'error': 'next_maintenance date is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update vehicle
+        vehicle.status = 'maintenance'
+        vehicle.next_maintenance = next_maintenance
+        vehicle.save()
+        
+        serializer = self.get_serializer(vehicle)
+        return Response({
+            'message': 'Maintenance scheduled successfully',
+            'vehicle': serializer.data
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def complete_maintenance(self, request, pk=None):
+        """
+        Mark maintenance as completed
+        POST /api/vehicles/{id}/complete_maintenance/
+        Body: {"next_maintenance": "2025-06-30"} (optional)
+        """
+        vehicle = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if not VehicleService.can_modify_vehicle(user, vehicle):
+            raise PermissionDenied("You don't have permission to complete maintenance")
+        
+        # Update vehicle
+        vehicle.status = 'available'
+        vehicle.last_maintenance = timezone.now().date()
+        
+        # Set next maintenance if provided
+        next_maintenance = request.data.get('next_maintenance')
+        if next_maintenance:
+            vehicle.next_maintenance = next_maintenance
+        
+        vehicle.save()
+        
+        serializer = self.get_serializer(vehicle)
+        return Response({
+            'message': 'Maintenance completed successfully',
+            'vehicle': serializer.data
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def statistics(self, request):
+        """
+        Get vehicle statistics for the user's accessible schools
+        GET /api/vehicles/statistics/
+        """
+        queryset = self.get_queryset()
+        
+        total = queryset.count()
+        by_status = dict(queryset.values('status').annotate(count=Count('id')).values_list('status', 'count'))
+        by_transmission = dict(queryset.values('transmission').annotate(count=Count('id')).values_list('transmission', 'count'))
+        
+        # Average age
+        current_year = timezone.now().year
+        ages = [current_year - v.year for v in queryset]
+        avg_age = sum(ages) / len(ages) if ages else 0
+        
+        # Maintenance stats
+        today = timezone.now().date()
+        overdue_maintenance = queryset.filter(next_maintenance__lt=today).count()
+        upcoming_maintenance = queryset.filter(
+            next_maintenance__gte=today,
+            next_maintenance__lte=today + timedelta(days=30)
+        ).count()
+        
+        return Response({
+            'total_vehicles': total,
+            'by_status': by_status,
+            'by_transmission': by_transmission,
+            'average_age': round(avg_age, 1),
+            'maintenance': {
+                'overdue': overdue_maintenance,
+                'upcoming_30_days': upcoming_maintenance
+            }
+        })
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def history(self, request, pk=None):
+        """
+        Get vehicle usage history (lessons/schedules)
+        GET /api/vehicles/{id}/history/
+        """
+        vehicle = self.get_object()
+        
+        # Get schedules for this vehicle
+        from .models import Schedule
+        schedules = Schedule.objects.filter(vehicle=vehicle).select_related(
+            'lesson__instructor', 'instructor'
+        ).order_by('-start_time')[:20]
+        
+        from .serializers import ScheduleSerializer
+        schedule_data = ScheduleSerializer(schedules, many=True, context={'request': request}).data
+        
+        return Response({
+            'vehicle': {
+                'id': vehicle.id,
+                'plate_number': vehicle.plate_number,
+                'make': vehicle.make,
+                'model': vehicle.model
+            },
+            'total_lessons': schedules.count(),
+            'recent_lessons': schedule_data
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_school_vehicles(self, request):
+        """Get vehicles in current user's school (shortcut endpoint)"""
+        user = request.user
+        
+        # Handle different user types
+        if user.role == 'A' and user.is_staff:
+            # Platform admin sees all vehicles
+            queryset = self.get_queryset()
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner sees vehicles in their schools
+            queryset = self.get_queryset().filter(school__owner=user)
+        
+        elif user.role in ['I', 'S']:
+            # Instructor/Student - get their school via profile
+            profile = user.student_profiles.filter(status='A').first()
+            if not profile:
+                return Response(
+                    {'error': 'You are not associated with any active school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            queryset = self.get_queryset().filter(school=profile.school)
+        
+        else:
+            return Response(
+                {'error': 'Invalid user role'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+        
