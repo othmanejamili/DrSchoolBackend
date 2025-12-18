@@ -1723,9 +1723,10 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         return distribution
 
 
-#This Viehicle viiew
+#DSS-8-create-Vehicle-views
 class VehicleViewSet(viewsets.ModelViewSet):
     """
+    DSS-8-create-Vehicle-views
     ViewSet for managing vehicles in driving schools.
     
     Access Control:
