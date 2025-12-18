@@ -1722,7 +1722,8 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         
         return distribution
 
-        
+
+#This Viehicle viiew
 class VehicleViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing vehicles in driving schools.
@@ -1733,6 +1734,7 @@ class VehicleViewSet(viewsets.ModelViewSet):
     - Instructors (I): View vehicles in their school
     - Students (S): View vehicles in their school (read-only)
     """
+    
     serializer_class = VehicleSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     filterset_fields = ['school', 'status', 'transmission', 'make', 'year']
