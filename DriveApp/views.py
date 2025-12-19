@@ -21,6 +21,9 @@ from django.db import transaction
 from .services import StudentProfileService, LessonService, AttendanceService, VehicleService
 from django.db.models import Avg, Sum
 from django_filters.rest_framework import DjangoFilterBackend 
+from datetime import datetime
+from rest_framework.pagination import PageNumberPagination
+
 User = get_user_model()
 
 
@@ -1722,7 +1725,6 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         
         return distribution
 
-
 #DSS-8-create-Vehicle-views
 class VehicleViewSet(viewsets.ModelViewSet):
     """
@@ -2249,4 +2251,914 @@ class VehicleViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
+#DSS-8-create-schedule-views
+
+class ScheduleViewSet(viewsets.ModelViewSet):
+    serializer_class = ScheduleSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['vehicle', 'instructor', 'lesson__school', 'lesson__status']
+    search_fields = ['vehicle__plate_number', 'instructor__username', 'lesson__title', 'start_time']
+    ordering_fields = ['start_time', 'end_time', 'lesson__title']
+    ordering = ['start_time']  # Changed to ascending for better UX
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return Schedule.objects.none()
         
+        # Platform Admin (staff) sees all schedules
+        if user.role == 'A' and user.is_staff:
+            return Schedule.objects.all().select_related(
+                'lesson', 'lesson__school', 'lesson__instructor',
+                'vehicle', 'instructor'
+            )
+        
+        # School Owner (admin but not staff) sees schedules in their schools
+        if user.role == 'A' and not user.is_staff:
+            return Schedule.objects.filter(
+                lesson__school__owner=user
+            ).select_related(
+                'lesson', 'lesson__school', 'lesson__instructor',
+                'vehicle', 'instructor'
+            )
+        
+        # Instructor sees their own schedules
+        if user.role == 'I':
+            return Schedule.objects.filter(
+                instructor=user
+            ).select_related(
+                'lesson', 'lesson__school', 'vehicle'
+            )
+        
+        # Student sees schedules in their school
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                return Schedule.objects.filter(
+                    lesson__school=student_profile.school
+                ).select_related(
+                    'lesson', 'lesson__instructor', 'vehicle', 'instructor'
+                )
+        
+        return Schedule.objects.none()
+    
+    def get_permissions(self):
+        if self.action == 'create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['cancel_schedule', 'reschedule']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['check_conflicts', 'my_schedule', 'upcoming', 
+                            'instructor_availability', 'vehicle_availability']:
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """Create schedule with validation"""
+        user = self.request.user
+        lesson = serializer.validated_data.get('lesson')
+        instructor = serializer.validated_data.get('instructor')
+        vehicle = serializer.validated_data.get('vehicle')
+        start_time = serializer.validated_data.get('start_time')
+        end_time = serializer.validated_data.get('end_time')
+
+        # Validate time slot
+        if end_time <= start_time:
+            raise PermissionDenied("End time must be after start time")
+
+        if start_time < timezone.now():
+            raise PermissionDenied("Cannot schedule in the past")
+
+        # Check scheduling conflicts
+        conflicts = self._check_scheduling_conflicts(
+            instructor, vehicle, start_time, end_time
+        )
+        if conflicts:
+            raise PermissionDenied(f"Scheduling conflict: {conflicts}")
+
+        # Platform admin can create for any school
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+
+        # School owner can create for their schools
+        if user.role == 'A' and not user.is_staff:
+            if lesson.school.owner != user:
+                raise PermissionDenied("You can only create schedules in your own school!")
+            
+            # Verify instructor belongs to school
+            if instructor and not instructor.student_profiles.filter(
+                school=lesson.school, status='A'
+            ).exists():
+                raise PermissionDenied("Instructor is not assigned to this school")
+            
+            # Verify vehicle belongs to school
+            if vehicle and vehicle.school != lesson.school:
+                raise PermissionDenied("Vehicle does not belong to this school")
+            
+            serializer.save()
+            return 
+        
+        raise PermissionDenied("You don't have permission to create schedules!")
+    
+    def perform_update(self, serializer):
+        """Update schedule with permission checks"""
+        user = self.request.user
+        instance = self.get_object()
+        lesson = serializer.validated_data.get('lesson', instance.lesson)
+        
+        # Prevent lesson change
+        if 'lesson' in serializer.validated_data and serializer.validated_data['lesson'] != instance.lesson:
+            raise PermissionDenied("Cannot change the lesson of an existing schedule")
+
+        # Platform admin can update any schedule
+        if user.role == 'A' and user.is_staff:
+            # Check for conflicts if time is changing
+            if any(field in serializer.validated_data for field in ['start_time', 'end_time', 'instructor', 'vehicle']):
+                conflicts = self._check_scheduling_conflicts(
+                    serializer.validated_data.get('instructor', instance.instructor),
+                    serializer.validated_data.get('vehicle', instance.vehicle),
+                    serializer.validated_data.get('start_time', instance.start_time),
+                    serializer.validated_data.get('end_time', instance.end_time),
+                    exclude_id=instance.id
+                )
+                if conflicts:
+                    raise PermissionDenied(f"Scheduling conflict: {conflicts}")
+            serializer.save()
+            return 
+        
+        # School owner can update schedules in their schools
+        if user.role == 'A' and not user.is_staff:
+            if lesson.school.owner != user:
+                raise PermissionDenied("You can only update schedules in your own school!")
+            
+            # Check for conflicts
+            if any(field in serializer.validated_data for field in ['start_time', 'end_time', 'instructor', 'vehicle']):
+                conflicts = self._check_scheduling_conflicts(
+                    serializer.validated_data.get('instructor', instance.instructor),
+                    serializer.validated_data.get('vehicle', instance.vehicle),
+                    serializer.validated_data.get('start_time', instance.start_time),
+                    serializer.validated_data.get('end_time', instance.end_time),
+                    exclude_id=instance.id
+                )
+                if conflicts:
+                    raise PermissionDenied(f"Scheduling conflict: {conflicts}")
+            serializer.save()
+            return 
+        
+        raise PermissionDenied("You don't have permission to update this schedule!!")
+        
+    def perform_destroy(self, instance):
+        """Delete schedule with permission checks"""
+        user = self.request.user
+        lesson = instance.lesson
+
+        # Prevent deleting schedules in the past
+        if instance.start_time < timezone.now():
+            raise PermissionDenied("Cannot delete past schedules")
+
+        # Platform admin can delete any schedule
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+
+        # School owner can delete schedules in their schools
+        if user.role == 'A' and not user.is_staff:
+            if lesson.school.owner != user:
+                raise PermissionDenied("You can only delete schedules in your own school")
+            instance.delete()
+            return 
+        
+        raise PermissionDenied("You don't have permission to delete this schedule!!")
+    
+    # ==================== HELPER METHODS ====================
+    
+    def _check_scheduling_conflicts(self, instructor, vehicle, start_time, end_time, exclude_id=None):
+        """Check for scheduling conflicts"""
+        buffer_minutes = 15  # 15 minutes buffer between lessons
+        buffer_time = timedelta(minutes=buffer_minutes)
+        
+        conflicts = []
+        
+        # Check instructor conflicts
+        if instructor:
+            instructor_query = Schedule.objects.filter(
+                instructor=instructor,
+                start_time__lt=end_time + buffer_time,
+                end_time__gt=start_time - buffer_time
+            )
+            
+            if exclude_id:
+                instructor_query = instructor_query.exclude(id=exclude_id)
+            
+            if instructor_query.exists():
+                conflict = instructor_query.first()
+                conflicts.append(f"Instructor busy from {conflict.start_time} to {conflict.end_time}")
+        
+        # Check vehicle conflicts
+        if vehicle:
+            vehicle_query = Schedule.objects.filter(
+                vehicle=vehicle,
+                start_time__lt=end_time + buffer_time,
+                end_time__gt=start_time - buffer_time
+            )
+            
+            if exclude_id:
+                vehicle_query = vehicle_query.exclude(id=exclude_id)
+            
+            if vehicle_query.exists():
+                conflict = vehicle_query.first()
+                conflicts.append(f"Vehicle booked from {conflict.start_time} to {conflict.end_time}")
+        
+        return "; ".join(conflicts) if conflicts else None
+    
+    # ==================== CUSTOM ACTIONS ====================
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_schedule(self, request):
+        """Get schedules for the authenticated user"""
+        user = request.user
+        queryset = self.get_queryset()
+        
+        # Get query parameters
+        range_filter = request.query_params.get('range', 'upcoming').lower()
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        include_past = request.query_params.get('include_past', 'false').lower() == 'true'
+        status_filter = request.query_params.get('status')
+        limit = int(request.query_params.get('limit', 50))
+        ordering = request.query_params.get('ordering', 'start_time')
+        
+        # Validate ordering
+        if ordering not in ['start_time', '-start_time']:
+            ordering = 'start_time'
+        
+        # Apply date filtering
+        now = timezone.now()
+        
+        if date_from or date_to:
+            # Use explicit date range
+            try:
+                if date_from:
+                    date_from_dt = datetime.strptime(date_from, '%Y-%m-%d').date()
+                    date_from_dt = timezone.make_aware(datetime.combine(date_from_dt, datetime.min.time()))
+                    queryset = queryset.filter(start_time__gte=date_from_dt)
+                
+                if date_to:
+                    date_to_dt = datetime.strptime(date_to, '%Y-%m-%d').date()
+                    date_to_dt = timezone.make_aware(datetime.combine(date_to_dt, datetime.max.time()))
+                    queryset = queryset.filter(start_time__lte=date_to_dt)
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            # Apply range-based filtering
+            if range_filter == 'today':
+                today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                today_end = today_start + timedelta(days=1)
+                queryset = queryset.filter(start_time__range=[today_start, today_end])
+            
+            elif range_filter == 'week':
+                week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                week_end = week_start + timedelta(days=7)
+                queryset = queryset.filter(start_time__range=[week_start, week_end])
+            
+            elif range_filter == 'month':
+                month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                if month_start.month == 12:
+                    month_end = month_start.replace(year=month_start.year + 1, month=1)
+                else:
+                    month_end = month_start.replace(month=month_start.month + 1)
+                queryset = queryset.filter(start_time__range=[month_start, month_end])
+            
+            elif range_filter == 'upcoming':
+                # Default: upcoming schedules only
+                queryset = queryset.filter(start_time__gte=now)
+            else:
+                return Response(
+                    {'error': 'Invalid range parameter. Use: today, week, month, or upcoming'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Filter out past schedules unless explicitly requested
+        if not include_past and not (date_from or date_to or range_filter):
+            queryset = queryset.filter(start_time__gte=now)
+        
+        # Apply status filter
+        if status_filter:
+            queryset = queryset.filter(lesson__status=status_filter)
+        
+        # Apply ordering
+        queryset = queryset.order_by(ordering)
+        
+        # Apply limit
+        if limit > 0:
+            queryset = queryset[:limit]
+        
+        # Prefetch related data
+        queryset = queryset.select_related(
+            'lesson__instructor',
+            'lesson__school',
+            'vehicle',
+            'instructor'
+        )
+        
+        # Serialize data
+        serializer = ScheduleSerializer(queryset, many=True, context={'request': request})
+        
+        # Calculate summary statistics
+        total_schedules = queryset.count()
+        completed = queryset.filter(lesson__status='C').count()
+        cancelled = queryset.filter(lesson__status='X').count()  # Assuming 'X' for cancelled
+        scheduled = queryset.filter(lesson__status='S').count()
+        
+        # For instructors: calculate workload hours
+        workload_hours = 0
+        if user.role == 'I':
+            instructor_schedules = queryset.filter(instructor=user)
+            for schedule in instructor_schedules:
+                if schedule.end_time and schedule.start_time:
+                    duration = schedule.end_time - schedule.start_time
+                    workload_hours += duration.total_seconds() / 3600
+        
+        response_data = {
+            'summary': {
+                'total_schedules': total_schedules,
+                'completed': completed,
+                'cancelled': cancelled,
+                'scheduled': scheduled,
+                'user_role': user.role,
+                'date_range_applied': {
+                    'range': range_filter,
+                    'date_from': date_from,
+                    'date_to': date_to,
+                    'include_past': include_past
+                }
+            },
+            'schedules': serializer.data
+        }
+        
+        # Add role-specific stats
+        if user.role == 'I':
+            response_data['summary']['workload_hours'] = round(workload_hours, 2)
+            response_data['summary']['schedules_count'] = queryset.filter(instructor=user).count()
+        
+        # Add next important schedule
+        if total_schedules > 0:
+            next_schedule = queryset.filter(start_time__gte=now).order_by('start_time').first()
+            if next_schedule:
+                response_data['next_schedule'] = {
+                    'id': next_schedule.id,
+                    'title': next_schedule.lesson.title if next_schedule.lesson else 'No title',
+                    'start_time': next_schedule.start_time,
+                    'instructor': next_schedule.instructor.get_full_name() or next_schedule.instructor.username,
+                    'location': next_schedule.lesson.school.name if next_schedule.lesson and next_schedule.lesson.school else 'Not specified'
+                }
+        
+        return Response(response_data)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def check_conflicts(self, request):
+        """Check for scheduling conflicts"""
+        instructor_id = request.data.get('instructor_id')
+        vehicle_id = request.data.get('vehicle_id')
+        start_time_str = request.data.get('start_time')
+        end_time_str = request.data.get('end_time')
+        exclude_schedule_id = request.data.get('exclude_schedule_id')
+        
+        # Validate required fields
+        if not start_time_str or not end_time_str:
+            return Response(
+                {'error': 'start_time and end_time are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            start_time = timezone.make_aware(datetime.fromisoformat(start_time_str))
+            end_time = timezone.make_aware(datetime.fromisoformat(end_time_str))
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate time slot
+        if end_time <= start_time:
+            return Response(
+                {'error': 'End time must be after start time'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get objects
+        instructor = None
+        vehicle = None
+        
+        if instructor_id:
+            try:
+                from .models import User
+                instructor = User.objects.get(id=instructor_id, role='I')
+            except User.DoesNotExist:
+                return Response(
+                    {'error': 'Instructor not found'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if vehicle_id:
+            try:
+                vehicle = Vehicle.objects.get(id=vehicle_id)
+            except Vehicle.DoesNotExist:
+                return Response(
+                    {'error': 'Vehicle not found'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Check conflicts
+        conflicts = []
+        buffer_minutes = 15
+        buffer_time = timedelta(minutes=buffer_minutes)
+        
+        # Check instructor conflicts
+        if instructor:
+            instructor_query = Schedule.objects.filter(
+                instructor=instructor,
+                start_time__lt=end_time + buffer_time,
+                end_time__gt=start_time - buffer_time
+            )
+            
+            if exclude_schedule_id:
+                instructor_query = instructor_query.exclude(id=exclude_schedule_id)
+            
+            if instructor_query.exists():
+                for conflict in instructor_query:
+                    conflicts.append({
+                        'type': 'instructor',
+                        'schedule_id': conflict.id,
+                        'start_time': conflict.start_time,
+                        'end_time': conflict.end_time,
+                        'lesson_title': conflict.lesson.title if conflict.lesson else 'No title'
+                    })
+        
+        # Check vehicle conflicts
+        if vehicle:
+            vehicle_query = Schedule.objects.filter(
+                vehicle=vehicle,
+                start_time__lt=end_time + buffer_time,
+                end_time__gt=start_time - buffer_time
+            )
+            
+            if exclude_schedule_id:
+                vehicle_query = vehicle_query.exclude(id=exclude_schedule_id)
+            
+            if vehicle_query.exists():
+                for conflict in vehicle_query:
+                    conflicts.append({
+                        'type': 'vehicle',
+                        'schedule_id': conflict.id,
+                        'start_time': conflict.start_time,
+                        'end_time': conflict.end_time,
+                        'lesson_title': conflict.lesson.title if conflict.lesson else 'No title'
+                    })
+        
+        return Response({
+            'has_conflicts': len(conflicts) > 0,
+            'conflicts': conflicts,
+            'available': len(conflicts) == 0,
+            'time_slot': {
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration_minutes': (end_time - start_time).total_seconds() / 60
+            }
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def instructor_availability(self, request):
+        """Get available time slots for an instructor"""
+        instructor_id = request.query_params.get('instructor_id')
+        date_str = request.query_params.get('date')
+        duration_minutes = int(request.query_params.get('duration', 60))
+        
+        if not instructor_id or not date_str:
+            return Response(
+                {'error': 'instructor_id and date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            from .models import User
+            instructor = User.objects.get(id=instructor_id, role='I')
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'Instructor not found'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            date_start = timezone.make_aware(datetime.combine(date_obj, datetime.min.time()))
+            date_end = timezone.make_aware(datetime.combine(date_obj, datetime.max.time()))
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get instructor's schedules for the day
+        schedules = Schedule.objects.filter(
+            instructor=instructor,
+            start_time__date=date_obj
+        ).order_by('start_time')
+        
+        # Define working hours (8 AM to 6 PM)
+        working_start = date_start.replace(hour=8, minute=0, second=0, microsecond=0)
+        working_end = date_start.replace(hour=18, minute=0, second=0, microsecond=0)
+        
+        # Generate time slots
+        slot_duration = timedelta(minutes=duration_minutes)
+        buffer = timedelta(minutes=15)  # Buffer between lessons
+        available_slots = []
+        
+        current_time = working_start
+        while current_time + slot_duration <= working_end:
+            slot_end = current_time + slot_duration
+            
+            # Check if this slot conflicts with existing schedules
+            conflict = False
+            for schedule in schedules:
+                schedule_start = schedule.start_time
+                schedule_end = schedule.end_time
+                
+                # Check for overlap (with buffer)
+                if (current_time < schedule_end + buffer and 
+                    slot_end > schedule_start - buffer):
+                    conflict = True
+                    break
+            
+            if not conflict:
+                available_slots.append({
+                    'start_time': current_time,
+                    'end_time': slot_end,
+                    'duration_minutes': duration_minutes
+                })
+            
+            # Move to next slot (30-minute increments)
+            current_time += timedelta(minutes=30)
+        
+        return Response({
+            'instructor': {
+                'id': instructor.id,
+                'name': instructor.get_full_name() or instructor.username
+            },
+            'date': date_obj,
+            'working_hours': {
+                'start': working_start.time(),
+                'end': working_end.time()
+            },
+            'scheduled_lessons': ScheduleSerializer(schedules, many=True).data,
+            'available_slots': available_slots,
+            'total_available_slots': len(available_slots)
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def vehicle_availability(self, request):
+        """Get available time slots for a vehicle"""
+        vehicle_id = request.query_params.get('vehicle_id')
+        date_str = request.query_params.get('date')
+        duration_minutes = int(request.query_params.get('duration', 60))
+        
+        if not vehicle_id or not date_str:
+            return Response(
+                {'error': 'vehicle_id and date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            vehicle = Vehicle.objects.get(id=vehicle_id)
+        except Vehicle.DoesNotExist:
+            return Response(
+                {'error': 'Vehicle not found'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check vehicle status
+        if vehicle.status != 'available':
+            return Response({
+                'available': False,
+                'reason': f'Vehicle is {vehicle.get_status_display()}',
+                'suggested_action': 'Select a different vehicle or change vehicle status'
+            })
+        
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            date_start = timezone.make_aware(datetime.combine(date_obj, datetime.min.time()))
+            date_end = timezone.make_aware(datetime.combine(date_obj, datetime.max.time()))
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get vehicle's schedules for the day
+        schedules = Schedule.objects.filter(
+            vehicle=vehicle,
+            start_time__date=date_obj
+        ).order_by('start_time')
+        
+        # Define working hours (8 AM to 6 PM)
+        working_start = date_start.replace(hour=8, minute=0, second=0, microsecond=0)
+        working_end = date_start.replace(hour=18, minute=0, second=0, microsecond=0)
+        
+        # Generate time slots
+        slot_duration = timedelta(minutes=duration_minutes)
+        buffer = timedelta(minutes=30)  # Buffer for vehicle maintenance/cleaning
+        available_slots = []
+        
+        current_time = working_start
+        while current_time + slot_duration <= working_end:
+            slot_end = current_time + slot_duration
+            
+            # Check if this slot conflicts with existing schedules
+            conflict = False
+            for schedule in schedules:
+                schedule_start = schedule.start_time
+                schedule_end = schedule.end_time
+                
+                # Check for overlap (with buffer)
+                if (current_time < schedule_end + buffer and 
+                    slot_end > schedule_start - buffer):
+                    conflict = True
+                    break
+            
+            if not conflict:
+                available_slots.append({
+                    'start_time': current_time,
+                    'end_time': slot_end,
+                    'duration_minutes': duration_minutes
+                })
+            
+            # Move to next slot (30-minute increments)
+            current_time += timedelta(minutes=30)
+        
+        return Response({
+            'vehicle': {
+                'id': vehicle.id,
+                'plate_number': vehicle.plate_number,
+                'make': vehicle.make,
+                'model': vehicle.model,
+                'status': vehicle.status
+            },
+            'date': date_obj,
+            'working_hours': {
+                'start': working_start.time(),
+                'end': working_end.time()
+            },
+            'scheduled_lessons': ScheduleSerializer(schedules, many=True).data,
+            'available_slots': available_slots,
+            'total_available_slots': len(available_slots)
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def upcoming(self, request):
+        """Get upcoming schedules (next 7 days)"""
+        user = request.user
+        now = timezone.now()
+        next_week = now + timedelta(days=7)
+        
+        queryset = self.get_queryset().filter(
+            start_time__gte=now,
+            start_time__lte=next_week
+        ).order_by('start_time')
+        
+        # Apply role-specific filtering
+        if user.role == 'I':
+            queryset = queryset.filter(instructor=user)
+        elif user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                # Get schedules where student has attendance
+                from .models import Attendance
+                student_lessons = Attendance.objects.filter(
+                    student=student_profile,
+                    presence=True
+                ).values_list('lesson_id', flat=True)
+                queryset = queryset.filter(lesson_id__in=student_lessons)
+        
+        # Group by day
+        schedules_by_day = {}
+        for schedule in queryset:
+            day_key = schedule.start_time.date().isoformat()
+            if day_key not in schedules_by_day:
+                schedules_by_day[day_key] = []
+            schedules_by_day[day_key].append(ScheduleSerializer(schedule).data)
+        
+        # Calculate daily counts
+        daily_counts = {
+            day: len(schedules) for day, schedules in schedules_by_day.items()
+        }
+        
+        return Response({
+            'period': {
+                'start': now.date(),
+                'end': next_week.date(),
+                'days': 7
+            },
+            'total_schedules': queryset.count(),
+            'daily_counts': daily_counts,
+            'schedules_by_day': schedules_by_day,
+            'today': now.date().isoformat(),
+            'tomorrow': (now.date() + timedelta(days=1)).isoformat()
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def cancel_schedule(self, request, pk=None):
+        """Cancel a schedule"""
+        schedule = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'I' and schedule.instructor != user:
+            raise PermissionDenied("You can only cancel your own schedules")
+        
+        if user.role == 'A' and not user.is_staff:
+            if schedule.lesson.school.owner != user:
+                raise PermissionDenied("You can only cancel schedules in your school")
+        
+        # Check if schedule is in the past
+        if schedule.start_time < timezone.now():
+            return Response(
+                {'error': 'Cannot cancel past schedules'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update lesson status to cancelled
+        lesson = schedule.lesson
+        lesson.status = 'C'  # Assuming 'C' is cancelled
+        lesson.save()
+        
+        # Delete the schedule
+        schedule_id = schedule.id
+        schedule.delete()
+        
+        return Response({
+            'message': 'Schedule cancelled successfully',
+            'cancelled_schedule_id': schedule_id,
+            'lesson_id': lesson.id,
+            'lesson_status': 'cancelled',
+            'cancelled_at': timezone.now()
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def reschedule(self, request, pk=None):
+        """Reschedule a lesson to a new time"""
+        schedule = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'I' and schedule.instructor != user:
+            raise PermissionDenied("You can only reschedule your own lessons")
+        
+        if user.role == 'A' and not user.is_staff:
+            if schedule.lesson.school.owner != user:
+                raise PermissionDenied("You can only reschedule lessons in your school")
+        
+        # Get new time slot
+        new_start_time_str = request.data.get('start_time')
+        new_end_time_str = request.data.get('end_time')
+        
+        if not new_start_time_str or not new_end_time_str:
+            return Response(
+                {'error': 'start_time and end_time are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            new_start_time = timezone.make_aware(datetime.fromisoformat(new_start_time_str))
+            new_end_time = timezone.make_aware(datetime.fromisoformat(new_end_time_str))
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate new time slot
+        if new_end_time <= new_start_time:
+            return Response(
+                {'error': 'End time must be after start time'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if new_start_time < timezone.now():
+            return Response(
+                {'error': 'Cannot reschedule to a past time'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check for conflicts
+        conflicts = self._check_scheduling_conflicts(
+            schedule.instructor,
+            schedule.vehicle,
+            new_start_time,
+            new_end_time,
+            exclude_id=schedule.id
+        )
+        
+        if conflicts:
+            return Response({
+                'error': 'Scheduling conflict',
+                'conflicts': conflicts,
+                'available': False
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Update schedule
+        old_start_time = schedule.start_time
+        old_end_time = schedule.end_time
+        
+        schedule.start_time = new_start_time
+        schedule.end_time = new_end_time
+        schedule.save()
+        
+        # Update lesson date if it's different day
+        if schedule.lesson.date.date() != new_start_time.date():
+            schedule.lesson.date = new_start_time
+            schedule.lesson.save()
+        
+        serializer = ScheduleSerializer(schedule, context={'request': request})
+        
+        return Response({
+            'message': 'Schedule updated successfully',
+            'schedule': serializer.data,
+            'changes': {
+                'old_start_time': old_start_time,
+                'old_end_time': old_end_time,
+                'new_start_time': new_start_time,
+                'new_end_time': new_end_time
+            }
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_schedule_mobile(self, request):
+        """Mobile-optimized schedule endpoint"""
+        user = request.user
+        queryset = self.get_queryset()
+        
+        # Filter upcoming only
+        now = timezone.now()
+        queryset = queryset.filter(start_time__gte=now)
+        
+        # Apply date filter if provided
+        date_str = request.query_params.get('date')
+        if date_str:
+            try:
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+                date_start = timezone.make_aware(datetime.combine(date_obj, datetime.min.time()))
+                date_end = timezone.make_aware(datetime.combine(date_obj, datetime.max.time()))
+                queryset = queryset.filter(start_time__range=[date_start, date_end])
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Order by start time
+        queryset = queryset.order_by('start_time')
+        
+        # Pagination
+        page_size = min(int(request.query_params.get('page_size', 10)), 50)
+        paginator = PageNumberPagination()
+        paginator.page_size = page_size
+        
+        page = paginator.paginate_queryset(queryset, request)
+        if page is not None:
+            serializer = ScheduleSerializer(page, many=True, context={'request': request})
+            
+            # Get counts for today and tomorrow
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            tomorrow_end = today_end + timedelta(days=1)
+            
+            today_count = queryset.filter(start_time__range=[today_start, today_end]).count()
+            tomorrow_count = queryset.filter(start_time__range=[today_end, tomorrow_end]).count()
+            
+            response_data = {
+                'today_count': today_count,
+                'tomorrow_count': tomorrow_count,
+                'total_upcoming': queryset.count(),
+                'user_role': user.role,
+                'schedules': serializer.data
+            }
+            
+            return paginator.get_paginated_response(response_data)
+        
+        serializer = ScheduleSerializer(queryset, many=True, context={'request': request})
+        return Response(serializer.data)
