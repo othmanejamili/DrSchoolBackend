@@ -3003,8 +3003,9 @@ class ScheduleService:
             raise serializers.ValidationError('Authentication required to manage schedules')
         
         # Admin must own the school
-        if request_user.role == 'A' and school.owner != request_user:
-            raise serializers.ValidationError('You can only manage schedules in your own schools')
+        if request_user.role == 'A' and not request_user.is_staff:
+            if request_user.role == 'A' and school.owner != request_user:
+                raise serializers.ValidationError('You can only manage schedules in your own schools')
         
         # Instructors must be assigned to the school
         if request_user.role == 'I':
@@ -3115,6 +3116,9 @@ class ScheduleService:
     @staticmethod
     def can_modify_schedule(user, schedule) -> bool:
         """Check if user has permission to modify this schedule"""
+        if user.role == 'A' and user.is_staff:
+            return True
+
         if user.role == 'A':
             return schedule.lesson.school.owner == user
         
