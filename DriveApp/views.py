@@ -23,6 +23,7 @@ from django.db.models import Avg, Sum
 from django_filters.rest_framework import DjangoFilterBackend 
 from datetime import datetime
 from rest_framework.pagination import PageNumberPagination
+from django.utils.dateparse import parse_datetime
 
 User = get_user_model()
 
@@ -2321,6 +2322,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         return [IsAuthenticated()]
     
+    @transaction.atomic
     def perform_create(self, serializer):
         """Create schedule with validation"""
         user = self.request.user
@@ -2336,6 +2338,11 @@ class ScheduleViewSet(viewsets.ModelViewSet):
 
         if start_time < timezone.now():
             raise PermissionDenied("Cannot schedule in the past")
+
+        if lesson and lesson.status == 'C':
+            raise Response({
+            'lesson': 'Cannot create schedule for a completed lesson'
+        })
 
         # Check scheduling conflicts
         conflicts = self._check_scheduling_conflicts(
@@ -2369,6 +2376,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         raise PermissionDenied("You don't have permission to create schedules!")
     
+    @transaction.atomic
     def perform_update(self, serializer):
         """Update schedule with permission checks"""
         user = self.request.user
@@ -2416,6 +2424,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         raise PermissionDenied("You don't have permission to update this schedule!!")
         
+    @transaction.atomic
     def perform_destroy(self, instance):
         """Delete schedule with permission checks"""
         user = self.request.user
@@ -2560,10 +2569,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         # Apply ordering
         queryset = queryset.order_by(ordering)
-        
-        # Apply limit
-        if limit > 0:
-            queryset = queryset[:limit]
+
         
         # Prefetch related data
         queryset = queryset.select_related(
@@ -2578,7 +2584,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         # Calculate summary statistics
         total_schedules = queryset.count()
-        completed = queryset.filter(lesson__status='C').count()
+        completed = queryset.filter(lesson__status='C').count() 
         cancelled = queryset.filter(lesson__status='X').count()  # Assuming 'X' for cancelled
         scheduled = queryset.filter(lesson__status='S').count()
         
@@ -2608,11 +2614,40 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             'schedules': serializer.data
         }
         
+        # Add this to your my_schedule action, right after the instructor workload calculation:
+
+        # For students: calculate their attendance
+        attendance_stats = {}
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                # Get schedules where student has attendance record
+                student_schedule_ids = Schedule.objects.filter(
+                    lesson__lesson_attendance__student=student_profile
+                ).values_list('id', flat=True)
+                
+                present_count = Attendance.objects.filter(
+                    student=student_profile,
+                    lesson__schedule__in=queryset,
+                    presence=True
+                ).count()
+                
+                total_scheduled_for_student = queryset.filter(id__in=student_schedule_ids).count()
+                
+                attendance_stats = {
+                    'total_scheduled': total_scheduled_for_student,
+                    'present_count': present_count,
+                    'attendance_rate': round((present_count / total_scheduled_for_student * 100), 2) if total_scheduled_for_student > 0 else 0
+                }
+
         # Add role-specific stats
         if user.role == 'I':
             response_data['summary']['workload_hours'] = round(workload_hours, 2)
             response_data['summary']['schedules_count'] = queryset.filter(instructor=user).count()
         
+        # ADD THIS FOR STUDENTS:
+        if user.role == 'S' and attendance_stats:
+            response_data['summary']['attendance'] = attendance_stats
         # Add next important schedule
         if total_schedules > 0:
             next_schedule = queryset.filter(start_time__gte=now).order_by('start_time').first()
@@ -2625,7 +2660,13 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                     'location': next_schedule.lesson.school.name if next_schedule.lesson and next_schedule.lesson.school else 'Not specified'
                 }
         
+
+        # Apply limit
+        if limit > 0:
+            queryset = queryset[:limit]
+
         return Response(response_data)
+
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def check_conflicts(self, request):
@@ -2644,8 +2685,18 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            start_time = timezone.make_aware(datetime.fromisoformat(start_time_str))
-            end_time = timezone.make_aware(datetime.fromisoformat(end_time_str))
+            start_time = parse_datetime(start_time_str)
+            end_time = parse_datetime(end_time_str)
+            if start_time is None or end_time is None:
+                return Response(
+                    {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS[±HH:MM])'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )            
+            if timezone.is_naive(start_time):
+                start_time = timezone.make_aware(start_time)
+            if timezone.is_naive(end_time):
+                end_time = timezone.make_aware(end_time)
+
         except (ValueError, TypeError):
             return Response(
                 {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
@@ -2944,14 +2995,15 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         elif user.role == 'S':
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
-                # Get schedules where student has attendance
+                # FIXED: Only show schedules for lessons the student attended
                 from .models import Attendance
-                student_lessons = Attendance.objects.filter(
+                attended_lesson_ids = Attendance.objects.filter(
                     student=student_profile,
                     presence=True
                 ).values_list('lesson_id', flat=True)
-                queryset = queryset.filter(lesson_id__in=student_lessons)
-        
+                
+                queryset = queryset.filter(lesson_id__in=attended_lesson_ids)
+
         # Group by day
         schedules_by_day = {}
         for schedule in queryset:
@@ -3002,7 +3054,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         # Update lesson status to cancelled
         lesson = schedule.lesson
-        lesson.status = 'C'  # Assuming 'C' is cancelled
+        lesson.status = 'X'  # Assuming 'X' is cancelled
         lesson.save()
         
         # Delete the schedule
@@ -3043,8 +3095,16 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            new_start_time = timezone.make_aware(datetime.fromisoformat(new_start_time_str))
-            new_end_time = timezone.make_aware(datetime.fromisoformat(new_end_time_str))
+            new_start_time = parse_datetime(new_start_time_str)
+            new_end_time = parse_datetime(new_end_time_str)
+            if new_start_time is None or new_end_time is None:
+                return Response({'error': 'Invalid datetime format'},status=status.HTTP_400_BAD_REQUEST)
+
+            if timezone.is_naive(new_start_time):
+                new_start_time = timezone.make_aware(new_start_time)
+            if timezone.is_naive(new_end_time):
+                new_end_time = timezone.make_aware(new_end_time)
+
         except (ValueError, TypeError):
             return Response(
                 {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
