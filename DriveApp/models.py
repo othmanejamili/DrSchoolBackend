@@ -109,6 +109,7 @@ class Lesson(models.Model):
         ('S', 'Scheduled'),
         ('C', 'Completed'),
         ('P', 'Paused'),
+        ('X', 'Cancelled'),
     ]
     instructor = models.ForeignKey(User, on_delete=models.CASCADE, null=True, related_name='student_lessons')
     school = models.ForeignKey(DrivingSchool, on_delete=models.CASCADE, related_name='school_lessons')
@@ -225,13 +226,6 @@ class VehiclePicture(models.Model):
         indexes = [
             models.Index(fields=['vehicle', 'is_primary']),
             models.Index(fields=['uploaded_at'])
-        ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=['vehicle', 'is_primary'],
-                name='unique_primary_picture_per_vehicle',
-                condition=models.Q(is_primary=True)
-            )
         ]
     
     def save(self, *args, **kwargs):

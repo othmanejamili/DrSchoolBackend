@@ -805,6 +805,10 @@ class ScheduleSerializer(serializers.ModelSerializer):
         if self.instance and value != self.instance.lesson:
             raise serializers.ValidationError("Cannot change the lesson of an existing schedule")
         
+        if value.status == 'C':
+            raise serializers.ValidationError("Cannot schedule a completed lesson")
+        
+
         # Check if lesson already has a schedule
         if not self.instance and hasattr(value, 'schedule'):
             raise serializers.ValidationError("This lesson already has a schedule")
