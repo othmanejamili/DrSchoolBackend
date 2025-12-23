@@ -8,17 +8,18 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from datetime import timedelta
 from .models import (User, DrivingSchool, StudentProfile, Lesson, 
-                     Attendance, Schedule, Feedback, Vehicle, VehiclePicture)
+                     Attendance, Schedule, Feedback, Vehicle, VehiclePicture,
+                     Achievement)
 from .serializers import (UserSerializer, DrivingSchoolSerializer, ScheduleSerializer, VehicleSerializer,
                           VehiclePictureSerializer,StudentProfileSerializer, LessonSerializer,AttendanceSerializer,
-                          FeedbackSerializer)
+                          FeedbackSerializer, AchievementSerializer)
 from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
                            IsPlatformAdminOrSchoolOwner, IsPlatformAdminOrSchoolOwnerOrInstructor,
                            IsStudent)
 from rest_framework.exceptions import PermissionDenied
 from django.db.models import Count
 from django.db import transaction
-from .services import StudentProfileService, LessonService, AttendanceService, VehicleService
+from .services import StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService
 from django.db.models import Avg, Sum
 from django_filters.rest_framework import DjangoFilterBackend 
 from datetime import datetime
@@ -3222,3 +3223,877 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         serializer = ScheduleSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data)
+
+#Dss-11-create-Achievement-view     
+class AchievemtViewSet(viewsets.ModelViewSet):
+    serializer_class =  AchievementSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['student__school','type','title','points']
+    search_fields = ['student__user__username','type','title','points','description','icon','earned_at']
+    ordering_fields = ['type','earned_at','points','student__user__username']
+    ordering = ['-earned_at']
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return Achievement.objects.none()
+        
+        # Platform Admin (staff) sees all Achievment
+        if user.role == 'A' and user.is_staff:
+            return Achievement.objects.all().select_related('student__user','student__school')
+        
+        # School Owner (admin but not staff) sees Achievement in their schools
+        if user.role == 'A' and not user.is_staff:
+            return Achievement.objects.filter(
+                student__school__owner=user
+            ).select_related('student__user','student__school')
+        
+        # Instructor sees their own school Achievement
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                return Achievement.objects.filter(
+                    student__school=instructor_profile.school
+                ).select_related('student__user','student__school')
+            return Achievement.objects.none()
+        
+        # Student sees schedules in their school
+        if user.role == 'S':
+            return Achievement.objects.filter(
+                student__user = user
+            ).select_related('student__user','student__school')
+        
+        return Achievement.objects.none()
+    
+    def get_permissions(self):
+        if self.action == 'create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+
+        elif self.action in ['update','partial_update']:
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        
+        elif self.action in ['award_achievement', 'bulk_award', 'check_milestones']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['my_achievements', 'leaderboard', 'statistics','student_progress', 'available_achievements']:
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def get_serializer_context(self):
+        """Add request to serializer context"""
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+    
+    @transaction.atomic
+    def perform_create(self, serializer):
+        """Create Achievement with validation"""
+        user =self.request.user
+        student = serializer.validated_data.get('student')
+
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return 
+        
+        if user.role == 'A' and not user.is_staff:
+            if student.school.owner != user:
+                raise PermissionDenied("You can only award achievements to students in your schools")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to create achievements!")
+    
+    @transaction.atomic
+    def perform_update(self, serializer):
+        user = self.request.user
+
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        raise PermissionDenied("Only platform administrators can update achievements")
+    
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        user = self.request.user
+
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+        
+        raise PermissionDenied("Only platform administrators can delete achievements")
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_achievements(self, request):
+        """
+        Get achievements for the current student.
+        Returns achievements with progress tracking.
+        """
+        user = request.user
+        
+        if user.role != 'S':
+            return Response(
+                {'error': 'This endpoint is only for students'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            student_profile = StudentProfile.objects.get(user=user, status='A')
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {'error': 'No active student profile found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get student's achievements
+        achievements = Achievement.objects.filter(student=student_profile).order_by('-earned_at')
+        serializer = self.get_serializer(achievements, many=True)
+        
+        # Calculate statistics
+        total_achievements = achievements.count()
+        total_points = achievements.aggregate(total=Sum('points'))['total'] or 0
+        
+        # Get available achievements (not yet earned)
+        earned_types = set(achievements.values_list('type', flat=True))
+        available = [
+            {
+                'type': key,
+                'title': value['title'],
+                'description': value['description'],
+                'points': value['points'],
+                'icon': value['icon'],
+                'progress': self._calculate_progress(student_profile, key)
+            }
+            for key, value in AchievementService.ACHIEVEMENT_RULES.items()
+            if key not in earned_types
+        ]
+        
+        # Recent achievements (last 7 days)
+        week_ago = timezone.now() - timedelta(days=7)
+        recent_achievements = achievements.filter(earned_at__gte=week_ago)
+        
+        return Response({
+            'student': {
+                'id': student_profile.id,
+                'name': user.get_full_name() or user.username,
+                'school': student_profile.school.name
+            },
+            'summary': {
+                'total_achievements': total_achievements,
+                'total_points': total_points,
+                'recent_count': recent_achievements.count(),
+                'completion_rate': round(
+                    (total_achievements / len(AchievementService.ACHIEVEMENT_RULES) * 100), 2
+                )
+            },
+            'earned_achievements': serializer.data,
+            'available_achievements': available,
+            'recent_achievements': AchievementSerializer(recent_achievements, many=True).data
+        })
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def award_achievement(self, request):
+        """
+        Manually award an achievement to a student.
+        
+        Body:
+        {
+            "student_id": 123,
+            "achievement_type": "first_lesson",
+            "custom_title": "Optional custom title",
+            "custom_description": "Optional custom description"
+        }
+        """
+        student_id = request.data.get('student_id')
+        achievement_type = request.data.get('achievement_type')
+        custom_title = request.data.get('custom_title')
+        custom_description = request.data.get('custom_description')
+        
+        # Validate input
+        if not student_id or not achievement_type:
+            return Response(
+                {'error': 'student_id and achievement_type are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get student
+        try:
+            student = StudentProfile.objects.select_related('school', 'user').get(id=student_id)
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {'error': 'Student not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != student.school:
+                raise PermissionDenied("You can only award achievements to students in your school")
+        
+        if user.role == 'A' and not user.is_staff:
+            if student.school.owner != user:
+                raise PermissionDenied("You can only award achievements to students in your schools")
+        
+        # Check if achievement already exists
+        if Achievement.objects.filter(student=student, type=achievement_type).exists():
+            return Response(
+                {'error': 'Student already has this achievement'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get achievement details from rules
+        rule = AchievementService.ACHIEVEMENT_RULES.get(achievement_type)
+        if not rule:
+            return Response(
+                {'error': f'Invalid achievement type: {achievement_type}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create achievement
+        achievement = Achievement.objects.create(
+            student=student,
+            type=achievement_type,
+            title=custom_title or rule['title'],
+            description=custom_description or rule['description'],
+            icon=rule['icon'],
+            points=rule['points']
+        )
+        
+        serializer = self.get_serializer(achievement)
+        
+        return Response({
+            'message': 'Achievement awarded successfully',
+            'achievement': serializer.data,
+            'awarded_to': {
+                'id': student.id,
+                'name': student.user.get_full_name() or student.user.username,
+                'school': student.school.name
+            }
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def bulk_award(self, request):
+        """
+        Award achievement to multiple students.
+        
+        Body:
+        {
+            "student_ids": [1, 2, 3],
+            "achievement_type": "first_lesson"
+        }
+        """
+        student_ids = request.data.get('student_ids', [])
+        achievement_type = request.data.get('achievement_type')
+        
+        if not student_ids or not achievement_type:
+            return Response(
+                {'error': 'student_ids (array) and achievement_type are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate achievement type
+        rule = AchievementService.ACHIEVEMENT_RULES.get(achievement_type)
+        if not rule:
+            return Response(
+                {'error': f'Invalid achievement type: {achievement_type}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get students
+        students = StudentProfile.objects.filter(id__in=student_ids).select_related('school', 'user')
+        
+        if not students.exists():
+            return Response(
+                {'error': 'No valid students found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'A' and not user.is_staff:
+            # School owner can only award to their students
+            students = students.filter(school__owner=user)
+        
+        # Award achievements
+        awarded = []
+        skipped = []
+        
+        for student in students:
+            # Skip if already has this achievement
+            if Achievement.objects.filter(student=student, type=achievement_type).exists():
+                skipped.append({
+                    'student_id': student.id,
+                    'name': student.user.username,
+                    'reason': 'Already has this achievement'
+                })
+                continue
+            
+            # Create achievement
+            achievement = Achievement.objects.create(
+                student=student,
+                type=achievement_type,
+                title=rule['title'],
+                description=rule['description'],
+                icon=rule['icon'],
+                points=rule['points']
+            )
+            
+            awarded.append({
+                'student_id': student.id,
+                'name': student.user.get_full_name() or student.user.username,
+                'achievement_id': achievement.id
+            })
+        
+        return Response({
+            'message': f'Awarded achievement to {len(awarded)} students',
+            'summary': {
+                'requested': len(student_ids),
+                'awarded': len(awarded),
+                'skipped': len(skipped)
+            },
+            'awarded_to': awarded,
+            'skipped': skipped
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def check_milestones(self, request):
+        """
+        Check and automatically award achievements based on student progress.
+        
+        Body:
+        {
+            "student_id": 123  # Optional, checks all students if not provided
+        }
+        """
+        student_id = request.data.get('student_id')
+        user = request.user
+        
+        if student_id:
+            # Check specific student
+            try:
+                student = StudentProfile.objects.get(id=student_id)
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'Student not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Permission check
+            if user.role == 'I':
+                instructor_profile = user.student_profiles.filter(status='A').first()
+                if not instructor_profile or instructor_profile.school != student.school:
+                    raise PermissionDenied("You can only check students in your school")
+            
+            if user.role == 'A' and not user.is_staff:
+                if student.school.owner != user:
+                    raise PermissionDenied("You can only check students in your schools")
+            
+            students = [student]
+        else:
+            # Check all students based on user role
+            if user.role == 'A' and user.is_staff:
+                students = StudentProfile.objects.filter(status='A')
+            elif user.role == 'A' and not user.is_staff:
+                students = StudentProfile.objects.filter(school__owner=user, status='A')
+            elif user.role == 'I':
+                instructor_profile = user.student_profiles.filter(status='A').first()
+                if instructor_profile:
+                    students = StudentProfile.objects.filter(
+                        school=instructor_profile.school,
+                        status='A'
+                    )
+                else:
+                    students = []
+            else:
+                return Response(
+                    {'error': 'Invalid user role'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Check milestones for each student
+        results = []
+        for student in students:
+            before_count = Achievement.objects.filter(student=student).count()
+            
+            # Use AchievementService to check and award
+            AchievementService.check_and_award(student)
+            
+            after_count = Achievement.objects.filter(student=student).count()
+            new_achievements = after_count - before_count
+            
+            if new_achievements > 0:
+                results.append({
+                    'student_id': student.id,
+                    'name': student.user.get_full_name() or student.user.username,
+                    'new_achievements': new_achievements
+                })
+        
+        return Response({
+            'message': f'Checked {len(students)} students',
+            'students_checked': len(students),
+            'achievements_awarded': sum(r['new_achievements'] for r in results),
+            'results': results
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def leaderboard(self, request):
+        """
+        Get achievement leaderboard.
+        
+        Query params:
+        - scope: 'school' or 'platform' (default: school for non-admins)
+        - limit: number of top students (default: 10)
+        - time_period: 'all_time', 'month', 'week' (default: all_time)
+        """
+        user = request.user
+        scope = request.query_params.get('scope', 'school')
+        limit = min(int(request.query_params.get('limit', 10)), 100)
+        time_period = request.query_params.get('time_period', 'all_time')
+        
+        # Determine queryset based on scope and permissions
+        if scope == 'platform':
+            if user.role != 'A' or not user.is_staff:
+                return Response(
+                    {'error': 'Only platform admins can view platform-wide leaderboard'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            queryset = Achievement.objects.all()
+        else:  # school scope
+            if user.role == 'A' and user.is_staff:
+                # Platform admin can view any school, but need school_id
+                school_id = request.query_params.get('school_id')
+                if school_id:
+                    queryset = Achievement.objects.filter(student__school_id=school_id)
+                else:
+                    return Response(
+                        {'error': 'school_id required for platform admin viewing school leaderboard'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            elif user.role == 'A' and not user.is_staff:
+                queryset = Achievement.objects.filter(student__school__owner=user)
+            elif user.role == 'I':
+                instructor_profile = user.student_profiles.filter(status='A').first()
+                if instructor_profile:
+                    queryset = Achievement.objects.filter(student__school=instructor_profile.school)
+                else:
+                    queryset = Achievement.objects.none()
+            elif user.role == 'S':
+                student_profile = user.student_profiles.filter(status='A').first()
+                if student_profile:
+                    queryset = Achievement.objects.filter(student__school=student_profile.school)
+                else:
+                    queryset = Achievement.objects.none()
+            else:
+                queryset = Achievement.objects.none()
+        
+        # Apply time filter
+        if time_period == 'week':
+            week_ago = timezone.now() - timedelta(days=7)
+            queryset = queryset.filter(earned_at__gte=week_ago)
+        elif time_period == 'month':
+            month_ago = timezone.now() - timedelta(days=30)
+            queryset = queryset.filter(earned_at__gte=month_ago)
+        # 'all_time' - no filter
+        
+        # Aggregate points by student
+        from django.db.models import Sum, Count
+        leaderboard = queryset.values(
+            'student__id',
+            'student__user__username',
+            'student__user__first_name',
+            'student__user__last_name',
+            'student__school__name'
+        ).annotate(
+            total_points=Sum('points'),
+            achievement_count=Count('id')
+        ).order_by('-total_points')[:limit]
+        
+        # Format response
+        ranked_students = []
+        for rank, entry in enumerate(leaderboard, 1):
+            full_name = f"{entry['student__user__first_name']} {entry['student__user__last_name']}".strip()
+            ranked_students.append({
+                'rank': rank,
+                'student_id': entry['student__id'],
+                'name': full_name or entry['student__user__username'],
+                'username': entry['student__user__username'],
+                'school': entry['student__school__name'],
+                'total_points': entry['total_points'],
+                'achievement_count': entry['achievement_count']
+            })
+        
+        # Get current user's rank (if student)
+        user_rank = None
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                user_rank_queryset = queryset.filter(student=student_profile).aggregate(
+                    total_points=Sum('points'),
+                    achievement_count=Count('id')
+                )
+                
+                # Find rank
+                better_students = queryset.values('student').annotate(
+                    total_points=Sum('points')
+                ).filter(
+                    total_points__gt=user_rank_queryset['total_points'] or 0
+                ).count()
+                
+                user_rank = {
+                    'rank': better_students + 1,
+                    'total_points': user_rank_queryset['total_points'] or 0,
+                    'achievement_count': user_rank_queryset['achievement_count'] or 0
+                }
+        
+        return Response({
+            'leaderboard': ranked_students,
+            'metadata': {
+                'scope': scope,
+                'time_period': time_period,
+                'limit': limit,
+                'total_students': queryset.values('student').distinct().count()
+            },
+            'your_rank': user_rank
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def statistics(self, request):
+        """
+        Get achievement statistics.
+        Scope depends on user role.
+        """
+        user = request.user
+        
+        # Determine queryset based on role
+        if user.role == 'A' and user.is_staff:
+            queryset = Achievement.objects.all()
+            scope = 'platform'
+        elif user.role == 'A' and not user.is_staff:
+            queryset = Achievement.objects.filter(student__school__owner=user)
+            scope = 'schools'
+        elif user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                queryset = Achievement.objects.filter(student__school=instructor_profile.school)
+                scope = 'school'
+            else:
+                queryset = Achievement.objects.none()
+                scope = 'none'
+        elif user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                queryset = Achievement.objects.filter(student=student_profile)
+                scope = 'personal'
+            else:
+                queryset = Achievement.objects.none()
+                scope = 'none'
+        else:
+            queryset = Achievement.objects.none()
+            scope = 'none'
+        
+        # Calculate statistics
+        from django.db.models import Sum, Count, Avg
+        
+        total_achievements = queryset.count()
+        total_points = queryset.aggregate(total=Sum('points'))['total'] or 0
+        unique_students = queryset.values('student').distinct().count()
+        
+        # Achievements by type
+        by_type = dict(
+            queryset.values('type').annotate(count=Count('id')).values_list('type', 'count')
+        )
+        
+        # Recent achievements (last 30 days)
+        month_ago = timezone.now() - timedelta(days=30)
+        recent_achievements = queryset.filter(earned_at__gte=month_ago).count()
+        
+        # Most popular achievement
+        most_popular = queryset.values('type', 'title').annotate(
+            count=Count('id')
+        ).order_by('-count').first()
+        
+        # Average points per student
+        avg_points_per_student = queryset.values('student').annotate(
+            total=Sum('points')
+        ).aggregate(average=Avg('total'))['average'] or 0
+        
+        return Response({
+            'scope': scope,
+            'summary': {
+                'total_achievements': total_achievements,
+                'total_points_awarded': total_points,
+                'unique_students': unique_students,
+                'recent_achievements_30days': recent_achievements,
+                'average_points_per_student': round(avg_points_per_student, 2)
+            },
+            'by_type': by_type,
+            'most_popular': most_popular,
+            'achievement_types_available': len(AchievementService.ACHIEVEMENT_RULES)
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def student_progress(self, request):
+        """
+        Get detailed progress for a specific student.
+        Shows earned and available achievements with progress.
+        
+        Query params:
+        - student_id: required (admins/owners/instructors)
+        - For students, shows their own progress
+        """
+        user = request.user
+        student_id = request.query_params.get('student_id')
+        
+        # Determine which student to check
+        if user.role == 'S':
+            # Students can only check their own progress
+            try:
+                student_profile = StudentProfile.objects.get(user=user, status='A')
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'No active student profile found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            # Admins/owners/instructors need student_id
+            if not student_id:
+                return Response(
+                    {'error': 'student_id is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                student_profile = StudentProfile.objects.select_related('school', 'user').get(id=student_id)
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'Student not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Permission check
+            if user.role == 'I':
+                instructor_profile = user.student_profiles.filter(status='A').first()
+                if not instructor_profile or instructor_profile.school != student_profile.school:
+                    raise PermissionDenied("You can only view students in your school")
+            
+            if user.role == 'A' and not user.is_staff:
+                if student_profile.school.owner != user:
+                    raise PermissionDenied("You can only view students in your schools")
+        
+        # Get earned achievements
+        earned_achievements = Achievement.objects.filter(student=student_profile).order_by('-earned_at')
+        earned_serialized = self.get_serializer(earned_achievements, many=True).data
+        
+        # Get progress for all available achievements
+        earned_types = set(earned_achievements.values_list('type', flat=True))
+        
+        available_with_progress = []
+        for achievement_type, rule in AchievementService.ACHIEVEMENT_RULES.items():
+            progress_data = self._calculate_progress(student_profile, achievement_type)
+            
+            available_with_progress.append({
+                'type': achievement_type,
+                'title': rule['title'],
+                'description': rule['description'],
+                'icon': rule['icon'],
+                'points': rule['points'],
+                'earned': achievement_type in earned_types,
+                'progress': progress_data
+            })
+        
+        # Summary statistics
+        total_points = earned_achievements.aggregate(total=Sum('points'))['total'] or 0
+        completion_rate = round((len(earned_types) / len(AchievementService.ACHIEVEMENT_RULES) * 100), 2)
+        
+        return Response({
+            'student': {
+                'id': student_profile.id,
+                'name': student_profile.user.get_full_name() or student_profile.user.username,
+                'school': student_profile.school.name,
+                'status': student_profile.get_status_display()
+            },
+            'summary': {
+                'earned_count': earned_achievements.count(),
+                'total_available': len(AchievementService.ACHIEVEMENT_RULES),
+                'completion_rate': completion_rate,
+                'total_points': total_points
+            },
+            'earned_achievements': earned_serialized,
+            'all_achievements_progress': available_with_progress
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def available_achievements(self, request):
+        """
+        Get list of all available achievement types with their requirements.
+        """
+        achievements_info = []
+        
+        for achievement_type, rule in AchievementService.ACHIEVEMENT_RULES.items():
+            achievements_info.append({
+                'type': achievement_type,
+                'title': rule['title'],
+                'description': rule['description'],
+                'icon': rule['icon'],
+                'points': rule['points'],
+                'requirements': self._get_achievement_requirements(achievement_type)
+            })
+        
+        return Response({
+            'total_types': len(achievements_info),
+            'achievements': achievements_info
+        })
+    
+        # ==================== HELPER METHODS ====================
+    
+    def _calculate_progress(self, student, achievement_type):
+        """
+        Calculate progress towards a specific achievement.
+        Returns dict with current value, target, and percentage.
+        """
+        from .models import Attendance
+        
+        if achievement_type == 'first_lesson':
+            attended = Attendance.objects.filter(student=student, presence=True).exists()
+            return {
+                'current': 1 if attended else 0,
+                'target': 1,
+                'percentage': 100 if attended else 0,
+                'unit': 'lesson'
+            }
+        
+        elif achievement_type == 'theory_master':
+            current = float(student.total_hours_theory)
+            target = 50
+            return {
+                'current': current,
+                'target': target,
+                'percentage': min(round((current / target * 100), 2), 100),
+                'unit': 'hours'
+            }
+        
+        elif achievement_type == 'driving_ace':
+            current = float(student.total_hours_driving)
+            target = 40
+            return {
+                'current': current,
+                'target': target,
+                'percentage': min(round((current / target * 100), 2), 100),
+                'unit': 'hours'
+            }
+        
+        elif achievement_type == 'perfect_attendance':
+            total_lessons = Attendance.objects.filter(student=student).count()
+            present = Attendance.objects.filter(student=student, presence=True).count()
+            
+            if total_lessons >= 10:
+                percentage = round((present / total_lessons * 100), 2) if total_lessons > 0 else 0
+            else:
+                percentage = 0
+            
+            return {
+                'current': f"{present}/{total_lessons}",
+                'target': "10 lessons with 100% attendance",
+                'percentage': percentage if total_lessons >= 10 else round((total_lessons / 10 * 100), 2),
+                'unit': 'lessons'
+            }
+        
+        # Add more achievement types as needed
+        else:
+            return {
+                'current': 0,
+                'target': 1,
+                'percentage': 0,
+                'unit': 'unknown'
+            }
+
+    def _get_achievement_requirements(self, achievement_type):
+        """
+        Get human-readable requirements for an achievement.
+        """
+        requirements_map = {
+            'first_lesson': 'Complete your first driving lesson',
+            'theory_master': 'Complete 50 hours of theory lessons',
+            'driving_ace': 'Complete 40 hours of driving practice',
+            'perfect_attendance': 'Maintain 100% attendance for 10 consecutive lessons'
+        }
+        
+        return requirements_map.get(achievement_type, 'Complete the requirements')
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    def export(self, request):
+        """
+        Export achievements to CSV/Excel.
+        """
+        from django.http import HttpResponse
+        import csv
+        
+        queryset = self.get_queryset()
+        
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="achievements.csv"'
+        
+        writer = csv.writer(response)
+        writer.writerow(['Student', 'School', 'Achievement', 'Points', 'Date Earned'])
+        
+        for achievement in queryset.select_related('student__user', 'student__school'):
+            writer.writerow([
+                achievement.student.user.get_full_name() or achievement.student.user.username,
+                achievement.student.school.name,
+                achievement.title,
+                achievement.points,
+                achievement.earned_at.strftime('%Y-%m-%d %H:%M')
+            ])
+        
+        return response
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def badges(self, request):
+        """
+        Get visual badges for achievements.
+        """
+        user = request.user
+        
+        if user.role == 'S':
+            try:
+                student_profile = StudentProfile.objects.get(user=user, status='A')
+                achievements = Achievement.objects.filter(student=student_profile)
+            except StudentProfile.DoesNotExist:
+                return Response({'error': 'Student profile not found'}, status=404)
+        else:
+            # Admins/instructors can see badges for a specific student
+            student_id = request.query_params.get('student_id')
+            if not student_id:
+                return Response({'error': 'student_id required for non-students'}, status=400)
+            
+            try:
+                student_profile = StudentProfile.objects.get(id=student_id)
+                achievements = Achievement.objects.filter(student=student_profile)
+            except StudentProfile.DoesNotExist:
+                return Response({'error': 'Student not found'}, status=404)
+        
+        badges = []
+        for achievement in achievements:
+            badges.append({
+                'id': achievement.id,
+                'type': achievement.type,
+                'title': achievement.title,
+                'icon': achievement.icon,
+                'earned_date': achievement.earned_at,
+                'description': achievement.description,
+                'badge_url': f'/static/badges/{achievement.type}.png'  # Customize this
+            })
+        
+        return Response({
+            'student': student_profile.user.username,
+            'total_badges': len(badges),
+            'badges': badges
+        })
