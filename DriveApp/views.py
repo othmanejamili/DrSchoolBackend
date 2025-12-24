@@ -25,6 +25,8 @@ from django_filters.rest_framework import DjangoFilterBackend
 from datetime import datetime
 from rest_framework.pagination import PageNumberPagination
 from django.utils.dateparse import parse_datetime
+from django.http import HttpResponse
+import csv
 
 User = get_user_model()
 
@@ -4033,17 +4035,17 @@ class AchievemtViewSet(viewsets.ModelViewSet):
         """
         Export achievements to CSV/Excel.
         """
-        from django.http import HttpResponse
-        import csv
-        
+        user = self.request.user
         queryset = self.get_queryset()
         
+
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="achievements.csv"'
         
         writer = csv.writer(response)
         writer.writerow(['Student', 'School', 'Achievement', 'Points', 'Date Earned'])
         
+    
         for achievement in queryset.select_related('student__user', 'student__school'):
             writer.writerow([
                 achievement.student.user.get_full_name() or achievement.student.user.username,
@@ -4052,8 +4054,18 @@ class AchievemtViewSet(viewsets.ModelViewSet):
                 achievement.points,
                 achievement.earned_at.strftime('%Y-%m-%d %H:%M')
             ])
-        
-        return response
+
+            
+        if user.role == 'A' and user.is_staff:
+            return response
+        elif user.role == 'A' and not user.is_staff:
+            return response
+        else:
+            return Response(
+                {'eroor':'You cannot export achievements to CSV/Excel'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
     
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def badges(self, request):
