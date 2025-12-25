@@ -9,17 +9,17 @@ from django.utils import timezone
 from datetime import timedelta
 from .models import (User, DrivingSchool, StudentProfile, Lesson, 
                      Attendance, Schedule, Feedback, Vehicle, VehiclePicture,
-                     Achievement)
+                     Achievement, CommunicationTemplate, AutomatedMessage)
 from .serializers import (UserSerializer, DrivingSchoolSerializer, ScheduleSerializer, VehicleSerializer,
                           VehiclePictureSerializer,StudentProfileSerializer, LessonSerializer,AttendanceSerializer,
-                          FeedbackSerializer, AchievementSerializer)
+                          FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer, AutomatedMessageSerializer)
 from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
                            IsPlatformAdminOrSchoolOwner, IsPlatformAdminOrSchoolOwnerOrInstructor,
                            IsStudent)
 from rest_framework.exceptions import PermissionDenied
 from django.db.models import Count
 from django.db import transaction
-from .services import StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService
+from .services import StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService, CommunicationService, CommunicationTemplateService
 from django.db.models import Avg, Sum
 from django_filters.rest_framework import DjangoFilterBackend 
 from datetime import datetime
@@ -4109,3 +4109,458 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             'total_badges': len(badges),
             'badges': badges
         })
+
+
+# DSS-12-create-CommunicationViewSet
+class CommunicationTemplateViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing communication templates.
+     
+    Templates are reusable message formats for various notifications.
+    
+    Access Control:
+    - Platform Admins: Full access to all templates
+    - School Owners: Manage templates in their schools
+    - Instructors: View templates in their school
+    - Students: Cannot access templates
+    """
+    
+    serializer_class = CommunicationTemplateSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['school', 'template_type', 'is_active']
+    search_fields = ['name', 'subject', 'body', 'template_type']
+    ordering_fields = ['name', 'created_at', 'template_type']
+    ordering = ['-created_at']
+
+    def get_queryset(self):
+        """Filter templates based on user role and school"""
+        user = self.request.user
+        if not user.is_authenticated:
+            return CommunicationTemplate.objects.none()
+        
+        # Platform Admin (staff) sees all templates
+        if user.role == 'A' and user.is_staff:
+            return CommunicationTemplate.objects.all().select_related('school')
+        
+        # School Owner sees templates in their schools
+        if user.role == 'A' and not user.is_staff:
+            return CommunicationTemplate.objects.filter(
+                school__owner=user
+            ).select_related('school')
+        
+        # Instructor sees templates in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                return CommunicationTemplate.objects.filter(
+                    school=instructor_profile.school
+                ).select_related('school')
+        
+        # Students cannot access templates
+        return CommunicationTemplate.objects.none()
+    
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action == 'create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['duplicate', 'preview', 'toggle_active']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['available_variables', 'by_type', 'usage_stats']:
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """Create template with validation"""
+        user = self.request.user
+        school = serializer.validated_data.get('school')
+        
+        # Platform admin can create for any school
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can only create for their own schools
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only create templates for your own schools")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to create templates")
+    
+    def perform_update(self, serializer):
+        """Update template with permission checks"""
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Platform admin can update any template
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can update templates in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.school.owner != user:
+                raise PermissionDenied("You can only update templates in your own schools")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to update this template")
+    
+    def perform_destroy(self, instance):
+        """Delete template with permission checks"""
+        user = self.request.user
+        
+        # Check if template is in use
+        usage_count = instance.messages.filter(status='pending').count()
+        if usage_count > 0:
+            raise PermissionDenied(
+                f"Cannot delete template. It has {usage_count} pending messages. "
+                "Please cancel or send those messages first."
+            )
+        
+        # Platform admin can delete any template
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+        
+        # School owner can delete templates in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.school.owner != user:
+                raise PermissionDenied("You can only delete templates in your own schools")
+            instance.delete()
+            return
+        
+        raise PermissionDenied("You don't have permission to delete this template")
+    
+    # ==================== CUSTOM ACTIONS ====================
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def available_variables(self, request):
+        """
+        Get all available template variables with descriptions.
+        
+        GET /api/communication-templates/available_variables/
+        """
+        variables = CommunicationTemplateService.get_available_variables()
+        
+        return Response({
+            'variables': variables,
+            'total_variables': len(variables),
+            'usage_example': {
+                'subject': 'Hello {student_name}!',
+                'body': 'Your progress in {school_name} is {progress_theory}% for theory.'
+            }
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def duplicate(self, request, pk=None):
+        """
+        Duplicate an existing template.
+        
+        POST /api/communication-templates/{id}/duplicate/
+        Body: {"new_name": "Copy of Template Name"} (optional)
+        """
+        template = self.get_object()
+        user = request.user
+        
+
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if template.school.owner != user:
+                raise PermissionDenied("You can only duplicate templates from your own schools")
+        
+        # Get new name
+        new_name = request.data.get('new_name', f"Copy of {template.name}")
+        
+        # Check for duplicate name
+        if CommunicationTemplate.objects.filter(
+            school=template.school,
+            name=new_name
+        ).exists():
+            return Response(
+                {'error': 'A template with this name already exists in this school'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create duplicate
+        new_template = CommunicationTemplate.objects.create(
+            school=template.school,
+            name=new_name,
+            template_type=template.template_type,
+            subject=template.subject,
+            body=template.body,
+            is_active=False  # Start as inactive
+        )
+        
+        serializer = self.get_serializer(new_template)
+        
+        return Response({
+            'message': 'Template duplicated successfully',
+            'original_template': template.id,
+            'new_template': serializer.data
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    def preview(self, request, pk=None):
+        """
+        Preview template with sample data.
+        
+        POST /api/communication-templates/{id}/preview/
+        Body: {
+            "student_id": 123  (optional - uses sample data if not provided)
+        }
+        """
+        template = self.get_object()
+        student_id = request.data.get('student_id')
+        
+        # Get student data or use sample data
+        if student_id:
+            try:
+                student = StudentProfile.objects.select_related('user', 'school').get(id=student_id)
+                
+                # Check permissions
+                user = request.user
+                if user.role == 'A' and not user.is_staff:
+                    if student.school.owner != user:
+                        raise PermissionDenied("You can only preview with students from your schools")
+                
+                if user.role == 'I':
+                    instructor_profile = user.student_profiles.filter(status='A').first()
+                    if not instructor_profile or instructor_profile.school != student.school:
+                        raise PermissionDenied("You can only preview with students from your school")
+                
+                # Real data
+                data = {
+                    'student_name': student.user.get_full_name() or student.user.username,
+                    'progress_theory': f"{student.progress_theory}%",
+                    'progress_driving': f"{student.progress_driving}%",
+                    'school_name': student.school.name,
+                    'license_type': student.get_license_type_display() if student.license_type else 'Not specified',
+                    'total_hours_theory': student.total_hours_theory,
+                    'total_hours_driving': student.total_hours_driving,
+                    'instructor_name': 'Your Instructor',
+                    'lesson_date': 'Next scheduled lesson',
+                    'completion_date': student.completion_date or 'To be determined',
+                }
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'Student not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            # Sample data
+            data = {
+                'student_name': 'John Doe',
+                'progress_theory': '75%',
+                'progress_driving': '60%',
+                'school_name': template.school.name,
+                'license_type': 'Car',
+                'total_hours_theory': 30,
+                'total_hours_driving': 20,
+                'instructor_name': 'Jane Smith',
+                'lesson_date': (timezone.now() + timedelta(days=2)).strftime('%Y-%m-%d'),
+                'completion_date': (timezone.now() + timedelta(days=60)).strftime('%Y-%m-%d'),
+            }
+        
+        # Render template
+        try:
+            rendered_subject = template.subject.format(**data)
+            rendered_body = template.body.format(**data)
+        except KeyError as e:
+            return Response(
+                {'error': f'Template contains invalid variable: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        return Response({
+            'template': {
+                'id': template.id,
+                'name': template.name,
+                'type': template.template_type
+            },
+            'preview': {
+                'subject': rendered_subject,
+                'body': rendered_body
+            },
+            'data_used': data,
+            'is_sample_data': not student_id
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def toggle_active(self, request, pk=None):
+        """
+        Toggle template active status.
+        
+        POST /api/communication-templates/{id}/toggle_active/
+        """
+        template = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if template.school.owner != user:
+                raise PermissionDenied("You can only toggle templates in your own schools")
+        
+        # Toggle status
+        template.is_active = not template.is_active
+        template.save()
+        
+        serializer = self.get_serializer(template)
+        
+        return Response({
+            'message': f"Template {'activated' if template.is_active else 'deactivated'} successfully",
+            'template': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def by_type(self, request):
+        """
+        Get templates grouped by type.
+        
+        GET /api/communication-templates/by_type/
+        Query params:
+        - school_id: Filter by school (admins only)
+        """
+        queryset = self.get_queryset()
+        
+        # Filter by school if provided (admin only)
+        school_id = request.query_params.get('school_id')
+        if school_id:
+            user = request.user
+            if user.role == 'A' and user.is_staff:
+                queryset = queryset.filter(school_id=school_id)
+            else:
+                return Response(
+                    {'error': 'Only platform admins can filter by school_id'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Group by type
+        template_types = CommunicationTemplate.TEMPLATE_TYPES
+        grouped = {}
+        
+        for type_code, type_name in template_types:
+            templates = queryset.filter(template_type=type_code)
+            serializer = self.get_serializer(templates, many=True)
+            
+            grouped[type_code] = {
+                'type_name': type_name,
+                'count': templates.count(),
+                'active_count': templates.filter(is_active=True).count(),
+                'templates': serializer.data
+            }
+        
+        return Response({
+            'grouped_templates': grouped,
+            'total_types': len(template_types),
+            'total_templates': queryset.count()
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def usage_stats(self, request):
+        """
+        Get template usage statistics.
+        
+        GET /api/communication-templates/usage_stats/
+        """
+        queryset = self.get_queryset()
+        
+        # Overall stats
+        total_templates = queryset.count()
+        active_templates = queryset.filter(is_active=True).count()
+        
+        # Usage by template
+        templates_with_usage = queryset.annotate(
+            message_count=Count('messages'),
+            pending_count=Count('messages', filter=Q(messages__status='pending')),
+            sent_count=Count('messages', filter=Q(messages__status='sent'))
+        ).order_by('-message_count')[:10]
+        
+        most_used = []
+        for template in templates_with_usage:
+            most_used.append({
+                'id': template.id,
+                'name': template.name,
+                'type': template.template_type,
+                'total_messages': template.message_count,
+                'pending_messages': template.pending_count,
+                'sent_messages': template.sent_count
+            })
+        
+        # Templates never used
+        never_used = queryset.filter(messages__isnull=True).count()
+        
+        return Response({
+            'summary': {
+                'total_templates': total_templates,
+                'active_templates': active_templates,
+                'inactive_templates': total_templates - active_templates,
+                'never_used': never_used
+            },
+            'most_used_templates': most_used,
+            'total_messages_created': queryset.aggregate(
+                total=Count('messages')
+            )['total'] or 0
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    def my_school_templates(self, request):
+        """
+        Get templates for current user's school.
+        Convenience endpoint for school owners and instructors.
+        
+        GET /api/communication-templates/my_school_templates/
+        Query params:
+        - template_type: Filter by type
+        - active_only: true/false (default: false)
+        """
+        user = request.user
+        
+        # Get user's school
+        if user.role == 'A' and not user.is_staff:
+            # School owner - get all their schools' templates
+            queryset = self.get_queryset()
+        elif user.role == 'I':
+            # Instructor - get their school's templates
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You are not associated with any active school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            queryset = CommunicationTemplate.objects.filter(school=instructor_profile.school)
+        else:
+            return Response(
+                {'error': 'This endpoint is only for school owners and instructors'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Apply filters
+        template_type = request.query_params.get('template_type')
+        if template_type:
+            queryset = queryset.filter(template_type=template_type)
+        
+        active_only = request.query_params.get('active_only', 'false').lower() == 'true'
+        if active_only:
+            queryset = queryset.filter(is_active=True)
+        
+        # Serialize
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
