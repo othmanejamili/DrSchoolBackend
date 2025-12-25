@@ -2,31 +2,34 @@ from django.shortcuts import render
 from rest_framework import viewsets, status, permissions, filters
 from rest_framework.response import Response
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAdminUser, AllowAny, IsAuthenticated
-from django.db.models import Q
+from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 from django.utils import timezone
-from datetime import timedelta
 from .models import (User, DrivingSchool, StudentProfile, Lesson, 
                      Attendance, Schedule, Feedback, Vehicle, VehiclePicture,
-                     Achievement, CommunicationTemplate, AutomatedMessage)
+                     Achievement, CommunicationTemplate, AutomatedMessage,
+                     SchoolAnalytics)
 from .serializers import (UserSerializer, DrivingSchoolSerializer, ScheduleSerializer, VehicleSerializer,
                           VehiclePictureSerializer,StudentProfileSerializer, LessonSerializer,AttendanceSerializer,
-                          FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer, AutomatedMessageSerializer)
+                          FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer, 
+                          AutomatedMessageSerializer, SchoolAnalyticsSerializer)
 from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
                            IsPlatformAdminOrSchoolOwner, IsPlatformAdminOrSchoolOwnerOrInstructor,
                            IsStudent)
 from rest_framework.exceptions import PermissionDenied
-from django.db.models import Count
 from django.db import transaction
-from .services import StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService, CommunicationService, CommunicationTemplateService
-from django.db.models import Avg, Sum
+from .services import (StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService, 
+                       CommunicationService, CommunicationTemplateService, AnalyticsService)
+from django.db.models import Avg, Sum, Q, Count, F, Max, Min
 from django_filters.rest_framework import DjangoFilterBackend 
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from rest_framework.pagination import PageNumberPagination
 from django.utils.dateparse import parse_datetime
 from django.http import HttpResponse
 import csv
+from django.core.cache import cache
+
+
 
 User = get_user_model()
 
@@ -4156,6 +4159,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
                     school=instructor_profile.school
                 ).select_related('school')
         
+        
         # Students cannot access templates
         return CommunicationTemplate.objects.none()
     
@@ -4225,7 +4229,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         if usage_count > 0:
             raise PermissionDenied(
                 f"Cannot delete template. It has {usage_count} pending messages. "
-                "Please cancel or send those messages first."
+                f"Please cancel or send those messages first, or set template to inactive."
             )
         
         # Platform admin can delete any template
@@ -4564,3 +4568,2898 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
+# DSS-27-AutomatedMessageViewSet
+class AutomatedMessageViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing automated messages.
+    
+    Messages are scheduled communications sent to students.
+    
+    Access Control:
+    - Platform Admins: Full access to all messages
+    - School Owners: Manage messages in their schools
+    - Instructors: View and create messages for students in their school
+    - Students: View their own messages (read-only)
+    """
+    
+    serializer_class = AutomatedMessageSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['student', 'template', 'status', 'template__school']
+    search_fields = ['student__user__username', 'student__user__email', 'template__name']
+    ordering_fields = ['scheduled_for', 'sent_at', 'created_at', 'status']
+    ordering = ['-scheduled_for']
+
+    def get_queryset(self):
+        """Filter messages based on user role and school"""
+        user = self.request.user
+        if not user.is_authenticated:
+            return AutomatedMessage.objects.none()
+        
+        # Platform Admin (staff) sees all messages
+        if user.role == 'A' and user.is_staff:
+            return AutomatedMessage.objects.all().select_related(
+                'student__user', 'student__school', 'template'
+            )
+        
+        # School Owner sees messages in their schools
+        if user.role == 'A' and not user.is_staff:
+            return AutomatedMessage.objects.filter(
+                template__school__owner=user
+            ).select_related('student__user', 'student__school', 'template')
+        
+        # Instructor sees messages for students in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                return AutomatedMessage.objects.filter(
+                    student__school=instructor_profile.school
+                ).select_related('student__user', 'template')
+        
+        # Student sees only their own messages
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                return AutomatedMessage.objects.filter(
+                    student=student_profile
+                ).select_related('template')
+        
+        return AutomatedMessage.objects.none()
+    
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action == 'create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['cancel', 'pending', 'send_now', 'reschedule', 'bulk_create', 'bulk_cancel']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['my_messages', 'sent', 'failed', 'statistics']:
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """Create message with validation"""
+        user = self.request.user
+        student = serializer.validated_data.get('student')
+        template = serializer.validated_data.get('template')
+        
+        # Platform admin can create for any student
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can create for students in their schools
+        if user.role == 'A' and not user.is_staff:
+            if student.school.owner != user or template.school.owner != user:
+                raise PermissionDenied("Student and template must be from your schools")
+            serializer.save()
+            return
+        
+        # Instructor can create for students in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                raise PermissionDenied("You have no active school profile")
+            
+            if student.school != instructor_profile.school:
+                raise PermissionDenied("You can only create messages for students in your school")
+            
+            if template.school != instructor_profile.school:
+                raise PermissionDenied("Template must be from your school")
+            
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to create messages")
+    
+    def perform_update(self, serializer):
+        """Update message with permission checks"""
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Cannot update sent, delivered, or read messages
+        if instance.status in ['sent', 'delivered', 'read']:
+            raise PermissionDenied(f"Cannot update {instance.status} messages")
+        
+        # Platform admin can update any message
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can update messages in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.template.school.owner != user:
+                raise PermissionDenied("You can only update messages in your schools")
+            serializer.save()
+            return
+        
+        # Instructor can update messages in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != instance.student.school:
+                raise PermissionDenied("You can only update messages in your school")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to update this message")
+    
+    def perform_destroy(self, instance):
+        """Delete message with permission checks"""
+        user = self.request.user
+        
+        # Cannot delete sent messages
+        if instance.status in ['sent', 'delivered', 'read']:
+            raise PermissionDenied(f"Cannot delete {instance.status} messages")
+        
+        # Platform admin can delete any message
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+        
+        # School owner can delete messages in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.template.school.owner != user:
+                raise PermissionDenied("You can only delete messages in your schools")
+            instance.delete()
+            return
+        
+        raise PermissionDenied("You don't have permission to delete this message")
+    
+    # ==================== CUSTOM ACTIONS ====================
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_messages(self, request):
+        """
+        Get messages for the current student.
+        
+        GET /api/automated-messages/my_messages/
+        Query params:
+        - status: Filter by status
+        - limit: Number of messages (default: 20)
+        """
+        user = request.user
+        
+        if user.role != 'S':
+            return Response(
+                {'error': 'This endpoint is only for students'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            student_profile = StudentProfile.objects.get(user=user, status='A')
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {'error': 'No active student profile found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get messages
+        queryset = AutomatedMessage.objects.filter(
+            student=student_profile
+        ).select_related('template').order_by('-scheduled_for')
+        
+        # Apply filters
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        # Get statistics
+        total_messages = queryset.count()
+        pending_count = queryset.filter(status='pending').count()
+        sent_count = queryset.filter(status='sent').count()
+        
+        # Paginate
+        limit = min(int(request.query_params.get('limit', 20)), 100)
+        queryset = queryset[:limit]
+        
+        serializer = self.get_serializer(queryset, many=True)
+        
+        return Response({
+            'statistics': {
+                'total_messages': total_messages,
+                'pending': pending_count,
+                'sent': sent_count
+            },
+            'messages': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def pending(self, request):
+        """
+        Get all pending messages.
+        
+        GET /api/automated-messages/pending/
+        """
+        queryset = self.get_queryset().filter(status='pending').order_by('scheduled_for')
+        user = self.request.user
+        # Separate overdue and upcoming
+        now = timezone.now()
+        overdue = queryset.filter(scheduled_for__lt=now)
+        upcoming = queryset.filter(scheduled_for__gte=now)
+        
+        return Response({
+            'overdue': {
+                'count': overdue.count(),
+                'messages': self.get_serializer(overdue[:10], many=True).data
+            },
+            'upcoming': {
+                'count': upcoming.count(),
+                'messages': self.get_serializer(upcoming[:20], many=True).data
+            },
+            'total_pending': queryset.count()
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def sent(self, request):
+        """
+        Get recently sent messages.
+        
+        GET /api/automated-messages/sent/
+        Query params:
+        - days: Number of days to look back (default: 7, max: 30)
+        """
+        days = min(int(request.query_params.get('days', 7)), 30)
+        since = timezone.now() - timedelta(days=days)
+        
+        queryset = self.get_queryset().filter(
+            status__in=['sent', 'delivered', 'read'],
+            sent_at__gte=since
+        ).order_by('-sent_at')
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def failed(self, request):
+        """
+        Get failed messages that need attention.
+        
+        GET /api/automated-messages/failed/
+        """
+        queryset = self.get_queryset().filter(status='failed').order_by('-created_at')
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({
+            'total_failed': queryset.count(),
+            'messages': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        """
+        Cancel a pending message.
+        
+        POST /api/automated-messages/{id}/cancel/
+        """
+        message = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != message.student.school:
+                raise PermissionDenied("You can only cancel messages in your school")
+        
+        if user.role == 'A' and not user.is_staff:
+            if message.template.school.owner != user:
+                raise PermissionDenied("You can only cancel messages in your schools")
+        
+        # Can only cancel pending messages
+        if message.status != 'pending':
+            return Response(
+                {'error': f'Cannot cancel {message.status} message'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Delete the message
+        message_id = message.id
+        message.delete()
+        
+        return Response({
+            'message': 'Message cancelled successfully',
+            'cancelled_message_id': message_id
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def send_now(self, request, pk=None):
+        """
+        Send a message immediately.
+        
+        POST /api/automated-messages/{id}/send_now/
+        """
+        message = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if message.template.school.owner != user:
+                raise PermissionDenied("You can only send messages in your schools")
+        
+        if user.role == 'I':
+            raise PermissionDenied("You cannot send messages")
+
+        # Can only send pending messages
+        if message.status != 'pending':
+            return Response(
+                {'error': f'Cannot send {message.status} message'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Send the message
+            CommunicationService._send_single_message(message)
+            
+            # Update message status
+            message.status = 'sent'
+            message.sent_at = timezone.now()
+            message.save()
+            
+            serializer = self.get_serializer(message)
+            
+            return Response({
+                'message': 'Message sent successfully',
+                'sent_message': serializer.data,
+                'sent_at': message.sent_at
+            })
+            
+        except Exception as e:
+            message.status = 'failed'
+            message.delivery_error = str(e)
+            message.save()
+            
+            return Response({
+                'error': f'Failed to send message: {str(e)}',
+                'message_status': 'failed'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def reschedule(self, request, pk=None):
+        """
+        Reschedule a pending message.
+        
+        POST /api/automated-messages/{id}/reschedule/
+        Body: {"new_time": "2024-12-31T10:00:00"}
+        """
+        message = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != message.student.school:
+                raise PermissionDenied("You can only reschedule messages in your school")
+        
+        if user.role == 'A' and not user.is_staff:
+            if message.template.school.owner != user:
+                raise PermissionDenied("You can only reschedule messages in your schools")
+        
+        # Can only reschedule pending messages
+        if message.status != 'pending':
+            return Response(
+                {'error': f'Cannot reschedule {message.status} message'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get new time
+        new_time_str = request.data.get('new_time')
+        if not new_time_str:
+            return Response(
+                {'error': 'new_time is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            new_time = timezone.datetime.fromisoformat(new_time_str.replace('Z', '+00:00'))
+            if timezone.is_naive(new_time):
+                new_time = timezone.make_aware(new_time)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate new time is in the future
+        if new_time < timezone.now():
+            return Response(
+                {'error': 'Cannot reschedule to a past time'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update message
+        old_time = message.scheduled_for
+        message.scheduled_for = new_time
+        message.save()
+        
+        serializer = self.get_serializer(message)
+        
+        return Response({
+            'message': 'Message rescheduled successfully',
+            'rescheduled_message': serializer.data,
+            'old_time': old_time,
+            'new_time': new_time
+        })
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def bulk_create(self, request):
+        """
+        Create multiple messages at once.
+        
+        POST /api/automated-messages/bulk_create/
+        Body: {
+            "student_ids": [1, 2, 3],
+            "template_id": 123,
+            "scheduled_for": "2024-12-31T10:00:00",
+            "custom_subject": "Optional custom subject",
+            "custom_body": "Optional custom body"
+        }
+        """
+        student_ids = request.data.get('student_ids', [])
+        template_id = request.data.get('template_id')
+        scheduled_for_str = request.data.get('scheduled_for')
+        custom_subject = request.data.get('custom_subject')
+        custom_body = request.data.get('custom_body')
+        
+        # Validate required fields
+        if not student_ids:
+            return Response(
+                {'error': 'student_ids (array) is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not template_id:
+            return Response(
+                {'error': 'template_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not scheduled_for_str:
+            return Response(
+                {'error': 'scheduled_for is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Parse scheduled time
+        try:
+            scheduled_for = timezone.datetime.fromisoformat(scheduled_for_str.replace('Z', '+00:00'))
+            if timezone.is_naive(scheduled_for):
+                scheduled_for = timezone.make_aware(scheduled_for)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format for scheduled_for'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate time is in the future
+        if scheduled_for < timezone.now():
+            return Response(
+                {'error': 'scheduled_for must be in the future'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get template
+        try:
+            template = CommunicationTemplate.objects.get(id=template_id)
+        except CommunicationTemplate.DoesNotExist:
+            return Response(
+                {'error': 'Template not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get students
+        students = StudentProfile.objects.filter(id__in=student_ids).select_related('user', 'school')
+        
+        if not students.exists():
+            return Response(
+                {'error': 'No valid students found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You have no active school profile'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            invalid_students = students.exclude(school=instructor_profile.school)
+            if invalid_students.exists():
+                return Response(
+                    {'error': 'You cannot create messages for students from another school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Filter students to only those in instructor's school
+            #student = students.filter(school=instructor_profile.school)
+            if template.school != instructor_profile.school:
+                return Response(
+                    {'error': 'Template must be from your school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner - check all students and template are from their schools
+            for student in students:
+                if student.school.owner != user:
+                    return Response(
+                        {'error': f'Student {student.id} is not from your school'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+            
+            if template.school.owner != user:
+                return Response(
+                    {'error': 'Template is not from your school'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Create messages
+        created_messages = []
+        skipped_students = []
+        
+        for student in students:
+            # Check if similar message already exists
+            existing = AutomatedMessage.objects.filter(
+                student=student,
+                template=template,
+                scheduled_for=scheduled_for
+            ).exists()
+            
+            if existing:
+                skipped_students.append({
+                    'student_id': student.id,
+                    'reason': 'Similar message already scheduled'
+                })
+                continue
+            
+            # Create message
+            message = AutomatedMessage.objects.create(
+                student=student,
+                template=template,
+                scheduled_for=scheduled_for,
+                status='pending'
+            )
+            
+            created_messages.append({
+                'student_id': student.id,
+                'student_name': student.user.get_full_name() or student.user.username,
+                'message_id': message.id
+            })
+        
+        return Response({
+            'message': f'Created {len(created_messages)} messages',
+            'summary': {
+                'requested': len(student_ids),
+                'created': len(created_messages),
+                'skipped': len(skipped_students)
+            },
+            'created_messages': created_messages,
+            'skipped_students': skipped_students,
+            'scheduled_for': scheduled_for,
+            'template': template.name
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def bulk_cancel(self, request):
+        """
+        Cancel multiple messages.
+        
+        POST /api/automated-messages/bulk_cancel/
+        Body: {
+            "message_ids": [1, 2, 3],
+            "reason": "Optional reason"
+        }
+        """
+        message_ids = request.data.get('message_ids', [])
+        reason = request.data.get('reason', 'No reason provided')
+        
+        if not message_ids:
+            return Response(
+                {'error': 'message_ids (array) is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get messages
+        messages = AutomatedMessage.objects.filter(id__in=message_ids).select_related(
+            'student', 'template'
+        )
+        
+        if not messages.exists():
+            return Response(
+                {'error': 'No messages found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        cancelled_messages = []
+        failed_messages = []
+        
+        for message in messages:
+            # Check if user can cancel this message
+            can_cancel = False
+            if user.role == 'A' and user.is_staff:
+                can_cancel = True
+            elif user.role == 'A' and not user.is_staff:
+                can_cancel = message.template.school.owner == user
+            
+            if not can_cancel:
+                failed_messages.append({
+                    'message_id': message.id,
+                    'reason': 'Permission denied'
+                })
+                continue
+            
+            # Can only cancel pending messages
+            if message.status != 'pending':
+                failed_messages.append({
+                    'message_id': message.id,
+                    'reason': f'Message status is {message.status}'
+                })
+                continue
+            
+            # Cancel message
+            message_id = message.id
+            message.delete()
+            
+            cancelled_messages.append({
+                'message_id': message_id,
+                'student_id': message.student.id,
+                'template_id': message.template.id
+            })
+        
+        return Response({
+            'message': f'Cancelled {len(cancelled_messages)} messages',
+            'summary': {
+                'requested': len(message_ids),
+                'cancelled': len(cancelled_messages),
+                'failed': len(failed_messages)
+            },
+            'cancelled_messages': cancelled_messages,
+            'failed_messages': failed_messages,
+            'cancellation_reason': reason
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def statistics(self, request):
+        """
+        Get messaging statistics.
+        
+        GET /api/automated-messages/statistics/
+        Query params:
+        - school_id: Filter by school (admins only)
+        - days: Number of days to analyze (default: 30, max: 90)
+        """
+        queryset = self.get_queryset()
+        
+        # Filter by school if provided (admin only)
+        school_id = request.query_params.get('school_id')
+        if school_id:
+            user = request.user
+            if user.role == 'A' and user.is_staff:
+                queryset = queryset.filter(template__school_id=school_id)
+            else:
+                return Response(
+                    {'error': 'Only platform admins can filter by school_id'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Time range
+        days = min(int(request.query_params.get('days', 30)), 90)
+        since = timezone.now() - timedelta(days=days)
+        
+        # Overall statistics
+        total_messages = queryset.filter(created_at__gte=since).count()
+        
+        # Messages by status
+        by_status = dict(
+            queryset.filter(created_at__gte=since)
+            .values('status')
+            .annotate(count=Count('id'))
+            .values_list('status', 'count')
+        )
+        
+        # Messages by template type
+        by_template_type = dict(
+            queryset.filter(created_at__gte=since)
+            .values('template__template_type')
+            .annotate(count=Count('id'))
+            .values_list('template__template_type', 'count')
+        )
+        
+        # Daily message volume (last 7 days)
+        daily_volume = []
+        for i in range(7):
+            day = timezone.now() - timedelta(days=i)
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+            count = queryset.filter(
+                created_at__range=[day_start, day_end]
+            ).count()
+            
+            daily_volume.append({
+                'date': day.date(),
+                'messages_created': count
+            })
+        
+        # Delivery success rate
+        successful = queryset.filter(
+            status__in=['sent', 'delivered', 'read'],
+            created_at__gte=since
+        ).count()
+        
+        total_with_status = sum(by_status.values()) if by_status else 0
+        delivery_rate = round((successful / total_with_status * 100), 2) if total_with_status > 0 else 0
+        
+        # Templates with most messages
+        top_templates = queryset.filter(created_at__gte=since).values(
+            'template__id',
+            'template__name',
+            'template__template_type'
+        ).annotate(
+            message_count=Count('id')
+        ).order_by('-message_count')[:5]
+        
+        return Response({
+            'period': {
+                'days': days,
+                'since': since.date(),
+                'until': timezone.now().date()
+            },
+            'summary': {
+                'total_messages': total_messages,
+                'delivery_success_rate': f'{delivery_rate}%',
+                'pending_messages': by_status.get('pending', 0),
+                'failed_messages': by_status.get('failed', 0)
+            },
+            'by_status': by_status,
+            'by_template_type': by_template_type,
+            'daily_volume': daily_volume,
+            'top_templates': list(top_templates),
+            'successful_messages': successful,
+            'total_analyzed': total_with_status
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def upcoming_schedule(self, request):
+        """
+        Get upcoming message schedule.
+        
+        GET /api/automated-messages/upcoming_schedule/
+        Query params:
+        - days: Number of days ahead (default: 7, max: 30)
+        - student_id: Filter by student (optional)
+        - template_type: Filter by template type (optional)
+        """
+        days = min(int(request.query_params.get('days', 7)), 30)
+        end_date = timezone.now() + timedelta(days=days)
+        
+        queryset = self.get_queryset().filter(
+            status='pending',
+            scheduled_for__lte=end_date
+        ).order_by('scheduled_for')
+        
+        # Apply additional filters
+        student_id = request.query_params.get('student_id')
+        if student_id:
+            queryset = queryset.filter(student_id=student_id)
+        
+        template_type = request.query_params.get('template_type')
+        if template_type:
+            queryset = queryset.filter(template__template_type=template_type)
+        
+        # Group by day
+        schedule_by_day = {}
+        for message in queryset:
+            day_key = message.scheduled_for.date().isoformat()
+            if day_key not in schedule_by_day:
+                schedule_by_day[day_key] = []
+            
+            schedule_by_day[day_key].append({
+                'id': message.id,
+                'scheduled_for': message.scheduled_for,
+                'student': {
+                    'id': message.student.id,
+                    'name': message.student.user.get_full_name() or message.student.user.username
+                },
+                'template': {
+                    'id': message.template.id,
+                    'name': message.template.name,
+                    'type': message.template.template_type
+                }
+            })
+        
+        # Calculate daily counts
+        daily_counts = {
+            day: len(messages) for day, messages in schedule_by_day.items()
+        }
+        
+        # Today's count
+        today = timezone.now().date()
+        today_count = sum(
+            1 for message in queryset 
+            if message.scheduled_for.date() == today
+        )
+        
+        return Response({
+            'period': {
+                'days': days,
+                'start': timezone.now().date(),
+                'end': end_date.date()
+            },
+            'summary': {
+                'total_scheduled': queryset.count(),
+                'scheduled_today': today_count,
+                'days_with_schedule': len(schedule_by_day)
+            },
+            'daily_counts': daily_counts,
+            'schedule_by_day': schedule_by_day,
+            'today': today.isoformat()
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def summary(self, request):
+        """
+        Get summary of messages for the current user.
+        Role-specific summary.
+        
+        GET /api/automated-messages/summary/
+        """
+        user = request.user
+
+        if user.role == 'S':
+            # Student summary
+            try:
+                student_profile = StudentProfile.objects.get(user=user, status='A')
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'No active student profile found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            messages = AutomatedMessage.objects.filter(student=student_profile)
+
+            recent_unread_qs = messages.filter(
+                status__in=['sent', 'delivered'],
+                sent_at__isnull=False
+            ).order_by('-sent_at')[:5]
+
+            serializer = self.get_serializer(recent_unread_qs, many=True)
+
+            summary = {
+                'statistics': {
+                    'total_messages': messages.count(),
+                    'pending': messages.filter(status='pending').count(),
+                    'read': messages.filter(status='read').count(),
+                    'unread_sent': messages.filter(status='sent').count(),
+                },
+                'recent_unread': serializer.data
+            }
+
+            return Response(summary)
+
+        
+        elif user.role == 'I':
+            # Instructor summary
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You are not associated with any active school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            messages = AutomatedMessage.objects.filter(
+                student__school=instructor_profile.school
+            )
+            
+            # Messages by template type for instructor's school
+            by_type = dict(
+                messages.values('template__template_type')
+                .annotate(count=Count('id'))
+                .values_list('template__template_type', 'count')
+            )
+            
+            # Recent messages to students taught by this instructor
+            from .models import Attendance
+            students_taught = Attendance.objects.filter(
+                lesson__instructor=user,
+                presence=True
+            ).values_list('student', flat=True).distinct()
+            
+            recent_to_my_students = messages.filter(
+                student__in=students_taught
+            ).order_by('-created_at')[:10]
+            
+            summary = {
+                'school': instructor_profile.school.name,
+                'total_messages_in_school': messages.count(),
+                'pending_in_school': messages.filter(status='pending').count(),
+                'messages_by_type': by_type,
+                'my_students': {
+                    'total_students': len(students_taught),
+                    'recent_messages': self.get_serializer(recent_to_my_students, many=True).data
+                }
+            }
+            
+            return Response(summary)
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner summary
+            messages = AutomatedMessage.objects.filter(
+                template__school__owner=user
+            )
+            
+            # School-level statistics
+            schools = DrivingSchool.objects.filter(owner=user)
+            school_stats = []
+            
+            for school in schools:
+                school_messages = messages.filter(template__school=school)
+                school_stats.append({
+                    'school_id': school.id,
+                    'school_name': school.name,
+                    'total_messages': school_messages.count(),
+                    'pending': school_messages.filter(status='pending').count(),
+                    'failed': school_messages.filter(status='failed').count(),
+                    'top_template': school_messages.values('template__name')
+                        .annotate(count=Count('id'))
+                        .order_by('-count')
+                        .first()
+                })
+            
+            summary = {
+                'total_messages_across_schools': messages.count(),
+                'total_schools': schools.count(),
+                'school_statistics': school_stats,
+                'pending_messages': messages.filter(status='pending').count(),
+                'failed_messages': messages.filter(status='failed').count(),
+                'recent_messages': self.get_serializer(
+                    messages.order_by('-created_at')[:10], many=True
+                ).data
+            }
+            
+            return Response(summary)
+        
+        else:
+            # Platform admin summary
+            messages = AutomatedMessage.objects.all()
+            
+            summary = {
+                'total_messages': messages.count(),
+                'messages_today': messages.filter(
+                    created_at__date=timezone.now().date()
+                ).count(),
+                'by_status': dict(
+                    messages.values('status')
+                    .annotate(count=Count('id'))
+                    .values_list('status', 'count')
+                ),
+                'by_school': dict(
+                    messages.values('template__school__name')
+                    .annotate(count=Count('id'))
+                    .values_list('template__school__name', 'count')
+                ),
+                'recent_activity': self.get_serializer(
+                    messages.order_by('-created_at')[:20], many=True
+                ).data
+            }
+            
+            return Response(summary)
+
+
+#DSS-13-Create-AnalyticsViewSet
+class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing school analytics.
+    
+    Provides comprehensive analytics and reporting for driving schools.
+    
+    Access Control:
+    - Platform Admins: Full access to all school analytics
+    - School Owners: View and manage analytics for their schools
+    - Instructors: View analytics for their school (read-only)
+    - Students: Cannot access analytics
+    """
+    
+    serializer_class = SchoolAnalyticsSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['school', 'date']
+    search_fields = ['school__name']
+    ordering_fields = ['date', 'total_students', 'active_students', 'completion_rate', 'revenue']
+    ordering = ['-date']
+
+    def get_queryset(self):
+        """Filter analytics based on user role and school"""
+        user = self.request.user
+        if not user.is_authenticated:
+            return SchoolAnalytics.objects.none()
+        
+        # Platform Admin (staff) sees all analytics
+        if user.role == 'A' and user.is_staff:
+            return SchoolAnalytics.objects.all().select_related('school')
+        
+        # School Owner sees analytics for their schools
+        if user.role == 'A' and not user.is_staff:
+            return SchoolAnalytics.objects.filter(
+                school__owner=user
+            ).select_related('school')
+        
+        # Instructor sees analytics for their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                return SchoolAnalytics.objects.filter(
+                    school=instructor_profile.school
+                ).select_related('school')
+        
+        if user.role == 'S':
+            raise PermissionDenied("Students cannot access analytics")
+        
+        
+        # Students cannot access analytics
+        return SchoolAnalytics.objects.none()
+    
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action == 'create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        
+        elif self.action in ['generate_daily', 'refresh', 'bulk_generate','export','predictions','system_health','comparison']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['dashboard', 'trends']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action == 'system_health':
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """Create analytics with validation"""
+        user = self.request.user
+        school = serializer.validated_data.get('school')
+        
+        # Platform admin can create for any school
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can only create for their own schools
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only create analytics for your own schools")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to create analytics")
+    
+    def perform_update(self, serializer):
+        """Update analytics with permission checks"""
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Platform admin can update any analytics
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can update analytics for their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.school.owner != user:
+                raise PermissionDenied("You can only update analytics for your own schools")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to update this analytics record")
+    
+    def perform_destroy(self, instance):
+        """Delete analytics with permission checks"""
+        user = self.request.user
+        
+        # Only platform admin can delete analytics
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+        
+        raise PermissionDenied("Only platform administrators can delete analytics records")
+    
+    # ==================== CUSTOM ACTIONS ====================
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def dashboard(self, request):
+        """
+        Get comprehensive dashboard data for a school.
+        
+        GET /api/school-analytics/dashboard/
+        Query params:
+        - school_id: Required for platform admins, optional for school owners
+        - date_range: 'today', 'week', 'month', 'year' (default: 'month')
+        """
+        user = request.user
+        school_id = request.query_params.get('school_id')
+        date_range = request.query_params.get('date_range', 'month')
+        
+        # Determine school
+        if user.role == 'A' and user.is_staff:
+            # Platform admin must provide school_id
+            if not school_id:
+                return Response(
+                    {'error': 'school_id is required for platform admins'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            try:
+                school = DrivingSchool.objects.get(id=school_id)
+            except DrivingSchool.DoesNotExist:
+                return Response(
+                    {'error': 'School not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner - use provided school_id or their first school
+            if school_id:
+                try:
+                    school = DrivingSchool.objects.get(id=school_id, owner=user)
+                except DrivingSchool.DoesNotExist:
+                    return Response(
+                        {'error': 'School not found or you do not own this school'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            else:
+                school = DrivingSchool.objects.filter(owner=user).first()
+                if not school:
+                    return Response(
+                        {'error': 'You do not own any schools'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+        
+        elif user.role == 'I':
+            # Instructor - use their school
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You are not associated with any active school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            school = instructor_profile.school
+        
+        else:
+            return Response(
+                {'error': 'Invalid user role for this endpoint'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Calculate date range
+        today = timezone.now().date()
+        if date_range == 'today':
+            start_date = today
+            end_date = today
+        elif date_range == 'week':
+            start_date = today - timedelta(days=7)
+            end_date = today
+        elif date_range == 'year':
+            start_date = today - timedelta(days=365)
+            end_date = today
+        else:  # month (default)
+            start_date = today - timedelta(days=30)
+            end_date = today
+        
+        # Get analytics data
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        # Current metrics (most recent data)
+        latest_analytics = analytics_records.last()
+        
+        if not latest_analytics:
+            # Generate analytics if none exist
+            latest_analytics = AnalyticsService.generate_daily_analytics(school, today)
+        
+        # Student metrics
+        total_students = StudentProfile.objects.filter(
+            school=school,
+            user__role='S'
+        ).count()
+        
+        active_students = StudentProfile.objects.filter(
+            school=school,
+            user__role='S',
+            status='A'
+        ).count()
+        
+        completed_students = StudentProfile.objects.filter(
+            school=school,
+            user__role='S',
+            status='C'
+        ).count()
+        
+        # Instructor metrics
+        total_instructors = StudentProfile.objects.filter(
+            school=school,
+            user__role='I',
+            status='A'
+        ).count()
+        
+        # Lesson metrics
+        lessons_this_period = Lesson.objects.filter(
+            school=school,
+            date__range=[timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                        timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))]
+        )
+        
+        total_lessons = lessons_this_period.count()
+        completed_lessons = lessons_this_period.filter(status='C').count()
+        scheduled_lessons = lessons_this_period.filter(status='S').count()
+        
+        # Average rating
+        avg_rating = Feedback.objects.filter(
+            lesson__school=school,
+            created_at__date__range=[start_date, end_date]
+        ).aggregate(avg=Avg('rating'))['avg'] or 0
+        
+        # Revenue trend (last 7 days)
+        revenue_trend = []
+        for i in range(7):
+            day = today - timedelta(days=6-i)
+            day_analytics = analytics_records.filter(date=day).first()
+            revenue_trend.append({
+                'date': day,
+                'revenue': float(day_analytics.revenue) if day_analytics else 0
+            })
+        
+        # Student growth trend (last 7 days)
+        student_trend = []
+        for i in range(7):
+            day = today - timedelta(days=6-i)
+            day_analytics = analytics_records.filter(date=day).first()
+            student_trend.append({
+                'date': day,
+                'active_students': day_analytics.active_students if day_analytics else 0,
+                'new_students': day_analytics.new_students if day_analytics else 0
+            })
+        
+        # Top performing students (by completion percentage)
+        top_students = StudentProfile.objects.filter(
+            school=school,
+            user__role='S',
+            status='A'
+        ).annotate(
+            completion=((F('progress_theory') + F('progress_driving')) / 2)
+        ).order_by('-completion')[:5]
+        
+        top_students_data = [{
+            'id': student.id,
+            'name': student.user.get_full_name() or student.user.username,
+            'completion_percentage': round((student.progress_theory + student.progress_driving) / 2, 2),
+            'total_hours': student.total_hours_theory + student.total_hours_driving
+        } for student in top_students]
+        
+        # Recent feedback
+        recent_feedback = Feedback.objects.filter(
+            lesson__school=school
+        ).select_related('student__user', 'lesson__instructor').order_by('-created_at')[:5]
+        
+        recent_feedback_data = [{
+            'id': feedback.id,
+            'student': feedback.student.user.get_full_name() or feedback.student.user.username,
+            'lesson': feedback.lesson.title,
+            'rating': feedback.rating,
+            'comment': feedback.comment[:100] if feedback.comment else '',
+            'created_at': feedback.created_at
+        } for feedback in recent_feedback]
+        
+        # Instructor performance
+        instructor_stats = []
+        instructors = User.objects.filter(
+            role='I',
+            student_profiles__school=school,
+            student_profiles__status='A'
+        ).distinct()
+        
+        for instructor in instructors:
+            lessons_taught = Lesson.objects.filter(
+                instructor=instructor,
+                school=school,
+                date__range=[timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                            timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))]
+            ).count()
+            
+            avg_instructor_rating = Feedback.objects.filter(
+                lesson__instructor=instructor,
+                lesson__school=school
+            ).aggregate(avg=Avg('rating'))['avg'] or 0
+            
+            instructor_stats.append({
+                'id': instructor.id,
+                'name': instructor.get_full_name() or instructor.username,
+                'lessons_taught': lessons_taught,
+                'average_rating': round(avg_instructor_rating, 2)
+            })
+        
+        # Compile dashboard data
+        dashboard_data = {
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'email': school.email
+            },
+            'period': {
+                'range': date_range,
+                'start_date': start_date,
+                'end_date': end_date
+            },
+            'current_metrics': {
+                'total_students': total_students,
+                'active_students': active_students,
+                'completed_students': completed_students,
+                'total_instructors': total_instructors,
+                'completion_rate': round(latest_analytics.completion_rate, 2) if latest_analytics else 0,
+                'average_rating': round(avg_rating, 2),
+                'instructor_utilization': round(latest_analytics.instructor_utilization, 2) if latest_analytics else 0
+            },
+            'lessons': {
+                'total': total_lessons,
+                'completed': completed_lessons,
+                'scheduled': scheduled_lessons,
+                'completion_rate': round((completed_lessons / total_lessons * 100), 2) if total_lessons > 0 else 0
+            },
+            'revenue': {
+                'total': float(latest_analytics.revenue) if latest_analytics else 0,
+                'trend': revenue_trend
+            },
+            'students': {
+                'trend': student_trend,
+                'top_performers': top_students_data
+            },
+            'instructors': instructor_stats,
+            'recent_feedback': recent_feedback_data
+        }
+        
+        return Response(dashboard_data)
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def generate_daily(self, request):
+        """
+        Generate daily analytics for a school.
+        
+        POST /api/school-analytics/generate_daily/
+        Body: {
+            "school_id": 123,
+            "date": "2024-12-31" (optional, defaults to today)
+        }
+        """
+        user = request.user
+        school_id = request.data.get('school_id')
+        date_str = request.data.get('date')
+        
+        # Validate school_id
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only generate analytics for your own schools")
+        
+        # Parse date
+        if date_str:
+            try:
+                target_date = timezone.datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            target_date = timezone.now().date()
+        
+        # Generate analytics
+        analytics = AnalyticsService.generate_daily_analytics(school, target_date, force_refresh=True)
+        
+        serializer = self.get_serializer(analytics)
+        
+        return Response({
+            'message': 'Analytics generated successfully',
+            'analytics': serializer.data
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def refresh(self, request, pk=None):
+        """
+        Refresh existing analytics record.
+        
+        POST /api/school-analytics/{id}/refresh/
+        """
+        analytics = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if analytics.school.owner != user:
+                raise PermissionDenied("You can only refresh analytics for your own schools")
+        
+        # Refresh analytics
+        refreshed_analytics = AnalyticsService.generate_daily_analytics(
+            analytics.school, 
+            analytics.date, 
+            force_refresh=True
+        )
+        
+        serializer = self.get_serializer(refreshed_analytics)
+        
+        return Response({
+            'message': 'Analytics refreshed successfully',
+            'analytics': serializer.data
+        })
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def bulk_generate(self, request):
+        """
+        Generate analytics for multiple schools or date range.
+        
+        POST /api/school-analytics/bulk_generate/
+        Body: {
+            "school_ids": [1, 2, 3], (optional, all schools if not provided)
+            "start_date": "2024-01-01",
+            "end_date": "2024-12-31"
+        }
+        """
+        user = request.user
+        school_ids = request.data.get('school_ids', [])
+        start_date_str = request.data.get('start_date')
+        end_date_str = request.data.get('end_date')
+        
+        # Validate dates
+        if not start_date_str or not end_date_str:
+            return Response(
+                {'error': 'start_date and end_date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            start_date = timezone.datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            end_date = timezone.datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if end_date < start_date:
+            return Response(
+                {'error': 'end_date must be after start_date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Limit date range to prevent performance issues
+        days_diff = (end_date - start_date).days
+        if days_diff > 90:
+            return Response(
+                {'error': 'Date range cannot exceed 90 days'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get schools
+        if school_ids:
+            schools = DrivingSchool.objects.filter(id__in=school_ids)
+            
+            # Check permissions
+            if user.role == 'A' and not user.is_staff:
+                schools = schools.filter(owner=user)
+                if schools.count() != len(school_ids):
+                    return Response(
+                        {'error': 'Some schools do not belong to you'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+        else:
+            # Generate for all accessible schools
+            if user.role == 'A' and user.is_staff:
+                schools = DrivingSchool.objects.all()
+            else:
+                schools = DrivingSchool.objects.filter(owner=user)
+        
+        if not schools.exists():
+            return Response(
+                {'error': 'No schools found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Generate analytics
+        generated_count = 0
+        skipped_count = 0
+        
+        for school in schools:
+            current_date = start_date
+            while current_date <= end_date:
+                # Check if analytics already exists
+                exists = SchoolAnalytics.objects.filter(
+                    school=school,
+                    date=current_date
+                ).exists()
+                
+                if not exists:
+                    AnalyticsService.generate_daily_analytics(school, current_date)
+                    generated_count += 1
+                else:
+                    skipped_count += 1
+                
+                current_date += timedelta(days=1)
+        
+        return Response({
+            'message': f'Bulk analytics generation completed',
+            'summary': {
+                'schools_processed': schools.count(),
+                'date_range_days': days_diff + 1,
+                'records_generated': generated_count,
+                'records_skipped': skipped_count,
+                'total_records': generated_count + skipped_count
+            }
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def trends(self, request):
+        """
+        Get trend analysis for a school.
+        
+        GET /api/school-analytics/trends/
+        Query params:
+        - school_id: Required
+        - metric: 'students', 'revenue', 'completion_rate', 'rating' (default: 'students')
+        - days: Number of days (default: 30, max: 365)
+        """
+        school_id = request.query_params.get('school_id')
+        metric = request.query_params.get('metric', 'students')
+        days = min(int(request.query_params.get('days', 30)), 365)
+        
+        # Validate school_id
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only view trends for your own schools")
+        
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != school:
+                raise PermissionDenied("You can only view trends for your school")
+        
+        # Get analytics data
+        end_date = timezone.now().date()
+        start_date = end_date - timedelta(days=days-1)
+        
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        # Build trend data based on metric
+        trend_data = []
+        
+        for record in analytics_records:
+            data_point = {'date': record.date}
+            
+            if metric == 'students':
+                data_point['total_students'] = record.total_students
+                data_point['active_students'] = record.active_students
+                data_point['new_students'] = record.new_students
+            
+            elif metric == 'revenue':
+                data_point['revenue'] = float(record.revenue)
+            
+            elif metric == 'completion_rate':
+                data_point['completion_rate'] = float(record.completion_rate)
+            
+            elif metric == 'rating':
+                data_point['average_rating'] = float(record.average_rating)
+            
+            else:
+                return Response(
+                    {'error': f'Invalid metric: {metric}. Use students, revenue, completion_rate, or rating'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            trend_data.append(data_point)
+        
+        # Calculate summary statistics
+        if trend_data:
+            if metric == 'students':
+                summary = {
+                    'current_total': trend_data[-1]['total_students'],
+                    'current_active': trend_data[-1]['active_students'],
+                    'total_new_students': sum(d['new_students'] for d in trend_data),
+                    'average_active': sum(d['active_students'] for d in trend_data) / len(trend_data)
+                }
+            
+            elif metric == 'revenue':
+                summary = {
+                    'total_revenue': sum(d['revenue'] for d in trend_data),
+                    'average_daily_revenue': sum(d['revenue'] for d in trend_data) / len(trend_data),
+                    'highest_revenue': max(d['revenue'] for d in trend_data),
+                    'lowest_revenue': min(d['revenue'] for d in trend_data)
+                }
+            
+            elif metric == 'completion_rate':
+                summary = {
+                    'current_rate': trend_data[-1]['completion_rate'],
+                    'average_rate': sum(d['completion_rate'] for d in trend_data) / len(trend_data),
+                    'highest_rate': max(d['completion_rate'] for d in trend_data),
+                    'lowest_rate': min(d['completion_rate'] for d in trend_data)
+                }
+            
+            else:  # rating
+                summary = {
+                    'current_rating': trend_data[-1]['average_rating'],
+                    'average_rating': sum(d['average_rating'] for d in trend_data) / len(trend_data),
+                    'highest_rating': max(d['average_rating'] for d in trend_data),
+                    'lowest_rating': min(d['average_rating'] for d in trend_data)
+                }
+        else:
+            summary = {'message': 'No data available for this period'}
+        
+        return Response({
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': days
+            },
+            'metric': metric,
+            'summary': summary,
+            'trend_data': trend_data,
+            'data_points': len(trend_data)
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def comparison(self, request):
+        """
+        Compare multiple schools or time periods.
+        
+        GET /api/school-analytics/comparison/
+        Query params:
+        - school_ids: Comma-separated school IDs (e.g., "1,2,3")
+        - start_date: YYYY-MM-DD
+        - end_date: YYYY-MM-DD
+        """
+        user = request.user
+        school_ids_str = request.query_params.get('school_ids')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        
+
+        # Validate inputs
+        if not school_ids_str:
+            return Response(
+                {'error': 'school_ids is required (comma-separated)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            school_ids = [int(id.strip()) for id in school_ids_str.split(',')]
+        except ValueError:
+            return Response(
+                {'error': 'Invalid school_ids format'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if len(school_ids) > 5:
+            return Response(
+                {'error': 'Cannot compare more than 5 schools at once'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Parse dates
+        # Check if only one date is provided (missing the other)
+        if (start_date_str and not end_date_str) or (end_date_str and not start_date_str):
+            # One date is missing
+            if start_date_str and not end_date_str:
+                return Response(
+                    {'error': 'Missing end_date. Both start_date and end_date are required together.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            elif end_date_str and not start_date_str:
+                return Response(
+                    {'error': 'Missing start_date. Both start_date and end_date are required together.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Both dates provided
+        if start_date_str and end_date_str:
+            try:
+                start_date = timezone.datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = timezone.datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Validate date range
+            if start_date > end_date:
+                return Response(
+                    {
+                        'error': f'Invalid date range',
+                        'detail': f'Start date ({start_date}) cannot be after end date ({end_date})',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Check minimum date range (if needed)
+            if (end_date - start_date).days < 1:
+                return Response(
+                    {'error': 'Date range must be at least 1 day'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # No dates provided, use defaults
+        else:
+            return Response(
+                {'error': 'Both start_date and end_date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Get schools
+        schools = DrivingSchool.objects.filter(id__in=school_ids)
+        
+        if not schools.exists():
+            return Response(
+                {'error': 'No schools found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'A' and not user.is_staff:
+            # School owner can only compare their own schools
+            schools = schools.filter(owner=user)
+            if schools.count() != len(school_ids):
+                return Response(
+                    {'error': 'Some schools do not belong to you'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        if user.role == 'I':
+            # Instructor can only view their school
+            return Response(
+                {'error': 'Instructors can only view their own school, not compare'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Continuing from where the comparison action left off...
+    
+        # Get analytics for comparison
+        comparison_data = []
+        
+        for school in schools:
+            # Get analytics for the period
+            analytics_records = SchoolAnalytics.objects.filter(
+                school=school,
+                date__range=[start_date, end_date]
+            ).order_by('date')
+            
+            # Calculate averages
+            avg_total_students = analytics_records.aggregate(avg=Avg('total_students'))['avg'] or 0
+            avg_active_students = analytics_records.aggregate(avg=Avg('active_students'))['avg'] or 0
+            avg_completion_rate = analytics_records.aggregate(avg=Avg('completion_rate'))['avg'] or 0
+            avg_rating = analytics_records.aggregate(avg=Avg('average_rating'))['avg'] or 0
+            avg_revenue = analytics_records.aggregate(avg=Avg('revenue'))['avg'] or 0
+            total_revenue = analytics_records.aggregate(total=Sum('revenue'))['total'] or 0
+            total_lessons = analytics_records.aggregate(total=Sum('lessons_completed'))['total'] or 0
+            
+            # Get latest record for current metrics
+            latest_record = analytics_records.last()
+            
+            # Get student enrollment trend
+            new_students_total = analytics_records.aggregate(total=Sum('new_students'))['total'] or 0
+            
+            # Add to comparison data
+            school_data = {
+                'school': {
+                    'id': school.id,
+                    'name': school.name,
+                    'owner': school.owner.get_full_name() or school.owner.username
+                },
+                'period_summary': {
+                    'average_total_students': round(avg_total_students, 2),
+                    'average_active_students': round(avg_active_students, 2),
+                    'average_completion_rate': round(avg_completion_rate, 2),
+                    'average_rating': round(avg_rating, 2),
+                    'average_daily_revenue': round(avg_revenue, 2),
+                    'total_revenue': round(total_revenue, 2),
+                    'total_lessons_completed': total_lessons,
+                    'new_students': new_students_total
+                },
+                'current_metrics': {
+                    'total_students': latest_record.total_students if latest_record else 0,
+                    'active_students': latest_record.active_students if latest_record else 0,
+                    'completion_rate': latest_record.completion_rate if latest_record else 0,
+                    'average_rating': latest_record.average_rating if latest_record else 0,
+                    'instructor_utilization': latest_record.instructor_utilization if latest_record else 0
+                } if latest_record else {},
+                'data_points': analytics_records.count()
+            }
+            
+            comparison_data.append(school_data)
+        
+        # Calculate growth rates
+        for data in comparison_data:
+            if data['data_points'] >= 2:
+                # Get first and last analytics for growth calculation
+                school = schools.get(id=data['school']['id'])
+                first_record = SchoolAnalytics.objects.filter(
+                    school=school,
+                    date__range=[start_date, end_date]
+                ).order_by('date').first()
+                
+                last_record = SchoolAnalytics.objects.filter(
+                    school=school,
+                    date__range=[start_date, end_date]
+                ).order_by('date').last()
+                
+                if first_record and last_record and first_record != last_record:
+                    # Calculate growth rates
+                    student_growth = ((last_record.total_students - first_record.total_students) / 
+                                    first_record.total_students * 100) if first_record.total_students > 0 else 0
+                    
+                    revenue_growth = ((last_record.revenue - first_record.revenue) / 
+                                    first_record.revenue * 100) if first_record.revenue > 0 else 0
+                    
+                    completion_growth = last_record.completion_rate - first_record.completion_rate
+                    
+                    data['growth_rates'] = {
+                        'student_growth': round(student_growth, 2),
+                        'revenue_growth': round(revenue_growth, 2),
+                        'completion_growth': round(completion_growth, 2),
+                        'period': f"{first_record.date} to {last_record.date}"
+                    }
+        
+        # Sort by performance (completion rate, then revenue)
+        comparison_data.sort(
+            key=lambda x: (
+                x['period_summary']['average_completion_rate'],
+                x['period_summary']['total_revenue']
+            ),
+            reverse=True
+        )
+        
+        # Add rankings
+        for idx, data in enumerate(comparison_data, 1):
+            data['rank'] = idx
+        
+        # Overall statistics
+        overall_stats = {
+            'total_schools_compared': len(comparison_data),
+            'highest_completion_rate': max(
+                [d['period_summary']['average_completion_rate'] for d in comparison_data]
+            ) if comparison_data else 0,
+            'highest_average_rating': max(
+                [d['period_summary']['average_rating'] for d in comparison_data]
+            ) if comparison_data else 0,
+            'highest_total_revenue': max(
+                [d['period_summary']['total_revenue'] for d in comparison_data]
+            ) if comparison_data else 0,
+            'average_across_schools': {
+                'completion_rate': round(
+                    sum([d['period_summary']['average_completion_rate'] for d in comparison_data]) / 
+                    len(comparison_data), 2
+                ) if comparison_data else 0,
+                'rating': round(
+                    sum([d['period_summary']['average_rating'] for d in comparison_data]) / 
+                    len(comparison_data), 2
+                ) if comparison_data else 0
+            }
+        }
+        
+        return Response({
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': (end_date - start_date).days + 1
+            },
+            'overall_statistics': overall_stats,
+            'school_comparison': comparison_data,
+            'performance_ranking': comparison_data[:3] if len(comparison_data) >= 3 else comparison_data
+        })
+    
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """
+        Export analytics data in CSV or JSON format.
+        
+        Query params:
+        - school_id: Required
+        - start_date: YYYY-MM-DD (optional, defaults to last 30 days)
+        - end_date: YYYY-MM-DD (optional, defaults to today)
+        - format: 'csv' or 'json' (default: 'csv')
+        """
+
+        
+        school_id = request.query_params.get('school_id')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        export_format = request.query_params.get('format', 'csv').lower()
+        
+        # Validate format
+        if export_format not in ['csv', 'json']:
+            return Response(
+                {'error': "Format must be 'csv' or 'json'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only export analytics for your own schools")
+        
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != school:
+                raise PermissionDenied("You can only export analytics for your school")
+        
+        # Parse dates or use defaults
+        try:
+            if start_date_str and end_date_str:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            else:
+                # Default to last 30 days
+                end_date = timezone.now().date()
+                start_date = end_date - timedelta(days=30)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate date range
+        if start_date > end_date:
+            return Response(
+                {'error': 'Start date cannot be after end date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Limit export range
+        days_diff = (end_date - start_date).days
+        if days_diff > 365:
+            return Response(
+                {'error': 'Export range cannot exceed 365 days'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get analytics data
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        # Prepare data
+        export_data = []
+        for record in analytics_records:
+            export_data.append({
+                'date': record.date.isoformat(),
+                'total_students': record.total_students,
+                'active_students': record.active_students,
+                'new_students': record.new_students,
+                'completion_rate': float(record.completion_rate),
+                'revenue': float(record.revenue),
+                'average_rating': float(record.average_rating) if record.average_rating else 0,
+                'lessons_completed': record.lessons_completed,
+                'instructor_utilization': float(record.instructor_utilization)
+            })
+        
+        # Calculate summary
+        summary = {
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'owner': school.owner.get_full_name() or school.owner.username
+            },
+            'period': {
+                'start_date': start_date.isoformat(),
+                'end_date': end_date.isoformat(),
+                'days': days_diff + 1
+            },
+            'total_records': len(export_data),
+            'metrics_summary': {
+                'average_total_students': round(
+                    sum(d['total_students'] for d in export_data) / len(export_data), 2
+                ) if export_data else 0,
+                'average_active_students': round(
+                    sum(d['active_students'] for d in export_data) / len(export_data), 2
+                ) if export_data else 0,
+                'average_completion_rate': round(
+                    sum(d['completion_rate'] for d in export_data) / len(export_data), 2
+                ) if export_data else 0,
+                'total_revenue': round(
+                    sum(d['revenue'] for d in export_data), 2
+                ) if export_data else 0,
+                'average_rating': round(
+                    sum(d['average_rating'] for d in export_data) / len(export_data), 2
+                ) if export_data else 0,
+                'total_lessons_completed': sum(d['lessons_completed'] for d in export_data) if export_data else 0,
+                'total_new_students': sum(d['new_students'] for d in export_data) if export_data else 0
+            }
+        }
+        
+        # Export based on format
+        if export_format == 'csv':
+            response = HttpResponse(content_type='text/csv')
+            response['Content-Disposition'] = f'attachment; filename="{school.name}_analytics_{start_date}_{end_date}.csv"'
+            
+            writer = csv.DictWriter(response, fieldnames=[
+                'date', 'total_students', 'active_students', 'new_students',
+                'completion_rate', 'revenue', 'average_rating',
+                'lessons_completed', 'instructor_utilization'
+            ])
+            
+            writer.writeheader()
+            writer.writerows(export_data)
+            
+            return response
+        
+        else:  # JSON format
+            return Response({
+                'metadata': summary,
+                'data': export_data,
+                'export_format': 'json',
+                'exported_at': timezone.now().isoformat()
+            })
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    def alerts(self, request):
+        """
+        Get performance alerts for a school.
+        Identifies areas needing attention.
+        
+        GET /api/school-analytics/alerts/
+        Query params:
+        - school_id: Required
+        - days: Lookback period (default: 7, max: 30)
+        """
+        school_id = request.query_params.get('school_id')
+        days = min(int(request.query_params.get('days', 7)), 30)
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only view alerts for your own schools")
+        
+        end_date = timezone.now().date()
+        start_date = end_date - timedelta(days=days)
+        
+        # Get analytics for the period
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if not analytics_records.exists():
+            return Response({
+                'school': school.name,
+                'period': f'{start_date} to {end_date}',
+                'message': 'No analytics data available for this period',
+                'alerts': []
+            })
+        
+        latest_record = analytics_records.last()
+        first_record = analytics_records.first()
+        
+        alerts = []
+        
+        # Check for low completion rate
+        if latest_record.completion_rate < 50:
+            alerts.append({
+                'type': 'warning',
+                'code': 'LOW_COMPLETION_RATE',
+                'title': 'Low Completion Rate',
+                'message': f'Completion rate is {latest_record.completion_rate}%, below 50% threshold',
+                'severity': 'high',
+                'suggestion': 'Review student progress and provide additional support to struggling students.'
+            })
+        
+        # Check for declining enrollment
+        if latest_record.total_students < first_record.total_students:
+            decline_percentage = ((first_record.total_students - latest_record.total_students) / 
+                                first_record.total_students * 100) if first_record.total_students > 0 else 0
+            
+            if decline_percentage > 10:
+                alerts.append({
+                    'type': 'warning',
+                    'code': 'DECLINING_ENROLLMENT',
+                    'title': 'Declining Student Enrollment',
+                    'message': f'Student enrollment declined by {decline_percentage:.1f}% over {days} days',
+                    'severity': 'medium',
+                    'suggestion': 'Review marketing strategies and student retention programs.'
+                })
+        
+        # Check for low instructor utilization
+        if latest_record.instructor_utilization < 60:
+            alerts.append({
+                'type': 'info',
+                'code': 'LOW_INSTRUCTOR_UTILIZATION',
+                    'title': 'Low Instructor Utilization',
+                    'message': f'Instructor utilization is {latest_record.instructor_utilization}%, below optimal levels',
+                    'severity': 'medium',
+                    'suggestion': 'Consider optimizing instructor schedules or offering more lessons.'
+                })
+        
+        # Check for no new students
+        new_students_total = sum(record.new_students for record in analytics_records)
+        if new_students_total == 0:
+            alerts.append({
+                'type': 'warning',
+                'code': 'NO_NEW_STUDENTS',
+                'title': 'No New Student Enrollment',
+                'message': f'No new students enrolled in the last {days} days',
+                'severity': 'high',
+                'suggestion': 'Review marketing and enrollment strategies.'
+            })
+        
+        # Check for low average rating
+        if latest_record.average_rating < 3.0:
+            alerts.append({
+                'type': 'warning',
+                'code': 'LOW_STUDENT_SATISFACTION',
+                'title': 'Low Student Satisfaction',
+                'message': f'Average student rating is {latest_record.average_rating}/5',
+                'severity': 'high',
+                'suggestion': 'Collect detailed feedback and address common concerns.'
+            })
+        
+        # Check for low lesson completion rate
+        total_lessons = Lesson.objects.filter(
+            school=school,
+            date__range=[timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                        timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))]
+        ).count()
+        
+        completed_lessons = Lesson.objects.filter(
+            school=school,
+            status='C',
+            date__range=[timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                        timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))]
+        ).count()
+        
+        if total_lessons > 0:
+            lesson_completion_rate = (completed_lessons / total_lessons) * 100
+            if lesson_completion_rate < 70:
+                alerts.append({
+                    'type': 'warning',
+                    'code': 'LOW_LESSON_COMPLETION',
+                    'title': 'Low Lesson Completion Rate',
+                    'message': f'Only {lesson_completion_rate:.1f}% of lessons were completed',
+                    'severity': 'medium',
+                    'suggestion': 'Review lesson scheduling and attendance policies.'
+                })
+        
+        # Get at-risk students
+        at_risk_students = StudentProfile.objects.filter(
+            school=school,
+            status='A',
+            progress_theory__lt=20,
+            progress_driving__lt=20
+        ).count()
+        
+        if at_risk_students > 0:
+            alerts.append({
+                'type': 'warning',
+                'code': 'AT_RISK_STUDENTS',
+                'title': 'Students at Risk',
+                'message': f'{at_risk_students} students have less than 20% progress in both theory and driving',
+                'severity': 'high',
+                'suggestion': 'Identify and provide additional support to at-risk students.'
+            })
+        
+        # Categorize alerts by severity
+        high_severity = [a for a in alerts if a['severity'] == 'high']
+        medium_severity = [a for a in alerts if a['severity'] == 'medium']
+        low_severity = [a for a in alerts if a['severity'] == 'low']
+        
+        # Calculate overall health score
+        health_score = 100
+        if high_severity:
+            health_score -= len(high_severity) * 20
+        if medium_severity:
+            health_score -= len(medium_severity) * 10
+        
+        health_status = 'healthy' if health_score >= 80 else 'needs_attention' if health_score >= 60 else 'critical'
+        
+        return Response({
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': days
+            },
+            'overall_health': {
+                'score': max(0, health_score),
+                'status': health_status,
+                'alerts_count': len(alerts)
+            },
+            'alerts_by_severity': {
+                'high': high_severity,
+                'medium': medium_severity,
+                'low': low_severity
+            },
+            'all_alerts': alerts,
+            'summary': {
+                'total_alerts': len(alerts),
+                'needs_immediate_attention': len(high_severity),
+                'should_be_addressed': len(medium_severity),
+                'for_information': len(low_severity)
+            },
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    def predictions(self, request):
+        """
+        Get predictive insights and forecasts.
+        
+        GET /api/school-analytics/predictions/
+        Query params:
+        - school_id: Required
+        - horizon: 'week', 'month', 'quarter' (default: 'month')
+        """
+        school_id = request.query_params.get('school_id')
+        horizon = request.query_params.get('horizon', 'month')
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only view predictions for your own schools")
+        
+        # Get historical data (last 90 days)
+        end_date = timezone.now().date()
+        start_date = end_date - timedelta(days=90)
+        
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if analytics_records.count() < 7:
+            return Response({
+                'school': school.name,
+                'message': 'Insufficient data for predictions. Need at least 7 days of data.',
+                'data_points': analytics_records.count()
+            })
+        
+        # Calculate trends
+        dates = [record.date for record in analytics_records]
+        total_students = [record.total_students for record in analytics_records]
+        active_students = [record.active_students for record in analytics_records]
+        revenues = [float(record.revenue) for record in analytics_records]
+        completion_rates = [float(record.completion_rate) for record in analytics_records]
+        
+        # Simple linear regression for prediction
+        def predict_trend(values):
+            if len(values) < 2:
+                return 0
+            
+            # Calculate slope
+            n = len(values)
+            x_mean = n / 2
+            y_mean = sum(values) / n
+            
+            numerator = sum((i - x_mean) * (values[i] - y_mean) for i in range(n))
+            denominator = sum((i - x_mean) ** 2 for i in range(n))
+            
+            if denominator == 0:
+                return 0
+            
+            return numerator / denominator
+        
+        # Calculate trends
+        student_trend = predict_trend(total_students)
+        active_trend = predict_trend(active_students)
+        revenue_trend = predict_trend(revenues)
+        completion_trend = predict_trend(completion_rates)
+        
+        # Make predictions based on horizon
+        if horizon == 'week':
+            days_ahead = 7
+        elif horizon == 'quarter':
+            days_ahead = 90
+        else:  # month
+            days_ahead = 30
+        
+        # Predictions
+        latest = analytics_records.last()
+        predictions = {
+            'total_students': max(0, round(latest.total_students + student_trend * days_ahead)),
+            'active_students': max(0, round(latest.active_students + active_trend * days_ahead)),
+            'revenue': max(0, round(latest.revenue + revenue_trend * days_ahead, 2)),
+            'completion_rate': max(0, min(100, round(latest.completion_rate + completion_trend * days_ahead, 2)))
+        }
+        
+        # Calculate confidence based on data quality
+        data_quality = min(1.0, analytics_records.count() / 30)  # Max confidence with 30 days of data
+        confidence = round(data_quality * 100, 1)
+        
+        # Generate recommendations
+        recommendations = []
+        
+        if student_trend < 0:
+            recommendations.append({
+                'type': 'enrollment',
+                'priority': 'high',
+                'title': 'Address Declining Enrollment',
+                'action': 'Review marketing strategies and student acquisition channels.',
+                'impact': 'High'
+            })
+        
+        if revenue_trend < 0:
+            recommendations.append({
+                'type': 'revenue',
+                'priority': 'high',
+                'title': 'Improve Revenue Streams',
+                'action': 'Consider introducing new services or adjusting pricing.',
+                'impact': 'High'
+            })
+        
+        if completion_trend < 0:
+            recommendations.append({
+                'type': 'retention',
+                'priority': 'medium',
+                'title': 'Improve Student Retention',
+                'action': 'Provide additional support to at-risk students.',
+                'impact': 'Medium'
+            })
+        
+        if student_trend > 0 and revenue_trend <= 0:
+            recommendations.append({
+                'type': 'pricing',
+                'priority': 'medium',
+                'title': 'Review Pricing Strategy',
+                'action': 'Growing student base but stagnant revenue may indicate pricing issues.',
+                'impact': 'Medium'
+            })
+        
+        return Response({
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'prediction_horizon': {
+                'period': horizon,
+                'days_ahead': days_ahead,
+                'prediction_date': end_date + timedelta(days=days_ahead)
+            },
+            'historical_data': {
+                'days_analyzed': len(analytics_records),
+                'date_range': f'{start_date} to {end_date}',
+                'data_quality_score': data_quality
+            },
+            'current_metrics': {
+                'total_students': latest.total_students,
+                'active_students': latest.active_students,
+                'revenue': float(latest.revenue),
+                'completion_rate': latest.completion_rate
+            },
+            'predicted_metrics': {
+                'values': predictions,
+                'confidence': f'{confidence}%',
+                'trend_directions': {
+                    'student_trend': 'up' if student_trend > 0 else 'down' if student_trend < 0 else 'stable',
+                    'revenue_trend': 'up' if revenue_trend > 0 else 'down' if revenue_trend < 0 else 'stable',
+                    'completion_trend': 'up' if completion_trend > 0 else 'down' if completion_trend < 0 else 'stable'
+                }
+            },
+            'recommendations': recommendations,
+            'trend_analysis': {
+                'student_growth_per_day': round(student_trend, 3),
+                'revenue_growth_per_day': round(revenue_trend, 3),
+                'completion_change_per_day': round(completion_trend, 3)
+            },
+            'notes': [
+                'Predictions are based on linear trend analysis of historical data.',
+                f'Confidence level is {confidence}% based on data quality.',
+                'Actual results may vary based on external factors.'
+            ]
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def summary(self, request):
+        """
+        Get a summary of all accessible schools' analytics.
+        Role-specific summary.
+        
+        GET /api/school-analytics/summary/
+        """
+        user = request.user
+        
+        if user.role == 'A' and user.is_staff:
+            # Platform admin - summary of all schools
+            schools = DrivingSchool.objects.all()
+            school_summaries = []
+            
+            for school in schools[:10]:  # Limit to 10 schools for performance
+                latest_analytics = SchoolAnalytics.objects.filter(
+                    school=school
+                ).order_by('-date').first()
+                
+                if latest_analytics:
+                    school_summaries.append({
+                        'school_id': school.id,
+                        'school_name': school.name,
+                        'owner': school.owner.get_full_name() or school.owner.username,
+                        'total_students': latest_analytics.total_students,
+                        'active_students': latest_analytics.active_students,
+                        'completion_rate': latest_analytics.completion_rate,
+                        'revenue': float(latest_analytics.revenue),
+                        'last_updated': latest_analytics.date
+                    })
+            
+            # Overall platform statistics
+            total_schools = schools.count()
+            total_students = sum(s['total_students'] for s in school_summaries)
+            total_active_students = sum(s['active_students'] for s in school_summaries)
+            avg_completion_rate = sum(s['completion_rate'] for s in school_summaries) / len(school_summaries) if school_summaries else 0
+            total_revenue = sum(s['revenue'] for s in school_summaries)
+            
+            return Response({
+                'user_role': 'platform_admin',
+                'overall_platform_stats': {
+                    'total_schools': total_schools,
+                    'total_students': total_students,
+                    'total_active_students': total_active_students,
+                    'average_completion_rate': round(avg_completion_rate, 2),
+                    'total_revenue': round(total_revenue, 2)
+                },
+                'school_summaries': school_summaries,
+                'top_performing_schools': sorted(
+                    school_summaries,
+                    key=lambda x: x['completion_rate'],
+                    reverse=True
+                )[:3],
+                'highest_revenue_schools': sorted(
+                    school_summaries,
+                    key=lambda x: x['revenue'],
+                    reverse=True
+                )[:3]
+            })
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner - summary of their schools
+            schools = DrivingSchool.objects.filter(owner=user)
+            school_summaries = []
+            
+            for school in schools:
+                latest_analytics = SchoolAnalytics.objects.filter(
+                    school=school
+                ).order_by('-date').first()
+                
+                if latest_analytics:
+                    school_summaries.append({
+                        'school_id': school.id,
+                        'school_name': school.name,
+                        'total_students': latest_analytics.total_students,
+                        'active_students': latest_analytics.active_students,
+                        'completion_rate': latest_analytics.completion_rate,
+                        'revenue': float(latest_analytics.revenue),
+                        'new_students': latest_analytics.new_students,
+                        'last_updated': latest_analytics.date
+                    })
+            
+            # Overall owner statistics
+            if school_summaries:
+                total_students = sum(s['total_students'] for s in school_summaries)
+                total_active_students = sum(s['active_students'] for s in school_summaries)
+                avg_completion_rate = sum(s['completion_rate'] for s in school_summaries) / len(school_summaries)
+                total_revenue = sum(s['revenue'] for s in school_summaries)
+                total_new_students = sum(s['new_students'] for s in school_summaries)
+            else:
+                total_students = total_active_students = avg_completion_rate = total_revenue = total_new_students = 0
+            
+            return Response({
+                'user_role': 'school_owner',
+                'overall_stats': {
+                    'total_schools': schools.count(),
+                    'total_students': total_students,
+                    'total_active_students': total_active_students,
+                    'average_completion_rate': round(avg_completion_rate, 2),
+                    'total_revenue': round(total_revenue, 2),
+                    'total_new_students': total_new_students
+                },
+                'school_summaries': school_summaries,
+                'best_performing_school': max(
+                    school_summaries,
+                    key=lambda x: x['completion_rate']
+                ) if school_summaries else None,
+                'highest_revenue_school': max(
+                    school_summaries,
+                    key=lambda x: x['revenue']
+                ) if school_summaries else None
+            })
+        
+        elif user.role == 'I':
+            # Instructor - summary of their school
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You are not associated with any active school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            school = instructor_profile.school
+            latest_analytics = SchoolAnalytics.objects.filter(
+                school=school
+            ).order_by('-date').first()
+            
+            if not latest_analytics:
+                return Response({
+                    'user_role': 'instructor',
+                    'school': {
+                        'id': school.id,
+                        'name': school.name
+                    },
+                    'message': 'No analytics data available for this school'
+                })
+            
+            # Instructor-specific metrics
+            lessons_taught = Lesson.objects.filter(
+                instructor=user,
+                date__gte=timezone.now() - timedelta(days=30)
+            ).count()
+            
+            avg_rating = Feedback.objects.filter(
+                lesson__instructor=user
+            ).aggregate(avg=Avg('rating'))['avg'] or 0
+            
+            students_taught = Attendance.objects.filter(
+                lesson__instructor=user,
+                presence=True
+            ).values('student').distinct().count()
+            
+            return Response({
+                'user_role': 'instructor',
+                'school_summary': {
+                    'school_id': school.id,
+                    'school_name': school.name,
+                    'total_students': latest_analytics.total_students,
+                    'active_students': latest_analytics.active_students,
+                    'completion_rate': latest_analytics.completion_rate,
+                    'average_rating': latest_analytics.average_rating,
+                    'last_updated': latest_analytics.date
+                },
+                'instructor_performance': {
+                    'lessons_taught_30days': lessons_taught,
+                    'average_rating': round(avg_rating, 2),
+                    'unique_students_taught': students_taught
+                },
+                'comparison': {
+                    'completion_rate_vs_school_average': round(
+                        latest_analytics.completion_rate - latest_analytics.completion_rate, 2
+                    ),  # Same for now, could compare with other instructors
+                    'rating_vs_school_average': round(
+                        float(avg_rating) - float(latest_analytics.average_rating), 2
+                    )
+                }
+            })
+        
+        else:
+            return Response(
+                {'error': 'Students cannot access analytics summaries'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    def system_health(self, request):
+        """
+        System health check for analytics module.
+        Platform admin only.
+        
+        GET /api/school-analytics/system_health/
+        """
+        from django.db import connection
+        from django.core.cache import cache
+        
+        health_checks = {}
+        
+        user = self.request.user
+
+        if user.role == 'A' and not user.is_staff:
+            raise PermissionDenied("you don't have permission")
+
+        # 1. Database connection check
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            health_checks['database'] = {
+                'status': 'healthy',
+                'message': 'Database connection successful'
+            }
+        except Exception as e:
+            health_checks['database'] = {
+                'status': 'unhealthy',
+                'message': f'Database connection failed: {str(e)}'
+            }
+        
+        # 2. Cache check
+        try:
+            test_key = 'analytics_health_check'
+            cache.set(test_key, 'test', 10)
+            cached_value = cache.get(test_key)
+            
+            if cached_value == 'test':
+                health_checks['cache'] = {
+                    'status': 'healthy',
+                    'message': 'Cache system working'
+                }
+            else:
+                health_checks['cache'] = {
+                    'status': 'unhealthy',
+                    'message': 'Cache read/write failed'
+                }
+        except Exception as e:
+            health_checks['cache'] = {
+                'status': 'unhealthy',
+                'message': f'Cache system error: {str(e)}'
+            }
+        
+        # 3. Analytics data completeness check
+        total_schools = DrivingSchool.objects.count()
+        schools_with_analytics = SchoolAnalytics.objects.values('school').distinct().count()
+        
+        if total_schools > 0:
+            coverage_percentage = (schools_with_analytics / total_schools) * 100
+            if coverage_percentage >= 80:
+                status = 'healthy'
+            elif coverage_percentage >= 50:
+                status = 'warning'
+            else:
+                status = 'unhealthy'
+            
+            health_checks['data_coverage'] = {
+                'status': status,
+                'message': f'Analytics coverage: {coverage_percentage:.1f}%',
+                'details': {
+                    'total_schools': total_schools,
+                    'schools_with_analytics': schools_with_analytics,
+                    'coverage_percentage': coverage_percentage
+                }
+            }
+        
+        # 4. Recent data freshness
+        recent_analytics = SchoolAnalytics.objects.order_by('-date').first()
+        if recent_analytics:
+            days_since_last_update = (timezone.now().date() - recent_analytics.date).days
+            
+            if days_since_last_update == 0:
+                status = 'healthy'
+            elif days_since_last_update <= 2:
+                status = 'warning'
+            else:
+                status = 'unhealthy'
+            
+            health_checks['data_freshness'] = {
+                'status': status,
+                'message': f'Most recent analytics: {recent_analytics.date} ({days_since_last_update} days ago)',
+                'details': {
+                    'last_update_date': recent_analytics.date,
+                    'days_since_update': days_since_last_update,
+                    'school': recent_analytics.school.name
+                }
+            }
+        
+        # 5. Performance metrics
+        try:
+            # Count queries in last hour
+            hour_ago = timezone.now() - timedelta(hours=1)
+            queries_last_hour = SchoolAnalytics.objects.filter(
+                created_at__gte=hour_ago
+            ).count()
+            
+            health_checks['performance'] = {
+                'status': 'healthy',
+                'message': f'Analytics queries in last hour: {queries_last_hour}',
+                'details': {
+                    'queries_last_hour': queries_last_hour,
+                    'average_daily_queries': SchoolAnalytics.objects.filter(
+                        created_at__date=timezone.now().date()
+                    ).count()
+                }
+            }
+        except Exception as e:
+            health_checks['performance'] = {
+                'status': 'warning',
+                'message': f'Performance check failed: {str(e)}'
+            }
+        
+        # Overall system status
+        unhealthy_checks = [h for h in health_checks.values() if h['status'] == 'unhealthy']
+        warning_checks = [h for h in health_checks.values() if h['status'] == 'warning']
+        
+        if unhealthy_checks:
+            overall_status = 'unhealthy'
+        elif warning_checks:
+            overall_status = 'warning'
+        else:
+            overall_status = 'healthy'
+        
+        return Response({
+            'system_health': {
+                'status': overall_status,
+                'timestamp': timezone.now().isoformat(),
+                'checks_performed': len(health_checks),
+                'unhealthy_checks': len(unhealthy_checks),
+                'warning_checks': len(warning_checks)
+            },
+            'detailed_checks': health_checks,
+            'recommendations': self._get_health_recommendations(health_checks),
+            'next_scheduled_maintenance': 'Daily at 02:00 AM UTC'
+        })
+    
+    def _get_health_recommendations(self, health_checks):
+        """Generate recommendations based on health check results"""
+        recommendations = []
+        
+        if 'data_coverage' in health_checks:
+            coverage_data = health_checks['data_coverage']
+            if coverage_data['status'] == 'warning':
+                recommendations.append({
+                    'priority': 'medium',
+                    'action': 'Run bulk analytics generation for schools missing data.',
+                    'reason': f"Only {coverage_data['details']['coverage_percentage']:.1f}% of schools have analytics data."
+                })
+            elif coverage_data['status'] == 'unhealthy':
+                recommendations.append({
+                    'priority': 'high',
+                    'action': 'Urgently generate analytics for all schools.',
+                    'reason': 'Analytics data coverage is critically low.'
+                })
+        
+        if 'data_freshness' in health_checks:
+            freshness_data = health_checks['data_freshness']
+            if freshness_data['status'] == 'warning':
+                recommendations.append({
+                    'priority': 'low',
+                    'action': 'Check analytics generation schedule.',
+                    'reason': f"Last update was {freshness_data['details']['days_since_update']} days ago."
+                })
+            elif freshness_data['status'] == 'unhealthy':
+                recommendations.append({
+                    'priority': 'high',
+                    'action': 'Immediately run analytics generation.',
+                    'reason': 'Analytics data is severely outdated.'
+                })
+        
+        return recommendations
+
