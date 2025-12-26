@@ -4156,6 +4156,14 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
                     school=instructor_profile.school
                 ).select_related('school')
         
+         # Studnet sees only active templates 
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                return CommunicationTemplate.objects.filter(
+                    school=student_profile.school,
+                    is_active=True 
+                ).select_related('school')
         # Students cannot access templates
         return CommunicationTemplate.objects.none()
     
@@ -4225,7 +4233,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         if usage_count > 0:
             raise PermissionDenied(
                 f"Cannot delete template. It has {usage_count} pending messages. "
-                "Please cancel or send those messages first."
+                f"Please cancel or send those messages first, or set template to inactive."
             )
         
         # Platform admin can delete any template
