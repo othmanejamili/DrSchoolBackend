@@ -4156,6 +4156,14 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
                     school=instructor_profile.school
                 ).select_related('school')
         
+         # Studnet sees only active templates 
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                return CommunicationTemplate.objects.filter(
+                    school=student_profile.school,
+                    is_active=True 
+                ).select_related('school')
         # Students cannot access templates
         return CommunicationTemplate.objects.none()
     
@@ -4225,7 +4233,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         if usage_count > 0:
             raise PermissionDenied(
                 f"Cannot delete template. It has {usage_count} pending messages. "
-                "Please cancel or send those messages first."
+                f"Please cancel or send those messages first, or set template to inactive."
             )
         
         # Platform admin can delete any template
@@ -4564,3 +4572,1013 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
+# DSS-27-AutomatedMessageViewSet
+class AutomatedMessageViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing automated messages.
+    
+    Messages are scheduled communications sent to students.
+    
+    Access Control:
+    - Platform Admins: Full access to all messages
+    - School Owners: Manage messages in their schools
+    - Instructors: View and create messages for students in their school
+    - Students: View their own messages (read-only)
+    """
+    
+    serializer_class = AutomatedMessageSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['student', 'template', 'status', 'template__school']
+    search_fields = ['student__user__username', 'student__user__email', 'template__name']
+    ordering_fields = ['scheduled_for', 'sent_at', 'created_at', 'status']
+    ordering = ['-scheduled_for']
+
+    def get_queryset(self):
+        """Filter messages based on user role and school"""
+        user = self.request.user
+        if not user.is_authenticated:
+            return AutomatedMessage.objects.none()
+        
+        # Platform Admin (staff) sees all messages
+        if user.role == 'A' and user.is_staff:
+            return AutomatedMessage.objects.all().select_related(
+                'student__user', 'student__school', 'template'
+            )
+        
+        # School Owner sees messages in their schools
+        if user.role == 'A' and not user.is_staff:
+            return AutomatedMessage.objects.filter(
+                template__school__owner=user
+            ).select_related('student__user', 'student__school', 'template')
+        
+        # Instructor sees messages for students in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                return AutomatedMessage.objects.filter(
+                    student__school=instructor_profile.school
+                ).select_related('student__user', 'template')
+        
+        # Student sees only their own messages
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                return AutomatedMessage.objects.filter(
+                    student=student_profile
+                ).select_related('template')
+        
+        return AutomatedMessage.objects.none()
+    
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action == 'create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['cancel', 'send_now', 'reschedule', 'bulk_create', 'bulk_cancel']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['my_messages', 'pending', 'sent', 'failed', 'statistics']:
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """Create message with validation"""
+        user = self.request.user
+        student = serializer.validated_data.get('student')
+        template = serializer.validated_data.get('template')
+        
+        # Platform admin can create for any student
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can create for students in their schools
+        if user.role == 'A' and not user.is_staff:
+            if student.school.owner != user or template.school.owner != user:
+                raise PermissionDenied("Student and template must be from your schools")
+            serializer.save()
+            return
+        
+        # Instructor can create for students in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                raise PermissionDenied("You have no active school profile")
+            
+            if student.school != instructor_profile.school:
+                raise PermissionDenied("You can only create messages for students in your school")
+            
+            if template.school != instructor_profile.school:
+                raise PermissionDenied("Template must be from your school")
+            
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to create messages")
+    
+    def perform_update(self, serializer):
+        """Update message with permission checks"""
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Cannot update sent, delivered, or read messages
+        if instance.status in ['sent', 'delivered', 'read']:
+            raise PermissionDenied(f"Cannot update {instance.status} messages")
+        
+        # Platform admin can update any message
+        if user.role == 'A' and user.is_staff:
+            serializer.save()
+            return
+        
+        # School owner can update messages in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.template.school.owner != user:
+                raise PermissionDenied("You can only update messages in your schools")
+            serializer.save()
+            return
+        
+        # Instructor can update messages in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != instance.student.school:
+                raise PermissionDenied("You can only update messages in your school")
+            serializer.save()
+            return
+        
+        raise PermissionDenied("You don't have permission to update this message")
+    
+    def perform_destroy(self, instance):
+        """Delete message with permission checks"""
+        user = self.request.user
+        
+        # Cannot delete sent messages
+        if instance.status in ['sent', 'delivered', 'read']:
+            raise PermissionDenied(f"Cannot delete {instance.status} messages")
+        
+        # Platform admin can delete any message
+        if user.role == 'A' and user.is_staff:
+            instance.delete()
+            return
+        
+        # School owner can delete messages in their schools
+        if user.role == 'A' and not user.is_staff:
+            if instance.template.school.owner != user:
+                raise PermissionDenied("You can only delete messages in your schools")
+            instance.delete()
+            return
+        
+        raise PermissionDenied("You don't have permission to delete this message")
+    
+    # ==================== CUSTOM ACTIONS ====================
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_messages(self, request):
+        """
+        Get messages for the current student.
+        
+        GET /api/automated-messages/my_messages/
+        Query params:
+        - status: Filter by status
+        - limit: Number of messages (default: 20)
+        """
+        user = request.user
+        
+        if user.role != 'S':
+            return Response(
+                {'error': 'This endpoint is only for students'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            student_profile = StudentProfile.objects.get(user=user, status='A')
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {'error': 'No active student profile found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get messages
+        queryset = AutomatedMessage.objects.filter(
+            student=student_profile
+        ).select_related('template').order_by('-scheduled_for')
+        
+        # Apply filters
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        # Get statistics
+        total_messages = queryset.count()
+        pending_count = queryset.filter(status='pending').count()
+        sent_count = queryset.filter(status='sent').count()
+        
+        # Paginate
+        limit = min(int(request.query_params.get('limit', 20)), 100)
+        queryset = queryset[:limit]
+        
+        serializer = self.get_serializer(queryset, many=True)
+        
+        return Response({
+            'statistics': {
+                'total_messages': total_messages,
+                'pending': pending_count,
+                'sent': sent_count
+            },
+            'messages': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def pending(self, request):
+        """
+        Get all pending messages.
+        
+        GET /api/automated-messages/pending/
+        """
+        queryset = self.get_queryset().filter(status='pending').order_by('scheduled_for')
+        
+        # Separate overdue and upcoming
+        now = timezone.now()
+        overdue = queryset.filter(scheduled_for__lt=now)
+        upcoming = queryset.filter(scheduled_for__gte=now)
+        
+        return Response({
+            'overdue': {
+                'count': overdue.count(),
+                'messages': self.get_serializer(overdue[:10], many=True).data
+            },
+            'upcoming': {
+                'count': upcoming.count(),
+                'messages': self.get_serializer(upcoming[:20], many=True).data
+            },
+            'total_pending': queryset.count()
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def sent(self, request):
+        """
+        Get recently sent messages.
+        
+        GET /api/automated-messages/sent/
+        Query params:
+        - days: Number of days to look back (default: 7, max: 30)
+        """
+        days = min(int(request.query_params.get('days', 7)), 30)
+        since = timezone.now() - timedelta(days=days)
+        
+        queryset = self.get_queryset().filter(
+            status__in=['sent', 'delivered', 'read'],
+            sent_at__gte=since
+        ).order_by('-sent_at')
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def failed(self, request):
+        """
+        Get failed messages that need attention.
+        
+        GET /api/automated-messages/failed/
+        """
+        queryset = self.get_queryset().filter(status='failed').order_by('-created_at')
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({
+            'total_failed': queryset.count(),
+            'messages': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        """
+        Cancel a pending message.
+        
+        POST /api/automated-messages/{id}/cancel/
+        """
+        message = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != message.student.school:
+                raise PermissionDenied("You can only cancel messages in your school")
+        
+        if user.role == 'A' and not user.is_staff:
+            if message.template.school.owner != user:
+                raise PermissionDenied("You can only cancel messages in your schools")
+        
+        # Can only cancel pending messages
+        if message.status != 'pending':
+            return Response(
+                {'error': f'Cannot cancel {message.status} message'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Delete the message
+        message_id = message.id
+        message.delete()
+        
+        return Response({
+            'message': 'Message cancelled successfully',
+            'cancelled_message_id': message_id
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def send_now(self, request, pk=None):
+        """
+        Send a message immediately.
+        
+        POST /api/automated-messages/{id}/send_now/
+        """
+        message = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if message.template.school.owner != user:
+                raise PermissionDenied("You can only send messages in your schools")
+        
+        # Can only send pending messages
+        if message.status != 'pending':
+            return Response(
+                {'error': f'Cannot send {message.status} message'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Send the message
+            CommunicationService._send_single_message(message)
+            
+            # Update message status
+            message.status = 'sent'
+            message.sent_at = timezone.now()
+            message.save()
+            
+            serializer = self.get_serializer(message)
+            
+            return Response({
+                'message': 'Message sent successfully',
+                'sent_message': serializer.data,
+                'sent_at': message.sent_at
+            })
+            
+        except Exception as e:
+            message.status = 'failed'
+            message.delivery_error = str(e)
+            message.save()
+            
+            return Response({
+                'error': f'Failed to send message: {str(e)}',
+                'message_status': 'failed'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def reschedule(self, request, pk=None):
+        """
+        Reschedule a pending message.
+        
+        POST /api/automated-messages/{id}/reschedule/
+        Body: {"new_time": "2024-12-31T10:00:00"}
+        """
+        message = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != message.student.school:
+                raise PermissionDenied("You can only reschedule messages in your school")
+        
+        if user.role == 'A' and not user.is_staff:
+            if message.template.school.owner != user:
+                raise PermissionDenied("You can only reschedule messages in your schools")
+        
+        # Can only reschedule pending messages
+        if message.status != 'pending':
+            return Response(
+                {'error': f'Cannot reschedule {message.status} message'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get new time
+        new_time_str = request.data.get('new_time')
+        if not new_time_str:
+            return Response(
+                {'error': 'new_time is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            new_time = timezone.datetime.fromisoformat(new_time_str.replace('Z', '+00:00'))
+            if timezone.is_naive(new_time):
+                new_time = timezone.make_aware(new_time)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate new time is in the future
+        if new_time < timezone.now():
+            return Response(
+                {'error': 'Cannot reschedule to a past time'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Update message
+        old_time = message.scheduled_for
+        message.scheduled_for = new_time
+        message.save()
+        
+        serializer = self.get_serializer(message)
+        
+        return Response({
+            'message': 'Message rescheduled successfully',
+            'rescheduled_message': serializer.data,
+            'old_time': old_time,
+            'new_time': new_time
+        })
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @transaction.atomic
+    def bulk_create(self, request):
+        """
+        Create multiple messages at once.
+        
+        POST /api/automated-messages/bulk_create/
+        Body: {
+            "student_ids": [1, 2, 3],
+            "template_id": 123,
+            "scheduled_for": "2024-12-31T10:00:00",
+            "custom_subject": "Optional custom subject",
+            "custom_body": "Optional custom body"
+        }
+        """
+        student_ids = request.data.get('student_ids', [])
+        template_id = request.data.get('template_id')
+        scheduled_for_str = request.data.get('scheduled_for')
+        custom_subject = request.data.get('custom_subject')
+        custom_body = request.data.get('custom_body')
+        
+        # Validate required fields
+        if not student_ids:
+            return Response(
+                {'error': 'student_ids (array) is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not template_id:
+            return Response(
+                {'error': 'template_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not scheduled_for_str:
+            return Response(
+                {'error': 'scheduled_for is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Parse scheduled time
+        try:
+            scheduled_for = timezone.datetime.fromisoformat(scheduled_for_str.replace('Z', '+00:00'))
+            if timezone.is_naive(scheduled_for):
+                scheduled_for = timezone.make_aware(scheduled_for)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format for scheduled_for'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate time is in the future
+        if scheduled_for < timezone.now():
+            return Response(
+                {'error': 'scheduled_for must be in the future'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get template
+        try:
+            template = CommunicationTemplate.objects.get(id=template_id)
+        except CommunicationTemplate.DoesNotExist:
+            return Response(
+                {'error': 'Template not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get students
+        students = StudentProfile.objects.filter(id__in=student_ids).select_related('user', 'school')
+        
+        if not students.exists():
+            return Response(
+                {'error': 'No valid students found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You have no active school profile'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Filter students to only those in instructor's school
+            students = students.filter(school=instructor_profile.school)
+            if template.school != instructor_profile.school:
+                return Response(
+                    {'error': 'Template must be from your school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner - check all students and template are from their schools
+            for student in students:
+                if student.school.owner != user:
+                    return Response(
+                        {'error': f'Student {student.id} is not from your school'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+            
+            if template.school.owner != user:
+                return Response(
+                    {'error': 'Template is not from your school'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Create messages
+        created_messages = []
+        skipped_students = []
+        
+        for student in students:
+            # Check if similar message already exists
+            existing = AutomatedMessage.objects.filter(
+                student=student,
+                template=template,
+                scheduled_for=scheduled_for
+            ).exists()
+            
+            if existing:
+                skipped_students.append({
+                    'student_id': student.id,
+                    'reason': 'Similar message already scheduled'
+                })
+                continue
+            
+            # Create message
+            message = AutomatedMessage.objects.create(
+                student=student,
+                template=template,
+                scheduled_for=scheduled_for,
+                status='pending'
+            )
+            
+            created_messages.append({
+                'student_id': student.id,
+                'student_name': student.user.get_full_name() or student.user.username,
+                'message_id': message.id
+            })
+        
+        return Response({
+            'message': f'Created {len(created_messages)} messages',
+            'summary': {
+                'requested': len(student_ids),
+                'created': len(created_messages),
+                'skipped': len(skipped_students)
+            },
+            'created_messages': created_messages,
+            'skipped_students': skipped_students,
+            'scheduled_for': scheduled_for,
+            'template': template.name
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @transaction.atomic
+    def bulk_cancel(self, request):
+        """
+        Cancel multiple messages.
+        
+        POST /api/automated-messages/bulk_cancel/
+        Body: {
+            "message_ids": [1, 2, 3],
+            "reason": "Optional reason"
+        }
+        """
+        message_ids = request.data.get('message_ids', [])
+        reason = request.data.get('reason', 'No reason provided')
+        
+        if not message_ids:
+            return Response(
+                {'error': 'message_ids (array) is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get messages
+        messages = AutomatedMessage.objects.filter(id__in=message_ids).select_related(
+            'student', 'template'
+        )
+        
+        if not messages.exists():
+            return Response(
+                {'error': 'No messages found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        cancelled_messages = []
+        failed_messages = []
+        
+        for message in messages:
+            # Check if user can cancel this message
+            can_cancel = False
+            if user.role == 'A' and user.is_staff:
+                can_cancel = True
+            elif user.role == 'A' and not user.is_staff:
+                can_cancel = message.template.school.owner == user
+            
+            if not can_cancel:
+                failed_messages.append({
+                    'message_id': message.id,
+                    'reason': 'Permission denied'
+                })
+                continue
+            
+            # Can only cancel pending messages
+            if message.status != 'pending':
+                failed_messages.append({
+                    'message_id': message.id,
+                    'reason': f'Message status is {message.status}'
+                })
+                continue
+            
+            # Cancel message
+            message_id = message.id
+            message.delete()
+            
+            cancelled_messages.append({
+                'message_id': message_id,
+                'student_id': message.student.id,
+                'template_id': message.template.id
+            })
+        
+        return Response({
+            'message': f'Cancelled {len(cancelled_messages)} messages',
+            'summary': {
+                'requested': len(message_ids),
+                'cancelled': len(cancelled_messages),
+                'failed': len(failed_messages)
+            },
+            'cancelled_messages': cancelled_messages,
+            'failed_messages': failed_messages,
+            'cancellation_reason': reason
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def statistics(self, request):
+        """
+        Get messaging statistics.
+        
+        GET /api/automated-messages/statistics/
+        Query params:
+        - school_id: Filter by school (admins only)
+        - days: Number of days to analyze (default: 30, max: 90)
+        """
+        queryset = self.get_queryset()
+        
+        # Filter by school if provided (admin only)
+        school_id = request.query_params.get('school_id')
+        if school_id:
+            user = request.user
+            if user.role == 'A' and user.is_staff:
+                queryset = queryset.filter(template__school_id=school_id)
+            else:
+                return Response(
+                    {'error': 'Only platform admins can filter by school_id'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Time range
+        days = min(int(request.query_params.get('days', 30)), 90)
+        since = timezone.now() - timedelta(days=days)
+        
+        # Overall statistics
+        total_messages = queryset.filter(created_at__gte=since).count()
+        
+        # Messages by status
+        by_status = dict(
+            queryset.filter(created_at__gte=since)
+            .values('status')
+            .annotate(count=Count('id'))
+            .values_list('status', 'count')
+        )
+        
+        # Messages by template type
+        by_template_type = dict(
+            queryset.filter(created_at__gte=since)
+            .values('template__template_type')
+            .annotate(count=Count('id'))
+            .values_list('template__template_type', 'count')
+        )
+        
+        # Daily message volume (last 7 days)
+        daily_volume = []
+        for i in range(7):
+            day = timezone.now() - timedelta(days=i)
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+            count = queryset.filter(
+                created_at__range=[day_start, day_end]
+            ).count()
+            
+            daily_volume.append({
+                'date': day.date(),
+                'messages_created': count
+            })
+        
+        # Delivery success rate
+        successful = queryset.filter(
+            status__in=['sent', 'delivered', 'read'],
+            created_at__gte=since
+        ).count()
+        
+        total_with_status = sum(by_status.values()) if by_status else 0
+        delivery_rate = round((successful / total_with_status * 100), 2) if total_with_status > 0 else 0
+        
+        # Templates with most messages
+        top_templates = queryset.filter(created_at__gte=since).values(
+            'template__id',
+            'template__name',
+            'template__template_type'
+        ).annotate(
+            message_count=Count('id')
+        ).order_by('-message_count')[:5]
+        
+        return Response({
+            'period': {
+                'days': days,
+                'since': since.date(),
+                'until': timezone.now().date()
+            },
+            'summary': {
+                'total_messages': total_messages,
+                'delivery_success_rate': f'{delivery_rate}%',
+                'pending_messages': by_status.get('pending', 0),
+                'failed_messages': by_status.get('failed', 0)
+            },
+            'by_status': by_status,
+            'by_template_type': by_template_type,
+            'daily_volume': daily_volume,
+            'top_templates': list(top_templates),
+            'successful_messages': successful,
+            'total_analyzed': total_with_status
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def upcoming_schedule(self, request):
+        """
+        Get upcoming message schedule.
+        
+        GET /api/automated-messages/upcoming_schedule/
+        Query params:
+        - days: Number of days ahead (default: 7, max: 30)
+        - student_id: Filter by student (optional)
+        - template_type: Filter by template type (optional)
+        """
+        days = min(int(request.query_params.get('days', 7)), 30)
+        end_date = timezone.now() + timedelta(days=days)
+        
+        queryset = self.get_queryset().filter(
+            status='pending',
+            scheduled_for__lte=end_date
+        ).order_by('scheduled_for')
+        
+        # Apply additional filters
+        student_id = request.query_params.get('student_id')
+        if student_id:
+            queryset = queryset.filter(student_id=student_id)
+        
+        template_type = request.query_params.get('template_type')
+        if template_type:
+            queryset = queryset.filter(template__template_type=template_type)
+        
+        # Group by day
+        schedule_by_day = {}
+        for message in queryset:
+            day_key = message.scheduled_for.date().isoformat()
+            if day_key not in schedule_by_day:
+                schedule_by_day[day_key] = []
+            
+            schedule_by_day[day_key].append({
+                'id': message.id,
+                'scheduled_for': message.scheduled_for,
+                'student': {
+                    'id': message.student.id,
+                    'name': message.student.user.get_full_name() or message.student.user.username
+                },
+                'template': {
+                    'id': message.template.id,
+                    'name': message.template.name,
+                    'type': message.template.template_type
+                }
+            })
+        
+        # Calculate daily counts
+        daily_counts = {
+            day: len(messages) for day, messages in schedule_by_day.items()
+        }
+        
+        # Today's count
+        today = timezone.now().date()
+        today_count = sum(
+            1 for message in queryset 
+            if message.scheduled_for.date() == today
+        )
+        
+        return Response({
+            'period': {
+                'days': days,
+                'start': timezone.now().date(),
+                'end': end_date.date()
+            },
+            'summary': {
+                'total_scheduled': queryset.count(),
+                'scheduled_today': today_count,
+                'days_with_schedule': len(schedule_by_day)
+            },
+            'daily_counts': daily_counts,
+            'schedule_by_day': schedule_by_day,
+            'today': today.isoformat()
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def summary(self, request):
+        """
+        Get summary of messages for the current user.
+        Role-specific summary.
+        
+        GET /api/automated-messages/summary/
+        """
+        user = request.user
+        
+        if user.role == 'S':
+            # Student summary
+            try:
+                student_profile = StudentProfile.objects.get(user=user, status='A')
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'No active student profile found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            messages = AutomatedMessage.objects.filter(student=student_profile)
+            
+            summary = {
+                'total_messages': messages.count(),
+                'pending': messages.filter(status='pending').count(),
+                'read': messages.filter(status='read').count(),
+                'unread_sent': messages.filter(status='sent').count(),
+                'recent_unread': messages.filter(
+                    status__in=['sent', 'delivered'],
+                    sent_at__isnull=False
+                ).order_by('-sent_at')[:5]
+            }
+            
+            serializer = self.get_serializer(summary['recent_unread'], many=True)
+            summary['recent_unread'] = serializer.data
+            
+            return Response(summary)
+        
+        elif user.role == 'I':
+            # Instructor summary
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response(
+                    {'error': 'You are not associated with any active school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            messages = AutomatedMessage.objects.filter(
+                student__school=instructor_profile.school
+            )
+            
+            # Messages by template type for instructor's school
+            by_type = dict(
+                messages.values('template__template_type')
+                .annotate(count=Count('id'))
+                .values_list('template__template_type', 'count')
+            )
+            
+            # Recent messages to students taught by this instructor
+            from .models import Attendance
+            students_taught = Attendance.objects.filter(
+                lesson__instructor=user,
+                presence=True
+            ).values_list('student', flat=True).distinct()
+            
+            recent_to_my_students = messages.filter(
+                student__in=students_taught
+            ).order_by('-created_at')[:10]
+            
+            summary = {
+                'school': instructor_profile.school.name,
+                'total_messages_in_school': messages.count(),
+                'pending_in_school': messages.filter(status='pending').count(),
+                'messages_by_type': by_type,
+                'my_students': {
+                    'total_students': len(students_taught),
+                    'recent_messages': self.get_serializer(recent_to_my_students, many=True).data
+                }
+            }
+            
+            return Response(summary)
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner summary
+            messages = AutomatedMessage.objects.filter(
+                template__school__owner=user
+            )
+            
+            # School-level statistics
+            schools = DrivingSchool.objects.filter(owner=user)
+            school_stats = []
+            
+            for school in schools:
+                school_messages = messages.filter(template__school=school)
+                school_stats.append({
+                    'school_id': school.id,
+                    'school_name': school.name,
+                    'total_messages': school_messages.count(),
+                    'pending': school_messages.filter(status='pending').count(),
+                    'failed': school_messages.filter(status='failed').count(),
+                    'top_template': school_messages.values('template__name')
+                        .annotate(count=Count('id'))
+                        .order_by('-count')
+                        .first()
+                })
+            
+            summary = {
+                'total_messages_across_schools': messages.count(),
+                'total_schools': schools.count(),
+                'school_statistics': school_stats,
+                'pending_messages': messages.filter(status='pending').count(),
+                'failed_messages': messages.filter(status='failed').count(),
+                'recent_messages': self.get_serializer(
+                    messages.order_by('-created_at')[:10], many=True
+                ).data
+            }
+            
+            return Response(summary)
+        
+        else:
+            # Platform admin summary
+            messages = AutomatedMessage.objects.all()
+            
+            summary = {
+                'total_messages': messages.count(),
+                'messages_today': messages.filter(
+                    created_at__date=timezone.now().date()
+                ).count(),
+                'by_status': dict(
+                    messages.values('status')
+                    .annotate(count=Count('id'))
+                    .values_list('status', 'count')
+                ),
+                'by_school': dict(
+                    messages.values('template__school__name')
+                    .annotate(count=Count('id'))
+                    .values_list('template__school__name', 'count')
+                ),
+                'recent_activity': self.get_serializer(
+                    messages.order_by('-created_at')[:20], many=True
+                ).data
+            }
+            
+            return Response(summary)
+
+
