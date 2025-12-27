@@ -20,6 +20,7 @@ from PIL import Image
 from io import BytesIO
 import cloudinary.uploader
 import cloudinary.api
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -1041,7 +1042,7 @@ class AnalyticsService:
             }
         }
     
-
+ 
 class StudentProgressService:
     """Handle comprehensive student progress tracking, predictions, and interventions"""
     
@@ -2061,30 +2062,64 @@ class CommunicationService:
     @staticmethod
     def validate_message_creation(student, template, scheduled_for, user=None) -> None:
         """Validate message creation business rules"""
-        # Validate student and template belong to same school
+
+        # Student & template must belong to same school
         if student.school != template.school:
             raise serializers.ValidationError({
                 'student': 'Student must belong to the same school as the template'
             })
 
-        # Validate template is active
+        # Template must be active
         if not template.is_active:
             raise serializers.ValidationError({
                 'template': 'Cannot use an inactive template'
             })
 
-        # Validate scheduled time is reasonable
-        if scheduled_for < timezone.now() - timedelta(days=CommunicationService.MAX_PAST_SCHEDULING_DAYS):
+        # Scheduled time validation
+        if scheduled_for < timezone.now():
             raise serializers.ValidationError({
-                'scheduled_for': f'Cannot schedule messages more than {CommunicationService.MAX_PAST_SCHEDULING_DAYS} days in the past'
+                'scheduled_for': (
+                    f'scheduled_for must be in the future '
+                )
             })
 
-        # Validate permissions if user provided
-        if user and template.school.owner != user:
-            raise serializers.ValidationError({
-                'template': 'You can only create messages for your own school'
-            })
+        # Permission check (ONLY if user provided)
+        if not user:
+            return
 
+        # Platform admin → allowed
+        if user.is_staff:
+            return
+
+        # School owner → must own the school
+        if user.role == 'A':
+            if template.school.owner != user:
+                raise serializers.ValidationError({
+                    'template': 'You can only create messages for your own school'
+                })
+            return
+
+        # Instructor → must belong to the school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(
+                school=template.school,
+                status='A'
+            ).first()
+
+            if not instructor_profile:
+                raise serializers.ValidationError({
+                    'template': 'You can only create messages for your own school'
+                })
+            return
+
+        # Any other role → forbidden
+        raise serializers.ValidationError({
+            'template': 'You are not allowed to create messages'
+        })
+
+
+        
+        
     @staticmethod
     def validate_message_update(instance, validated_data) -> None:
         """Validate message update business rules"""
@@ -2213,6 +2248,8 @@ class CommunicationService:
             fail_silently=False
         )
 
+
+
     @staticmethod
     def _render_template(template, student):
         """Render template with student variables"""
@@ -2222,19 +2259,28 @@ class CommunicationService:
             'progress_driving': student.progress_driving,
             'school_name': student.school.name,
             'license_type': student.get_license_type_display(),
-            'total_hours_theory': student.total_hours_theory,  
-            'total_hours_driving': student.total_hours_driving,  
+            'total_hours_theory': student.total_hours_theory,
+            'total_hours_driving': student.total_hours_driving,
         }
-        
+
         subject = template.subject
         body = template.body
-        
+
+        # 🔎 Find all placeholders like {variable}
+        placeholders = set(re.findall(r'{(\w+)}', subject + body))
+
+        # ❌ Raise error if any variable is missing
+        missing_vars = placeholders - context.keys()
+        if missing_vars:
+            raise KeyError(f"Missing template variables: {', '.join(missing_vars)}")
+
+        # ✅ Replace variables
         for key, value in context.items():
-            placeholder = f'{{{key}}}'
-            subject = subject.replace(placeholder, str(value))
-            body = body.replace(placeholder, str(value))
-        
+            subject = subject.replace(f'{{{key}}}', str(value))
+            body = body.replace(f'{{{key}}}', str(value))
+
         return {'subject': subject, 'body': body}
+
 
     @staticmethod
     def get_message_statistics(school=None):
@@ -2373,7 +2419,6 @@ class CommunicationService:
 # Add this to your services.py
 class CommunicationTemplateService:
     """Handle template business logic"""
-    
     @staticmethod
     def get_available_variables():
         """Get all available template variables"""
@@ -2406,6 +2451,7 @@ class CommunicationTemplateService:
         if template_type:
             queryset = queryset.filter(template_type=template_type)
         return queryset.order_by('name')
+    
 # services.py - Add this class
 class FeedbackService:
     """Handle feedback analysis, insights, and automated actions"""
