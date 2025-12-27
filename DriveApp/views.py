@@ -4156,14 +4156,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
                     school=instructor_profile.school
                 ).select_related('school')
         
-         # Studnet sees only active templates 
-        if user.role == 'S':
-            student_profile = user.student_profiles.filter(status='A').first()
-            if student_profile:
-                return CommunicationTemplate.objects.filter(
-                    school=student_profile.school,
-                    is_active=True 
-                ).select_related('school')
+        
         # Students cannot access templates
         return CommunicationTemplate.objects.none()
     
@@ -4641,10 +4634,10 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         elif self.action == 'destroy':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         
-        elif self.action in ['cancel', 'send_now', 'reschedule', 'bulk_create', 'bulk_cancel']:
+        elif self.action in ['cancel', 'pending', 'send_now', 'reschedule', 'bulk_create', 'bulk_cancel']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
         
-        elif self.action in ['my_messages', 'pending', 'sent', 'failed', 'statistics']:
+        elif self.action in ['my_messages', 'sent', 'failed', 'statistics']:
             return [IsAuthenticated()]
         
         return [IsAuthenticated()]
@@ -4803,7 +4796,7 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         GET /api/automated-messages/pending/
         """
         queryset = self.get_queryset().filter(status='pending').order_by('scheduled_for')
-        
+        user = self.request.user
         # Separate overdue and upcoming
         now = timezone.now()
         overdue = queryset.filter(scheduled_for__lt=now)
@@ -4919,6 +4912,9 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             if message.template.school.owner != user:
                 raise PermissionDenied("You can only send messages in your schools")
         
+        if user.role == 'I':
+            raise PermissionDenied("You cannot send messages")
+
         # Can only send pending messages
         if message.status != 'pending':
             return Response(
@@ -5104,11 +5100,18 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             if not instructor_profile:
                 return Response(
                     {'error': 'You have no active school profile'},
-                    status=status.HTTP_400_BAD_REQUEST
+                    status=status.HTTP_403_FORBIDDEN
                 )
             
+            invalid_students = students.exclude(school=instructor_profile.school)
+            if invalid_students.exists():
+                return Response(
+                    {'error': 'You cannot create messages for students from another school'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             # Filter students to only those in instructor's school
-            students = students.filter(school=instructor_profile.school)
+            #student = students.filter(school=instructor_profile.school)
             if template.school != instructor_profile.school:
                 return Response(
                     {'error': 'Template must be from your school'},
@@ -5445,7 +5448,7 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         GET /api/automated-messages/summary/
         """
         user = request.user
-        
+
         if user.role == 'S':
             # Student summary
             try:
@@ -5457,22 +5460,26 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
                 )
             
             messages = AutomatedMessage.objects.filter(student=student_profile)
-            
+
+            recent_unread_qs = messages.filter(
+                status__in=['sent', 'delivered'],
+                sent_at__isnull=False
+            ).order_by('-sent_at')[:5]
+
+            serializer = self.get_serializer(recent_unread_qs, many=True)
+
             summary = {
-                'total_messages': messages.count(),
-                'pending': messages.filter(status='pending').count(),
-                'read': messages.filter(status='read').count(),
-                'unread_sent': messages.filter(status='sent').count(),
-                'recent_unread': messages.filter(
-                    status__in=['sent', 'delivered'],
-                    sent_at__isnull=False
-                ).order_by('-sent_at')[:5]
+                'statistics': {
+                    'total_messages': messages.count(),
+                    'pending': messages.filter(status='pending').count(),
+                    'read': messages.filter(status='read').count(),
+                    'unread_sent': messages.filter(status='sent').count(),
+                },
+                'recent_unread': serializer.data
             }
-            
-            serializer = self.get_serializer(summary['recent_unread'], many=True)
-            summary['recent_unread'] = serializer.data
-            
+
             return Response(summary)
+
         
         elif user.role == 'I':
             # Instructor summary

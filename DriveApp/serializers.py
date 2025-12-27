@@ -1039,16 +1039,17 @@ class CommunicationTemplateSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         """Validate template data"""
         school = attrs.get('school', self.instance.school if self.instance else None)
-
+        request = self.context.get('request')
         # Validate school ownership
-        if self.instance is None:
-            request = self.context.get('request')
-            if request and request.user.is_authenticated and school:
-                if school.owner != request.user:
-                    raise serializers.ValidationError({
-                        'school': 'You can only create templates for your own school'
-                    })
 
+        if self.instance is None:
+            if request and request.user.is_authenticated and school:
+                if request.user.role == 'A' and not request.user.is_staff:
+                    if school.owner != request.user:
+                        raise serializers.ValidationError({
+                            'school': 'You can only create templates for your own school'
+                        })
+                
         # Validate template body is not empty
         body = attrs.get('body', '')
         if not body or not body.strip():
