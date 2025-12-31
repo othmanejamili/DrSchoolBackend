@@ -5637,6 +5637,9 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                     school=instructor_profile.school
                 ).select_related('school')
         
+        if user.role == 'S':
+            raise PermissionDenied("Students cannot access analytics")
+
         # Students cannot access analytics
         return SchoolAnalytics.objects.none()
     

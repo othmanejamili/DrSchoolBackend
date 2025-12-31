@@ -942,7 +942,7 @@ class SchoolAnalyticsSerializer(serializers.ModelSerializer):
         # Validate school ownership (keep this in serializer since it's request-specific)
         if self.instance is None:
             request = self.context.get('request')
-            if request and request.user.is_authenticated and school:
+            if request and request.user.is_authenticated and not request.user.is_active and school:
                 if school.owner != request.user:
                     raise serializers.ValidationError({
                         'school': 'You can only create analytics for your own school'
