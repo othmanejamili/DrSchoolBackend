@@ -28,7 +28,7 @@ from django.utils.dateparse import parse_datetime
 from django.http import HttpResponse
 import csv
 from django.core.cache import cache
-
+from django.db import connection
 
 
 User = get_user_model()
@@ -5636,8 +5636,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 return SchoolAnalytics.objects.filter(
                     school=instructor_profile.school
                 ).select_related('school')
-        
+            
         # Students cannot access analytics
+        if user.role == 'S':
+            return Response("Students cannot access analytics")
+        
+    
         return SchoolAnalytics.objects.none()
     
     def get_permissions(self):
@@ -5651,12 +5655,15 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         elif self.action == 'destroy':
             return [IsAuthenticated(), IsPlatformAdmin()]
         
-        elif self.action in ['generate_daily', 'refresh', 'bulk_generate']:
+        elif self.action in ['generate_daily', 'refresh', 'bulk_generate','export','predictions','system_health','comparison']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         
-        elif self.action in ['dashboard', 'trends', 'comparison', 'export']:
+        elif self.action in ['dashboard', 'trends']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
         
+        elif self.action == 'system_health':
+            return [IsAuthenticated(), IsPlatformAdmin()]
+
         return [IsAuthenticated()]
     
     def perform_create(self, serializer):
@@ -6300,6 +6307,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         - start_date: YYYY-MM-DD
         - end_date: YYYY-MM-DD
         """
+        user = request.user
+
         school_ids_str = request.query_params.get('school_ids')
         start_date_str = request.query_params.get('start_date')
         end_date_str = request.query_params.get('end_date')
@@ -6326,6 +6335,21 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             )
         
         # Parse dates
+        # Check if only one date is provided (missing the other)
+        if (start_date_str and not end_date_str) or (end_date_str and not start_date_str):
+            # One date is missing
+            if start_date_str and not end_date_str:
+                return Response(
+                    {'error': 'Missing end_date. Both start_date and end_date are required together.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            elif end_date_str and not start_date_str:
+                return Response(
+                    {'error': 'Missing start_date. Both start_date and end_date are required together.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Both dates provided
         if start_date_str and end_date_str:
             try:
                 start_date = timezone.datetime.strptime(start_date_str, '%Y-%m-%d').date()
@@ -6335,11 +6359,31 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                     {'error': 'Invalid date format. Use YYYY-MM-DD'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+            
+            # Validate date range
+            if start_date > end_date:
+                return Response(
+                    {
+                        'error': f'Invalid date range',
+                        'detail': f'Start date ({start_date}) cannot be after end date ({end_date})',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Check minimum date range (if needed)
+            if (end_date - start_date).days < 1:
+                return Response(
+                    {'error': 'Date range must be at least 1 day'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # No dates provided, use defaults
         else:
-            # Default to last 30 days
-            end_date = timezone.now().date()
-            start_date = end_date - timedelta(days=30)
-        
+            return Response(
+                {'error': 'Both start_date and end_date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Get schools
         schools = DrivingSchool.objects.filter(id__in=school_ids)
         
@@ -6361,21 +6405,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 )
         
         if user.role == 'I':
-            # Instructor can only view their school
-            instructor_profile = user.student_profiles.filter(status='A').first()
-            if not instructor_profile:
-                return Response(
-                    {'error': 'You are not associated with any active school'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            schools = schools.filter(id=instructor_profile.school.id)
-            if not schools.exists():
-                return Response(
-                    {'error': 'You can only view analytics for your school'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-        
+            # Instructor cannot view their school
+            return Response(
+                {'error': 'Instructors can only view their own school, not compare'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
         # Continuing from where the comparison action left off...
     
         # Get analytics for comparison
@@ -6512,36 +6547,39 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             'performance_ranking': comparison_data[:3] if len(comparison_data) >= 3 else comparison_data
         })
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=False, methods=['get'])
     def export(self, request):
         """
-        Export analytics data.
+        Export analytics data in CSV or JSON format.
         
-        GET /api/school-analytics/export/
         Query params:
         - school_id: Required
-        - start_date: YYYY-MM-DD
-        - end_date: YYYY-MM-DD
-        - format: 'csv' or 'json' (default: 'json')
+        - start_date: YYYY-MM-DD (optional, defaults to last 30 days)
+        - end_date: YYYY-MM-DD (optional, defaults to today)
+        - format: 'csv' or 'json' (default: 'csv')
         """
-        import csv
-        import json
-        from django.http import HttpResponse
-        from datetime import datetime
+
+
         
         school_id = request.query_params.get('school_id')
         start_date_str = request.query_params.get('start_date')
         end_date_str = request.query_params.get('end_date')
-        export_format = request.query_params.get('format', 'json')
+        export_format = request.query_params.get('format', 'csv').lower()
         
-        # Validate required parameters
-        if not school_id or not start_date_str or not end_date_str:
+        # Validate format
+        if export_format not in ['csv', 'json']:
             return Response(
-                {'error': 'school_id, start_date, and end_date are required'},
+                {'error': "Format must be 'csv' or 'json'"},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get school
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+
         try:
             school = DrivingSchool.objects.get(id=school_id)
         except DrivingSchool.DoesNotExist:
@@ -6561,16 +6599,28 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             if not instructor_profile or instructor_profile.school != school:
                 raise PermissionDenied("You can only export analytics for your school")
         
-        # Parse dates
+        # Parse dates or use defaults
         try:
-            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-        except ValueError:
+            if start_date_str and end_date_str:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            else:
+                # Default to last 30 days
+                end_date = timezone.now().date()
+                start_date = end_date - timedelta(days=30)
+        except (ValueError, TypeError):
             return Response(
                 {'error': 'Invalid date format. Use YYYY-MM-DD'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Validate date range
+        if start_date > end_date:
+            return Response(
+                {'error': 'Start date cannot be after end date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Limit export range
         days_diff = (end_date - start_date).days
         if days_diff > 365:
@@ -6602,7 +6652,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         # Calculate summary
         summary = {
-            'school_name': school.name,
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'owner': school.owner.get_full_name() or school.owner.username
+            },
+
             'period': {
                 'start_date': start_date.isoformat(),
                 'end_date': end_date.isoformat(),
@@ -6613,18 +6668,28 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 'average_total_students': round(
                     sum(d['total_students'] for d in export_data) / len(export_data), 2
                 ) if export_data else 0,
+                'average_active_students': round(
+                    sum(d['active_students'] for d in export_data) / len(export_data), 2
+                ) if export_data else 0,
+
                 'average_completion_rate': round(
                     sum(d['completion_rate'] for d in export_data) / len(export_data), 2
                 ) if export_data else 0,
                 'total_revenue': round(
                     sum(d['revenue'] for d in export_data), 2
                 ) if export_data else 0,
+                'average_rating': round(
+                    sum(d['average_rating'] for d in export_data) / len(export_data), 2
+                ) if export_data else 0,
+                'total_lessons_completed': sum(d['lessons_completed'] for d in export_data) if export_data else 0,
+
                 'total_new_students': sum(d['new_students'] for d in export_data) if export_data else 0
             }
         }
         
         # Export based on format
-        if export_format.lower() == 'csv':
+        if export_format == 'csv':
+
             response = HttpResponse(content_type='text/csv')
             response['Content-Disposition'] = f'attachment; filename="{school.name}_analytics_{start_date}_{end_date}.csv"'
             
@@ -6639,14 +6704,15 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             
             return response
         
-        else:  # JSON format (default)
+        else:  # JSON format
+
             return Response({
                 'metadata': summary,
                 'data': export_data,
                 'export_format': 'json',
                 'exported_at': timezone.now().isoformat()
             })
-    
+
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
     def alerts(self, request):
         """
@@ -7211,7 +7277,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                         latest_analytics.completion_rate - latest_analytics.completion_rate, 2
                     ),  # Same for now, could compare with other instructors
                     'rating_vs_school_average': round(
-                        avg_rating - latest_analytics.average_rating, 2
+                        float(avg_rating) - float(latest_analytics.average_rating), 2
                     )
                 }
             })
@@ -7230,11 +7296,15 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         GET /api/school-analytics/system_health/
         """
-        from django.db import connection
-        from django.core.cache import cache
+
         
         health_checks = {}
         
+        user = self.request.user
+
+        if user.role == 'A' and not user.is_staff:
+            raise PermissionDenied("you don't have permission")
+
         # 1. Database connection check
         try:
             with connection.cursor() as cursor:

@@ -2,6 +2,9 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import RegexValidator, MinValueValidator, MaxValueValidator
 import cloudinary
+from django.db import models
+from cloudinary.models import CloudinaryField
+
 #This Model For Table User
 class User(AbstractUser):
     ROLE_CHOICES = [
@@ -174,11 +177,6 @@ class Feedback(models.Model):
         return f"{self.student.user.username} - {self.lesson.title}"
 
 #This Model For Table Vehicle
-# models.py
-
-from django.db import models
-from cloudinary.models import CloudinaryField
-
 class Vehicle(models.Model):
     STATUS_CHOICES = [
         ('available', 'Available'),
@@ -261,7 +259,8 @@ class VehiclePicture(models.Model):
                 fetch_format='auto'
             )
         return None
-#This Model For Table Schedule
+
+#This Model For Table Schedule    
 class Schedule(models.Model):
     lesson = models.OneToOneField(Lesson, on_delete=models.CASCADE, related_name='schedule')  # One-to-one with lesson
     vehicle = models.ForeignKey(Vehicle, on_delete=models.SET_NULL, null=True, blank=True, related_name='schedules')
