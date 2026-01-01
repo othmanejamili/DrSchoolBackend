@@ -28,7 +28,7 @@ from django.utils.dateparse import parse_datetime
 from django.http import HttpResponse
 import csv
 from django.core.cache import cache
-
+from django.db import connection
 
 
 User = get_user_model()
@@ -5636,12 +5636,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 return SchoolAnalytics.objects.filter(
                     school=instructor_profile.school
                 ).select_related('school')
-        
-        if user.role == 'S':
-            raise PermissionDenied("Students cannot access analytics")
-        
-        
+            
         # Students cannot access analytics
+        if user.role == 'S':
+            return Response("Students cannot access analytics")
+        
+    
         return SchoolAnalytics.objects.none()
     
     def get_permissions(self):
@@ -5663,7 +5663,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         elif self.action == 'system_health':
             return [IsAuthenticated(), IsPlatformAdmin()]
-        
+
         return [IsAuthenticated()]
     
     def perform_create(self, serializer):
@@ -6308,11 +6308,11 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         - end_date: YYYY-MM-DD
         """
         user = request.user
+
         school_ids_str = request.query_params.get('school_ids')
         start_date_str = request.query_params.get('start_date')
         end_date_str = request.query_params.get('end_date')
         
-
         # Validate inputs
         if not school_ids_str:
             return Response(
@@ -6405,12 +6405,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 )
         
         if user.role == 'I':
-            # Instructor can only view their school
+            # Instructor cannot view their school
             return Response(
                 {'error': 'Instructors can only view their own school, not compare'},
                 status=status.HTTP_403_FORBIDDEN
             )
-        
+
         # Continuing from where the comparison action left off...
     
         # Get analytics for comparison
@@ -6559,6 +6559,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         - format: 'csv' or 'json' (default: 'csv')
         """
 
+
         
         school_id = request.query_params.get('school_id')
         start_date_str = request.query_params.get('start_date')
@@ -6578,6 +6579,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+
         try:
             school = DrivingSchool.objects.get(id=school_id)
         except DrivingSchool.DoesNotExist:
@@ -6618,7 +6620,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 {'error': 'Start date cannot be after end date'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         # Limit export range
         days_diff = (end_date - start_date).days
         if days_diff > 365:
@@ -6655,6 +6657,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 'name': school.name,
                 'owner': school.owner.get_full_name() or school.owner.username
             },
+
             'period': {
                 'start_date': start_date.isoformat(),
                 'end_date': end_date.isoformat(),
@@ -6668,6 +6671,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 'average_active_students': round(
                     sum(d['active_students'] for d in export_data) / len(export_data), 2
                 ) if export_data else 0,
+
                 'average_completion_rate': round(
                     sum(d['completion_rate'] for d in export_data) / len(export_data), 2
                 ) if export_data else 0,
@@ -6678,12 +6682,14 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                     sum(d['average_rating'] for d in export_data) / len(export_data), 2
                 ) if export_data else 0,
                 'total_lessons_completed': sum(d['lessons_completed'] for d in export_data) if export_data else 0,
+
                 'total_new_students': sum(d['new_students'] for d in export_data) if export_data else 0
             }
         }
         
         # Export based on format
         if export_format == 'csv':
+
             response = HttpResponse(content_type='text/csv')
             response['Content-Disposition'] = f'attachment; filename="{school.name}_analytics_{start_date}_{end_date}.csv"'
             
@@ -6699,12 +6705,14 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             return response
         
         else:  # JSON format
+
             return Response({
                 'metadata': summary,
                 'data': export_data,
                 'export_format': 'json',
                 'exported_at': timezone.now().isoformat()
             })
+
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
     def alerts(self, request):
         """
@@ -7288,8 +7296,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         GET /api/school-analytics/system_health/
         """
-        from django.db import connection
-        from django.core.cache import cache
+
         
         health_checks = {}
         
@@ -7462,4 +7469,3 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 })
         
         return recommendations
-
