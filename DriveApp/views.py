@@ -5636,7 +5636,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 return SchoolAnalytics.objects.filter(
                     school=instructor_profile.school
                 ).select_related('school')
-            
+        
+
         # Students cannot access analytics
         if user.role == 'S':
             return Response("Students cannot access analytics")

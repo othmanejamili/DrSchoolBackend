@@ -231,7 +231,7 @@ class AchievementViewSetTestCase(APITestCase):
         self.detail_url = lambda pk: reverse('achievement-detail', kwargs={'pk': pk})
         self.my_achievements_url = reverse('achievement-my-achievements')
         self.award_achievement_url = reverse('achievement-award-achievement')
-        self.bulk_award_url = reverse('achievement-bulk-award')
+        self.bulk_award_url = reverse('achievement-bulk-award') 
         self.check_milestones_url = reverse('achievement-check-milestones')
         self.leaderboard_url = reverse('achievement-leaderboard')
         self.statistics_url = reverse('achievement-statistics')
@@ -1526,6 +1526,7 @@ class AchievementViewSetTestCase(APITestCase):
         self.client.force_authenticate(user=self.platform_admin)
         
         response = self.client.get(self.export_url)
+        
         
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response['Content-Type'], 'text/csv')
