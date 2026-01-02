@@ -19,7 +19,7 @@ from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile
 from rest_framework.exceptions import PermissionDenied
 from django.db import transaction
 from .services import (StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService, 
-                       CommunicationService, CommunicationTemplateService, AnalyticsService)
+                       CommunicationService, CommunicationTemplateService, AnalyticsService, ReportService)
 from django.db.models import Avg, Sum, Q, Count, F, Max, Min
 from django_filters.rest_framework import DjangoFilterBackend 
 from datetime import datetime, timedelta, date
@@ -29,6 +29,7 @@ from django.http import HttpResponse
 import csv
 from django.core.cache import cache
 from django.db import connection
+import io
 
 
 User = get_user_model()
@@ -5591,8 +5592,7 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             
             return Response(summary)
 
-
-#DSS-13-Create-AnalyticsViewSet
+# DSS-13-Create-AnalyticsViewSet
 class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing school analytics.
@@ -7470,3 +7470,1347 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 })
         
         return recommendations
+
+
+
+
+class CSVRenderer:
+    """Custom renderer for CSV responses"""
+    media_type = 'text/csv'
+    format = 'csv'
+    
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        """
+        Render report data as CSV
+        """
+        if isinstance(data, bytes):
+            return data
+        
+        if isinstance(data, str):
+            return data.encode('utf-8')
+        
+        # If data is a dict with 'error' key, it's an error response
+        if isinstance(data, dict) and 'error' in data:
+            return str(data).encode('utf-8')
+        
+        return data
+
+# DSS-14-create-ReportViewSet
+class ReportViewSet(viewsets.ViewSet):
+    """
+    ViewSet for generating and managing reports.
+    
+    Provides various report types and export formats for analytics data.
+    
+    Access Control:
+    - Platform Admins: Full access to all reports
+    - School Owners: Generate reports for their schools
+    - Instructors: View reports for their school (read-only)
+    - Students: Cannot access reports
+    """
+    
+    permission_classes = [IsAuthenticated]
+    
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action in ['weekly_report', 'monthly_report', 'custom_report', 'export_report']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['instructor_performance', 'student_progress', 'financial_summary']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
+        
+        elif self.action in ['send_weekly_report', 'schedule_report']:
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        return [IsAuthenticated()]
+    
+    @action(detail=False, methods=['get'], url_path='report-weekly', url_name='report-weekly')
+    def weekly_report(self, request):
+        """
+        Generate weekly report for a school.
+        
+        GET /api/reports/weekly_report/
+        Query params:
+        - school_id: Required
+        - date: Optional (defaults to last 7 days from today)
+        """
+        user = request.user
+        school_id = request.query_params.get('school_id')
+        date_str = request.query_params.get('date')
+        
+        # Validate school_id
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only generate reports for your own schools")
+        
+        # Parse date or use default
+        if date_str:
+            try:
+                end_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            end_date = timezone.now().date()
+        
+        start_date = end_date - timedelta(days=6)  # 7 days total
+        
+        # Get analytics data
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if not analytics_records.exists():
+            return Response({
+                'school': school.name,
+                'period': f'{start_date} to {end_date}',
+                'message': 'No analytics data available for this week'
+            })
+        
+        # Calculate summary metrics
+        total_students = analytics_records.last().total_students if analytics_records.exists() else 0
+        avg_active_students = analytics_records.aggregate(avg=Avg('active_students'))['avg'] or 0
+        total_new_students = analytics_records.aggregate(total=Sum('new_students'))['total'] or 0
+        avg_completion_rate = analytics_records.aggregate(avg=Avg('completion_rate'))['avg'] or 0
+        total_revenue = analytics_records.aggregate(total=Sum('revenue'))['total'] or 0
+        avg_rating = analytics_records.aggregate(avg=Avg('average_rating'))['avg'] or 0
+        total_lessons = analytics_records.aggregate(total=Sum('lessons_completed'))['total'] or 0
+        avg_instructor_utilization = analytics_records.aggregate(avg=Avg('instructor_utilization'))['avg'] or 0
+        
+        # Daily breakdown
+        daily_data = []
+        for record in analytics_records:
+            daily_data.append({
+                'date': record.date,
+                'total_students': record.total_students,
+                'active_students': record.active_students,
+                'new_students': record.new_students,
+                'completion_rate': float(record.completion_rate),
+                'revenue': float(record.revenue),
+                'average_rating': float(record.average_rating),
+                'lessons_completed': record.lessons_completed
+            })
+        
+        # Get lessons data
+        lessons = Lesson.objects.filter(
+            school=school,
+            date__range=[
+                timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+            ]
+        )
+        
+        total_lessons_scheduled = lessons.count()
+        completed_lessons = lessons.filter(status='C').count()
+        cancelled_lessons = lessons.filter(status='X').count()
+        
+        # Get feedback data
+        feedback_records = Feedback.objects.filter(
+            lesson__school=school,
+            created_at__date__range=[start_date, end_date]
+        )
+        
+        total_feedback = feedback_records.count()
+        feedback_by_rating = dict(
+            feedback_records.values('rating').annotate(count=Count('id')).values_list('rating', 'count')
+        )
+        
+        # Top performing students
+        top_students = StudentProfile.objects.filter(
+            school=school,
+            user__role='S',
+            status='A'
+        ).annotate(
+            avg_progress=((F('progress_theory') + F('progress_driving')) / 2)
+        ).order_by('-avg_progress')[:5]
+        
+        top_students_data = [{
+            'id': student.id,
+            'name': student.user.get_full_name() or student.user.username,
+            'progress': round((student.progress_theory + student.progress_driving) / 2, 2),
+            'total_hours': student.total_hours_theory + student.total_hours_driving
+        } for student in top_students]
+        
+        # Instructor performance
+        instructors = User.objects.filter(
+            role='I',
+            student_profiles__school=school,
+            student_profiles__status='A'
+        ).distinct()
+        
+        instructor_stats = []
+        for instructor in instructors:
+            instructor_lessons = lessons.filter(instructor=instructor)
+            instructor_feedback = feedback_records.filter(lesson__instructor=instructor)
+            
+            instructor_stats.append({
+                'id': instructor.id,
+                'name': instructor.get_full_name() or instructor.username,
+                'lessons_taught': instructor_lessons.count(),
+                'completed_lessons': instructor_lessons.filter(status='C').count(),
+                'average_rating': round(
+                    instructor_feedback.aggregate(avg=Avg('rating'))['avg'] or 0, 2
+                ),
+                'total_feedback': instructor_feedback.count()
+            })
+        
+        # Attendance statistics
+        attendance_records = Attendance.objects.filter(
+            lesson__school=school,
+            lesson__date__range=[
+                timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+            ]
+        )
+        
+        total_attendance_records = attendance_records.count()
+        present_count = attendance_records.filter(presence=True).count()
+        attendance_rate = round((present_count / total_attendance_records * 100), 2) if total_attendance_records > 0 else 0
+        
+        # Compare with previous week
+        prev_week_start = start_date - timedelta(days=7)
+        prev_week_end = start_date - timedelta(days=1)
+        
+        prev_week_analytics = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[prev_week_start, prev_week_end]
+        )
+        
+        if prev_week_analytics.exists():
+            prev_avg_completion = prev_week_analytics.aggregate(avg=Avg('completion_rate'))['avg'] or 0
+            prev_total_revenue = prev_week_analytics.aggregate(total=Sum('revenue'))['total'] or 0
+            prev_new_students = prev_week_analytics.aggregate(total=Sum('new_students'))['total'] or 0
+            
+            completion_change = avg_completion_rate - prev_avg_completion
+            revenue_change = float(total_revenue) - float(prev_total_revenue)
+            students_change = total_new_students - prev_new_students
+            
+            comparison = {
+                'completion_rate_change': round(completion_change, 2),
+                'revenue_change': round(revenue_change, 2),
+                'new_students_change': students_change,
+                'trends': {
+                    'completion': 'up' if completion_change > 0 else 'down' if completion_change < 0 else 'stable',
+                    'revenue': 'up' if revenue_change > 0 else 'down' if revenue_change < 0 else 'stable',
+                    'enrollment': 'up' if students_change > 0 else 'down' if students_change < 0 else 'stable'
+                }
+            }
+        else:
+            comparison = {
+                'message': 'No previous week data available for comparison'
+            }
+        
+        # Compile report
+        report = {
+            'report_type': 'weekly',
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'owner': school.owner.get_full_name() or school.owner.username,
+                'email': school.email
+            },
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': 7
+            },
+            'summary_metrics': {
+                'total_students': total_students,
+                'avg_active_students': round(avg_active_students, 2),
+                'total_new_students': total_new_students,
+                'avg_completion_rate': round(avg_completion_rate, 2),
+                'total_revenue': round(float(total_revenue), 2),
+                'avg_rating': round(avg_rating, 2),
+                'total_lessons': total_lessons,
+                'avg_instructor_utilization': round(avg_instructor_utilization, 2)
+            },
+            'daily_breakdown': daily_data,
+            'lessons': {
+                'total_scheduled': total_lessons_scheduled,
+                'completed': completed_lessons,
+                'cancelled': cancelled_lessons,
+                'completion_rate': round((completed_lessons / total_lessons_scheduled * 100), 2) if total_lessons_scheduled > 0 else 0
+            },
+            'attendance': {
+                'total_records': total_attendance_records,
+                'present': present_count,
+                'absent': total_attendance_records - present_count,
+                'attendance_rate': attendance_rate
+            },
+            'feedback': {
+                'total_feedback': total_feedback,
+                'by_rating': feedback_by_rating,
+                'average_rating': round(avg_rating, 2)
+            },
+            'top_students': top_students_data,
+            'instructor_performance': instructor_stats,
+            'comparison_with_previous_week': comparison,
+            'generated_at': timezone.now().isoformat()
+        }
+        
+        return Response(report)
+    
+    @action(detail=False, methods=['get'], url_name='report-monthly', url_path='report-monthly')
+    def monthly_report(self, request):
+        """
+        Generate monthly report for a school.
+        
+        GET /api/reports/monthly_report/
+        Query params:
+        - school_id: Required
+        - month: Optional (YYYY-MM format, defaults to current month)
+        """
+        user = request.user
+        school_id = request.query_params.get('school_id')
+        month_str = request.query_params.get('month')
+        
+        # Validate school_id
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only generate reports for your own schools")
+        
+        # Parse month or use default
+        if month_str:
+            try:
+                year, month = map(int, month_str.split('-'))
+                start_date = date(year, month, 1)
+            except (ValueError, AttributeError):
+                return Response(
+                    {'error': 'Invalid month format. Use YYYY-MM'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            today = timezone.now().date()
+            start_date = date(today.year, today.month, 1)
+        
+        # Calculate end date (last day of month)
+        if start_date.month == 12:
+            end_date = date(start_date.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end_date = date(start_date.year, start_date.month + 1, 1) - timedelta(days=1)
+        
+        # Don't allow future months
+        if start_date > timezone.now().date():
+            return Response(
+                {'error': 'Cannot generate reports for future months'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get analytics data
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if not analytics_records.exists():
+            return Response({
+                'school': school.name,
+                'period': f'{start_date} to {end_date}',
+                'message': 'No analytics data available for this month'
+            })
+        
+        # Calculate monthly metrics
+        final_record = analytics_records.last()
+        initial_record = analytics_records.first()
+        
+        # Student metrics
+        students_at_start = initial_record.total_students
+        students_at_end = final_record.total_students
+        student_growth = students_at_end - students_at_start
+        total_new_students = analytics_records.aggregate(total=Sum('new_students'))['total'] or 0
+        avg_active_students = analytics_records.aggregate(avg=Avg('active_students'))['avg'] or 0
+        
+        # Performance metrics
+        avg_completion_rate = analytics_records.aggregate(avg=Avg('completion_rate'))['avg'] or 0
+        avg_rating = analytics_records.aggregate(avg=Avg('average_rating'))['avg'] or 0
+        avg_instructor_utilization = analytics_records.aggregate(avg=Avg('instructor_utilization'))['avg'] or 0
+        
+        # Financial metrics
+        total_revenue = analytics_records.aggregate(total=Sum('revenue'))['total'] or 0
+        avg_daily_revenue = analytics_records.aggregate(avg=Avg('revenue'))['avg'] or 0
+        highest_revenue_day = analytics_records.order_by('-revenue').first()
+        
+        # Lesson metrics
+        total_lessons = analytics_records.aggregate(total=Sum('lessons_completed'))['total'] or 0
+        
+        lessons = Lesson.objects.filter(
+            school=school,
+            date__range=[
+                timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+            ]
+        )
+        
+        total_scheduled = lessons.count()
+        completed = lessons.filter(status='C').count()
+        cancelled = lessons.filter(status='X').count()
+        
+        # Weekly breakdown
+        weekly_breakdown = []
+        current_week_start = start_date
+        week_num = 1
+        
+        while current_week_start <= end_date:
+            week_end = min(current_week_start + timedelta(days=6), end_date)
+            
+            week_analytics = analytics_records.filter(date__range=[current_week_start, week_end])
+            
+            if week_analytics.exists():
+                weekly_breakdown.append({
+                    'week': week_num,
+                    'start_date': current_week_start,
+                    'end_date': week_end,
+                    'avg_active_students': round(week_analytics.aggregate(avg=Avg('active_students'))['avg'] or 0, 2),
+                    'new_students': week_analytics.aggregate(total=Sum('new_students'))['total'] or 0,
+                    'revenue': round(float(week_analytics.aggregate(total=Sum('revenue'))['total'] or 0), 2),
+                    'avg_completion_rate': round(week_analytics.aggregate(avg=Avg('completion_rate'))['avg'] or 0, 2),
+                    'lessons_completed': week_analytics.aggregate(total=Sum('lessons_completed'))['total'] or 0
+                })
+            
+            current_week_start = week_end + timedelta(days=1)
+            week_num += 1
+        
+        # Student status breakdown
+        students_completed = StudentProfile.objects.filter(
+            school=school,
+            status='C',
+            completion_date__range=[start_date, end_date]
+        ).count()
+        
+        current_active = StudentProfile.objects.filter(
+            school=school,
+            user__role='S',
+            status='A'
+        ).count()
+        
+        current_paused = StudentProfile.objects.filter(
+            school=school,
+            user__role='S',
+            status='P'
+        ).count()
+        
+        # Instructor performance (monthly)
+        instructors = User.objects.filter(
+            role='I',
+            student_profiles__school=school,
+            student_profiles__status='A'
+        ).distinct()
+        
+        instructor_monthly_stats = []
+        for instructor in instructors:
+            instructor_lessons = lessons.filter(instructor=instructor)
+            instructor_feedback = Feedback.objects.filter(
+                lesson__instructor=instructor,
+                lesson__school=school,
+                created_at__date__range=[start_date, end_date]
+            )
+            
+            instructor_monthly_stats.append({
+                'id': instructor.id,
+                'name': instructor.get_full_name() or instructor.username,
+                'total_lessons': instructor_lessons.count(),
+                'completed_lessons': instructor_lessons.filter(status='C').count(),
+                'cancelled_lessons': instructor_lessons.filter(status='X').count(),
+                'average_rating': round(instructor_feedback.aggregate(avg=Avg('rating'))['avg'] or 0, 2),
+                'total_feedback': instructor_feedback.count(),
+                'completion_rate': round(
+                    (instructor_lessons.filter(status='C').count() / instructor_lessons.count() * 100), 2
+                ) if instructor_lessons.count() > 0 else 0
+            })
+        
+        # Top achievements
+        achievements_earned = Achievement.objects.filter(
+            student__school=school,
+            earned_at__date__range=[start_date, end_date]
+        )
+        
+        total_achievements = achievements_earned.count()
+        achievements_by_type = dict(
+            achievements_earned.values('type').annotate(count=Count('id')).values_list('type', 'count')
+        )
+        
+        # Attendance analysis
+        attendance_records = Attendance.objects.filter(
+            lesson__school=school,
+            lesson__date__range=[
+                timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+            ]
+        )
+        
+        total_attendance = attendance_records.count()
+        present = attendance_records.filter(presence=True).count()
+        monthly_attendance_rate = round((present / total_attendance * 100), 2) if total_attendance > 0 else 0
+        
+        # Compare with previous month
+        prev_month_start = (start_date.replace(day=1) - timedelta(days=1)).replace(day=1)
+        prev_month_end = start_date - timedelta(days=1)
+        
+        prev_month_analytics = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[prev_month_start, prev_month_end]
+        )
+        
+        if prev_month_analytics.exists():
+            prev_revenue = prev_month_analytics.aggregate(total=Sum('revenue'))['total'] or 0
+            prev_completion = prev_month_analytics.aggregate(avg=Avg('completion_rate'))['avg'] or 0
+            prev_new_students = prev_month_analytics.aggregate(total=Sum('new_students'))['total'] or 0
+            
+            revenue_change = float(total_revenue) - float(prev_revenue)
+            completion_change = avg_completion_rate - prev_completion
+            students_change = total_new_students - prev_new_students
+            
+            revenue_pct = round((revenue_change / float(prev_revenue) * 100), 2) if prev_revenue > 0 else 0
+            
+            month_comparison = {
+                'revenue_change': round(revenue_change, 2),
+                'revenue_change_percentage': revenue_pct,
+                'completion_rate_change': round(completion_change, 2),
+                'new_students_change': students_change,
+                'trends': {
+                    'revenue': 'up' if revenue_change > 0 else 'down' if revenue_change < 0 else 'stable',
+                    'completion': 'up' if completion_change > 0 else 'down' if completion_change < 0 else 'stable',
+                    'enrollment': 'up' if students_change > 0 else 'down' if students_change < 0 else 'stable'
+                }
+            }
+        else:
+            month_comparison = {
+                'message': 'No previous month data available for comparison'
+            }
+        
+        # Compile monthly report
+        report = {
+            'report_type': 'monthly',
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'owner': school.owner.get_full_name() or school.owner.username,
+                'email': school.email
+            },
+            'period': {
+                'month': start_date.strftime('%B %Y'),
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': (end_date - start_date).days + 1
+            },
+            'executive_summary': {
+                'total_revenue': round(float(total_revenue), 2),
+                'student_growth': student_growth,
+                'new_students': total_new_students,
+                'students_completed': students_completed,
+                'avg_completion_rate': round(avg_completion_rate, 2),
+                'avg_rating': round(avg_rating, 2),
+                'total_lessons_completed': total_lessons,
+                'monthly_attendance_rate': monthly_attendance_rate
+            },
+            'student_metrics': {
+                'students_at_start': students_at_start,
+                'students_at_end': students_at_end,
+                'net_growth': student_growth,
+                'growth_percentage': round((student_growth / students_at_start * 100), 2) if students_at_start > 0 else 0,
+                'new_enrollments': total_new_students,
+                'completions': students_completed,
+                'current_active': current_active,
+                'current_paused': current_paused,
+                'avg_active_per_day': round(avg_active_students, 2)
+            },
+            'financial_metrics': {
+                'total_revenue': round(float(total_revenue), 2),
+                'avg_daily_revenue': round(float(avg_daily_revenue), 2),
+                'highest_revenue_day': {
+                    'date': highest_revenue_day.date,
+                    'amount': round(float(highest_revenue_day.revenue), 2)
+                } if highest_revenue_day else None
+            },
+            'performance_metrics': {
+                'avg_completion_rate': round(avg_completion_rate, 2),
+                'avg_rating': round(avg_rating, 2),
+                'avg_instructor_utilization': round(avg_instructor_utilization, 2)
+            },
+            'lesson_metrics': {
+                'total_scheduled': total_scheduled,
+                'total_completed': completed,
+                'total_cancelled': cancelled,
+                'completion_rate': round((completed / total_scheduled * 100), 2) if total_scheduled > 0 else 0,
+                'cancellation_rate': round((cancelled / total_scheduled * 100), 2) if total_scheduled > 0 else 0
+            },
+            'weekly_breakdown': weekly_breakdown,
+            'instructor_performance': instructor_monthly_stats,
+            'achievements': {
+                'total_earned': total_achievements,
+                'by_type': achievements_by_type
+            },
+            'attendance': {
+                'total_records': total_attendance,
+                'present': present,
+                'absent': total_attendance - present,
+                'attendance_rate': monthly_attendance_rate
+            },
+            'comparison_with_previous_month': month_comparison,
+            'generated_at': timezone.now().isoformat()
+        }
+        
+        return Response(report)
+    
+    @action(detail=False, methods=['post'], url_path='report-send-weekly', url_name='report-send-weekly')
+    def send_weekly_report(self, request):
+        """
+        Generate and send weekly report via email.
+        
+        POST /api/reports/send_weekly_report/
+        Body: {
+            "school_id": 123,
+            "date": "2024-12-31" (optional)
+        }
+        """
+        user = request.user
+        school_id = request.data.get('school_id')
+        date_str = request.data.get('date')
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only send reports for your own schools")
+        
+        # Generate report (reuse weekly_report logic)
+        request.query_params._mutable = True
+        request.query_params['school_id'] = school_id
+        if date_str:
+            request.query_params['date'] = date_str
+        request.query_params._mutable = False
+        
+        report_response = self.weekly_report(request)
+        
+        if report_response.status_code != 200:
+            return report_response
+        
+        summary = report_response.data
+        
+        # Send email using ReportService
+        try:
+            ReportService.send_weekly_report(school, summary)
+            
+            return Response({
+                'message': 'Weekly report sent successfully',
+                'recipient': school.owner.email,
+                'school': school.name,
+                'period': {
+                    'start_date': summary['period']['start_date'],
+                    'end_date': summary['period']['end_date']
+                },
+                'sent_at': timezone.now().isoformat()
+            })
+        
+        except Exception as e:
+            return Response({
+                'error': f'Failed to send report: {str(e)}',
+                'report_generated': True,
+                'email_sent': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['get'], )
+    def instructor_performance(self, request):
+        """
+        Generate instructor performance report.
+        
+        GET /api/reports/instructor_performance/
+        Query params:
+        - school_id: Required
+        - instructor_id: Optional (specific instructor)
+        - start_date: Optional (YYYY-MM-DD)
+        - end_date: Optional (YYYY-MM-DD)
+        """
+        user = request.user
+        school_id = request.query_params.get('school_id')
+        instructor_id = request.query_params.get('instructor_id')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only view reports for your own schools")
+        
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != school:
+                raise PermissionDenied("You can only view reports for your school")
+        
+        # Parse dates or use defaults (last 30 days)
+        if start_date_str and end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            end_date = timezone.now().date()
+            start_date = end_date - timedelta(days=30)
+        
+        # Get instructors
+        if instructor_id:
+            try:
+                instructors = [User.objects.get(id=instructor_id, role='I')]
+                # Verify instructor belongs to this school
+                if not instructors[0].student_profiles.filter(school=school, status='A').exists():
+                    return Response(
+                        {'error': 'Instructor not found in this school'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            except User.DoesNotExist:
+                return Response(
+                    {'error': 'Instructor not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            instructors = User.objects.filter(
+                role='I',
+                student_profiles__school=school,
+                student_profiles__status='A'
+            ).distinct()
+        
+        # Generate performance data for each instructor
+        instructor_reports = []
+        
+        for instructor in instructors:
+            # Get lessons
+            lessons = Lesson.objects.filter(
+                instructor=instructor,
+                school=school,
+                date__range=[
+                    timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                    timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+                ]
+                )
+        
+        total_lessons = lessons.count()
+        completed_lessons = lessons.filter(status='C').count()
+        cancelled_lessons = lessons.filter(status='X').count()
+        
+        # Get feedback
+        feedback = Feedback.objects.filter(
+            lesson__instructor=instructor,
+            lesson__school=school,
+            created_at__date__range=[start_date, end_date]
+        )
+        
+        avg_rating = feedback.aggregate(avg=Avg('rating'))['avg'] or 0
+        total_feedback = feedback.count()
+        
+        # Feedback distribution
+        rating_distribution = dict(
+            feedback.values('rating').annotate(count=Count('id')).values_list('rating', 'count')
+        )
+        
+        # Students taught
+        students_taught = Attendance.objects.filter(
+            lesson__instructor=instructor,
+            lesson__school=school,
+            lesson__date__range=[
+                timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+            ],
+            presence=True
+        ).values('student').distinct().count()
+        
+        # Hours taught
+        total_hours = sum(
+            (lesson.duration / 60) for lesson in lessons if lesson.status == 'C'
+        )
+        
+        # Attendance rate for instructor's lessons
+        attendance_records = Attendance.objects.filter(
+            lesson__instructor=instructor,
+            lesson__school=school,
+            lesson__date__range=[
+                timezone.make_aware(datetime.combine(start_date, datetime.min.time())),
+                timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+            ]
+        )
+        
+        total_attendance = attendance_records.count()
+        present = attendance_records.filter(presence=True).count()
+        instructor_attendance_rate = round((present / total_attendance * 100), 2) if total_attendance > 0 else 0
+        
+        instructor_reports.append({
+            'instructor': {
+                'id': instructor.id,
+                'name': instructor.get_full_name() or instructor.username,
+                'email': instructor.email
+            },
+            'lesson_metrics': {
+                'total_lessons': total_lessons,
+                'completed': completed_lessons,
+                'cancelled': cancelled_lessons,
+                'completion_rate': round((completed_lessons / total_lessons * 100), 2) if total_lessons > 0 else 0,
+                'total_hours': round(total_hours, 2)
+            },
+            'student_metrics': {
+                'unique_students_taught': students_taught,
+                'attendance_rate': instructor_attendance_rate
+            },
+            'feedback_metrics': {
+                'average_rating': round(avg_rating, 2),
+                'total_feedback': total_feedback,
+                'rating_distribution': rating_distribution,
+                'feedback_rate': round((total_feedback / completed_lessons * 100), 2) if completed_lessons > 0 else 0
+            },
+            'performance_score': round(
+                (avg_rating * 0.4) + 
+                ((completed_lessons / total_lessons * 5) * 0.3 if total_lessons > 0 else 0) + 
+                ((instructor_attendance_rate / 20) * 0.3), 2
+            )
+        })
+    
+        # Sort by performance score
+        instructor_reports.sort(key=lambda x: x['performance_score'], reverse=True)
+    
+        # Add rankings
+        for idx, report in enumerate(instructor_reports, 1):
+            report['rank'] = idx
+    
+        # Overall statistics
+        total_instructors = len(instructor_reports)
+        avg_completion_rate = sum(r['lesson_metrics']['completion_rate'] for r in instructor_reports) / total_instructors if total_instructors > 0 else 0
+        avg_rating_overall = sum(r['feedback_metrics']['average_rating'] for r in instructor_reports) / total_instructors if total_instructors > 0 else 0
+        
+        return Response({
+            'report_type': 'instructor_performance',
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': (end_date - start_date).days + 1
+            },
+            'overall_statistics': {
+                'total_instructors': total_instructors,
+                'avg_completion_rate': round(avg_completion_rate, 2),
+                'avg_rating': round(avg_rating_overall, 2)
+            },
+            'instructor_reports': instructor_reports,
+            'top_performers': instructor_reports[:3] if len(instructor_reports) >= 3 else instructor_reports,
+            'generated_at': timezone.now().isoformat()
+        })
+
+    @action(detail=False, methods=['get'])
+    def student_progress(self, request):
+        """
+        Generate student progress report.
+        
+        GET /api/reports/student_progress/
+        Query params:
+        - school_id: Required
+        - status: Optional ('A', 'C', 'P')
+        - min_progress: Optional (0-100)
+        """
+        user = request.user
+        school_id = request.query_params.get('school_id')
+        status_filter = request.query_params.get('status')
+        min_progress = request.query_params.get('min_progress')
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only view reports for your own schools")
+        
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != school:
+                raise PermissionDenied("You can only view reports for your school")
+        
+        # Get students
+        students = StudentProfile.objects.filter(
+            school=school,
+            user__role='S'
+        ).select_related('user')
+        
+        # Apply filters
+        if status_filter:
+            students = students.filter(status=status_filter)
+        
+        # Generate student reports
+        student_reports = []
+        
+        for student in students:
+            avg_progress = (student.progress_theory + student.progress_driving) / 2
+            
+            # Apply min_progress filter
+            if min_progress:
+                try:
+                    min_prog = float(min_progress)
+                    if avg_progress < min_prog:
+                        continue
+                except ValueError:
+                    pass
+            
+            # Get attendance
+            attendance = Attendance.objects.filter(student=student)
+            total_lessons = attendance.count()
+            attended = attendance.filter(presence=True).count()
+            
+            # Get achievements
+            achievements_count = Achievement.objects.filter(student=student).count()
+            
+            # Get feedback given
+            feedback_given = Feedback.objects.filter(student=student).count()
+            
+            student_reports.append({
+                'student': {
+                    'id': student.id,
+                    'name': student.user.get_full_name() or student.user.username,
+                    'email': student.user.email
+                },
+                'status': student.get_status_display(),
+                'progress': {
+                    'theory': float(student.progress_theory),
+                    'driving': float(student.progress_driving),
+                    'average': round(avg_progress, 2)
+                },
+                'hours': {
+                    'theory': float(student.total_hours_theory),
+                    'driving': float(student.total_hours_driving),
+                    'total': float(student.total_hours_theory + student.total_hours_driving)
+                },
+                'attendance': {
+                    'total_lessons': total_lessons,
+                    'attended': attended,
+                    'missed': total_lessons - attended,
+                    'attendance_rate': round((attended / total_lessons * 100), 2) if total_lessons > 0 else 0
+                },
+                'engagement': {
+                    'achievements_earned': achievements_count,
+                    'feedback_given': feedback_given
+                },
+                'dates': {
+                    'joined': student.joined_at,
+                    'theory_start': student.theory_start_date,
+                    'driving_start': student.driving_start_date,
+                    'completion': student.completion_date
+                }
+            })
+        
+        # Sort by average progress
+        student_reports.sort(key=lambda x: x['progress']['average'], reverse=True)
+        
+        # Categorize students
+        at_risk = [s for s in student_reports if s['progress']['average'] < 20]
+        on_track = [s for s in student_reports if 20 <= s['progress']['average'] < 80]
+        excelling = [s for s in student_reports if s['progress']['average'] >= 80]
+        
+        return Response({
+            'report_type': 'student_progress',
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'summary': {
+                'total_students': len(student_reports),
+                'at_risk': len(at_risk),
+                'on_track': len(on_track),
+                'excelling': len(excelling),
+                'avg_progress': round(
+                    sum(s['progress']['average'] for s in student_reports) / len(student_reports), 2
+                ) if student_reports else 0
+            },
+            'students': student_reports,
+            'categorized': {
+                'at_risk': at_risk,
+                'on_track': on_track,
+                'excelling': excelling
+            },
+            'generated_at': timezone.now().isoformat()
+        })
+
+    @action(detail=False, methods=['get'])
+    def financial_summary(self, request):
+        """
+        Generate financial summary report.
+        
+        GET /api/reports/financial_summary/
+        Query params:
+        - school_id: Required
+        - start_date: Optional (YYYY-MM-DD)
+        - end_date: Optional (YYYY-MM-DD)
+        """
+        user = request.user
+        school_id = request.query_params.get('school_id')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        
+        if not school_id:
+            return Response(
+                {'error': 'school_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get school
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionDenied("You can only view financial reports for your own schools")
+        
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != school:
+                raise PermissionDenied("You can only view reports for your school")
+        
+        # Parse dates or use defaults
+        if start_date_str and end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            end_date = timezone.now().date()
+            start_date = end_date - timedelta(days=30)
+        
+        # Get analytics data
+        analytics = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if not analytics.exists():
+            return Response({
+                'school': school.name,
+                'period': f'{start_date} to {end_date}',
+                'message': 'No financial data available for this period'
+            })
+        
+        # Calculate financial metrics
+        total_revenue = analytics.aggregate(total=Sum('revenue'))['total'] or 0
+        avg_daily_revenue = analytics.aggregate(avg=Avg('revenue'))['avg'] or 0
+        
+        highest_day = analytics.order_by('-revenue').first()
+        lowest_day = analytics.order_by('revenue').first()
+        
+        # Daily revenue data
+        daily_revenue = [{
+            'date': record.date,
+            'revenue': float(record.revenue)
+        } for record in analytics]
+        
+        # Monthly breakdown if period > 30 days
+        monthly_breakdown = []
+        if (end_date - start_date).days > 30:
+            current_month = start_date.replace(day=1)
+            while current_month <= end_date:
+                if current_month.month == 12:
+                    next_month = current_month.replace(year=current_month.year + 1, month=1)
+                else:
+                    next_month = current_month.replace(month=current_month.month + 1)
+                
+                month_end = min(next_month - timedelta(days=1), end_date)
+                
+                month_analytics = analytics.filter(date__range=[current_month, month_end])
+                
+                if month_analytics.exists():
+                    monthly_breakdown.append({
+                        'month': current_month.strftime('%B %Y'),
+                        'total_revenue': round(float(month_analytics.aggregate(total=Sum('revenue'))['total'] or 0), 2),
+                        'avg_daily_revenue': round(float(month_analytics.aggregate(avg=Avg('revenue'))['avg'] or 0), 2),
+                        'days': month_analytics.count()
+                    })
+                
+                current_month = next_month
+        
+        return Response({
+            'report_type': 'financial_summary',
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': (end_date - start_date).days + 1
+            },
+            'financial_summary': {
+                'total_revenue': round(float(total_revenue), 2),
+                'avg_daily_revenue': round(float(avg_daily_revenue), 2),
+                'highest_revenue_day': {
+                    'date': highest_day.date,
+                    'amount': round(float(highest_day.revenue), 2)
+                } if highest_day else None,
+                'lowest_revenue_day': {
+                    'date': lowest_day.date,
+                    'amount': round(float(lowest_day.revenue), 2)
+                } if lowest_day else None
+            },
+            'daily_revenue': daily_revenue,
+            'monthly_breakdown': monthly_breakdown if monthly_breakdown else None,
+            'generated_at': timezone.now().isoformat()
+        })
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export_report(self, request):
+        """
+        Export report in CSV or JSON format.
+        
+        GET /api/reports/export/
+        Query params:
+        - school_id: Required
+        - report_type: 'weekly' or 'monthly' (default: 'weekly')
+        - format: 'csv' or 'json' (default: 'csv')
+        """
+        try:
+            school_id = request.query_params.get('school_id')
+            report_type = request.query_params.get('report_type', 'weekly').lower()
+            export_format = request.query_params.get('export_format', 'csv').lower()  # ← Changed
+            
+            if not school_id:
+                return Response(
+                    {'error': 'school_id is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            if export_format not in ['csv', 'json']:
+                return Response(
+                    {'error': "format must be 'csv' or 'json'"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Generate report data based on type
+            if report_type == 'weekly':
+                report_data = ReportService.generate_weekly_report(
+                    school_id=int(school_id),
+                    end_date=None,
+                    user=request.user
+                )
+            elif report_type == 'monthly':
+                report_data = ReportService.generate_monthly_report(
+                    school_id=int(school_id),
+                    year=None,
+                    month=None,
+                    user=request.user
+                )
+            else:
+                return Response(
+                    {'error': f'Unknown report type: {report_type}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+
+            if export_format not in ['csv', 'json']:
+                return Response(
+                    {'error': "export_format must be 'csv' or 'json'"},  # ← Updated error message
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            # Export based on format
+            if export_format == 'csv':
+                # Generate CSV content
+                csv_content = self._generate_csv_content(report_data, report_type)
+                
+                # Create response with CSV content
+                response = Response(
+                    csv_content,
+                    status=status.HTTP_200_OK,
+                    content_type='text/csv'
+                )
+                
+                # Set filename
+                school_name = report_data.get('school', {}).get('name', 'report').replace(' ', '_')
+                filename = f"{report_type}_report_{school_name}_{datetime.now().strftime('%Y%m%d')}.csv"
+                response['Content-Disposition'] = f'attachment; filename="{filename}"'
+                
+                return response
+            else:  # json
+                return Response(report_data)
+        
+        except PermissionError as e:
+            return Response({'error': str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            import traceback
+            print(f"Export error: {str(e)}")
+            print(traceback.format_exc())
+            return Response(
+                {'error': f'Failed to export report: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def _generate_csv_content(self, report_data, report_type):
+        """
+        Generate CSV content as a string from report data.
+        Returns the CSV content as a string.
+        """
+        # Use StringIO to write CSV to memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write metadata
+        writer.writerow(['Report Type', report_type.upper()])
+        if 'school' in report_data:
+            writer.writerow(['School', report_data['school'].get('name', '')])
+        if 'period' in report_data:
+            start = report_data['period'].get('start_date', '')
+            end = report_data['period'].get('end_date', '')
+            writer.writerow(['Period', f"{start} to {end}"])
+        writer.writerow(['Generated At', report_data.get('generated_at', datetime.now().isoformat())])
+        writer.writerow([])  # Empty row
+        
+        # Write summary metrics
+        summary = report_data.get('summary_metrics', {})
+        if summary:
+            writer.writerow(['Summary Metrics'])
+            writer.writerow(['Metric', 'Value'])
+            for key, value in summary.items():
+                writer.writerow([key.replace('_', ' ').title(), value])
+            writer.writerow([])  # Empty row
+        
+        # Write daily breakdown if exists
+        if 'daily_breakdown' in report_data:
+            writer.writerow(['Daily Breakdown'])
+            writer.writerow(['Date', 'Total Students', 'Active Students', 'New Students', 'Revenue', 'Lessons Completed'])
+            for day in report_data['daily_breakdown']:
+                writer.writerow([
+                    day.get('date', ''),
+                    day.get('total_students', ''),
+                    day.get('active_students', ''),
+                    day.get('new_students', ''),
+                    day.get('revenue', ''),
+                    day.get('lessons_completed', '')
+                ])
+            writer.writerow([])  # Empty row
+        
+        # Write weekly breakdown if exists
+        if 'weekly_breakdown' in report_data:
+            writer.writerow(['Weekly Breakdown'])
+            writer.writerow(['Week', 'Start Date', 'End Date', 'Avg Active Students', 'New Students', 'Revenue', 'Lessons'])
+            for week in report_data['weekly_breakdown']:
+                writer.writerow([
+                    week.get('week', ''),
+                    week.get('start_date', ''),
+                    week.get('end_date', ''),
+                    week.get('avg_active_students', ''),
+                    week.get('new_students', ''),
+                    week.get('revenue', ''),
+                    week.get('lessons_completed', '')
+                ])
+            writer.writerow([])  # Empty row
+        
+        # Write lesson statistics if exists
+        if 'lessons' in report_data:
+            lessons = report_data['lessons']
+            writer.writerow(['Lesson Statistics'])
+            writer.writerow(['Metric', 'Value'])
+            writer.writerow(['Total Scheduled', lessons.get('total_scheduled', '')])
+            writer.writerow(['Completed', lessons.get('completed', '')])
+            writer.writerow(['Cancelled', lessons.get('cancelled', '')])
+            writer.writerow(['Completion Rate', f"{lessons.get('completion_rate', '')}%"])
+            writer.writerow([])  # Empty row
+        
+        # Write attendance statistics if exists
+        if 'attendance' in report_data:
+            attendance = report_data['attendance']
+            writer.writerow(['Attendance Statistics'])
+            writer.writerow(['Metric', 'Value'])
+            writer.writerow(['Total Records', attendance.get('total_records', '')])
+            writer.writerow(['Present', attendance.get('present', '')])
+            writer.writerow(['Absent', attendance.get('absent', '')])
+            writer.writerow(['Attendance Rate', f"{attendance.get('attendance_rate', '')}%"])
+        
+        # Get the CSV content as a string
+        csv_content = output.getvalue()
+        output.close()
+        
+        return csv_content
