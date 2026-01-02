@@ -182,7 +182,6 @@ def send_scheduled_messages():
     }
 
 
-
 @shared_task(name='send_lesson_reminders')
 def send_lesson_reminders():
     """

@@ -1,17 +1,17 @@
 # services.py
 from datetime import timedelta
 from django.utils import timezone
-from datetime import datetime
+from datetime import datetime, date
 from django.db.models import Avg, Count, Sum, Q
 from .models import (SchoolAnalytics, StudentProfile, Lesson, 
                      Feedback, Attendance, Schedule, Vehicle, StudentDocument,
-                     SubscriptionPlan, SchoolSubscription, AutomatedMessage, CommunicationTemplate)
+                     SubscriptionPlan, SchoolSubscription, AutomatedMessage, CommunicationTemplate,
+                     StudentPerformancePrediction, User, DrivingSchool)
 from django.db import transaction
 from django.db.models import Count, Avg, Sum, Max,Q, F, ExpressionWrapper, FloatField
 from django.core.cache import cache
 from datetime import timedelta
 import logging
-from .models import StudentPerformancePrediction
 from typing import Dict, List, Optional, Tuple
 from rest_framework import serializers
 from decimal import Decimal
@@ -484,13 +484,456 @@ class LessonService:
 
 
 class ReportService:
-    """Generate and send reports"""
+    """
+    Service class for generating reports.
+    Handles all business logic for report generation.
+    """
+    
+    @staticmethod
+    def _check_school_access(school_id, user):
+        """Check if user has access to this school"""
+        try:
+            school = DrivingSchool.objects.get(id=school_id)
+        except DrivingSchool.DoesNotExist:
+            raise ValueError('School not found')
+        
+        # If no user provided, raise error
+        if not user:
+            raise PermissionError("Authentication required")
+        
+        # Platform admin has access to all schools
+        if user.role == 'A' and user.is_staff:
+            return school
+        
+        # School owner can only access their own schools
+        if user.role == 'A' and not user.is_staff:
+            if school.owner != user:
+                raise PermissionError("You can only view reports for your own schools")
+            return school
+        
+        # Instructor can only access their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != school:
+                raise PermissionError("You can only view reports for your school")
+            return school
+        
+        raise PermissionError("You don't have permission to view this report")
+    
+    @classmethod
+    def generate_weekly_report(cls, school_id, end_date=None, user=None):
+        """
+        Generate weekly report for a school.
+        
+        Args:
+            school_id: ID of the school
+            end_date: End date for report (defaults to today)
+            user: User requesting the report
+            
+        Returns:
+            dict: Report data
+        """
+        # Create cache key
+        cache_key = f'weekly_report_{school_id}_{end_date}'
+
+        cached_report = cache.get(cache_key)
+        if cached_report:
+            return cached_report
+
+        # Check access
+        school = cls._check_school_access(school_id, user)
+        
+        # Calculate date range
+        if not end_date:
+            end_date = timezone.now().date()
+        start_date = end_date - timedelta(days=6)
+        
+        # Get analytics data
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if not analytics_records.exists():
+            return {
+                'school': {'id': school.id, 'name': school.name},
+                'period': {'start_date': start_date, 'end_date': end_date},
+                'message': 'No analytics data available for this week'
+            }
+        
+        # Calculate summary metrics
+        summary_metrics = cls._calculate_summary_metrics(analytics_records)
+        
+        # Get daily breakdown
+        daily_breakdown = cls._get_daily_breakdown(analytics_records)
+        
+        # Get lesson statistics
+        lesson_stats = cls._get_lesson_statistics(school, start_date, end_date)
+        
+        # Get attendance statistics
+        attendance_stats = cls._get_attendance_statistics(school, start_date, end_date)
+        
+        # Compile report
+        report = {
+            'report_type': 'weekly',
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'owner': school.owner.get_full_name() or school.owner.username,
+                'email': school.email
+            },
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': 7
+            },
+            'summary_metrics': summary_metrics,
+            'daily_breakdown': daily_breakdown,
+            'lessons': lesson_stats,
+            'attendance': attendance_stats,
+            'generated_at': timezone.now().isoformat()
+        }
+
+        # Cache for 1 hour
+        cache.set(cache_key, report, timeout=3600)
+
+
+        return report
+    
+    @classmethod
+    def generate_monthly_report(cls, school_id, year=None, month=None, user=None):
+        """Generate monthly report for a school"""
+        # Check access
+        school = cls._check_school_access(school_id, user)
+        
+        # Calculate date range
+        if not year or not month:
+            today = timezone.now().date()
+            year, month = today.year, today.month
+        
+        start_date = date(year, month, 1)
+        
+        # Calculate end date (last day of month)
+        if month == 12:
+            end_date = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end_date = date(year, month + 1, 1) - timedelta(days=1)
+        
+        # Don't allow future months
+        if start_date > timezone.now().date():
+            raise ValueError('Cannot generate reports for future months')
+        
+        # Get analytics data
+        analytics_records = SchoolAnalytics.objects.filter(
+            school=school,
+            date__range=[start_date, end_date]
+        ).order_by('date')
+        
+        if not analytics_records.exists():
+            return {
+                'school': {'id': school.id, 'name': school.name},
+                'period': {'start_date': start_date, 'end_date': end_date},
+                'message': 'No analytics data available for this month'
+            }
+        
+        # Calculate metrics
+        summary_metrics = cls._calculate_summary_metrics(analytics_records)
+        weekly_breakdown = cls._get_weekly_breakdown(analytics_records, start_date, end_date)
+        lesson_stats = cls._get_lesson_statistics(school, start_date, end_date)
+        
+        report = {
+            'report_type': 'monthly',
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'owner': school.owner.get_full_name() or school.owner.username
+            },
+            'period': {
+                'month': start_date.strftime('%B %Y'),
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': (end_date - start_date).days + 1
+            },
+            'summary_metrics': summary_metrics,
+            'weekly_breakdown': weekly_breakdown,
+            'lessons': lesson_stats,
+            'generated_at': timezone.now().isoformat()
+        }
+        
+        return report
+    
+    @classmethod
+    def generate_instructor_performance_report(cls, school_id, instructor_id=None, 
+                                               start_date=None, end_date=None, user=None):
+        """Generate instructor performance report"""
+        # Check access
+        school = cls._check_school_access(school_id, user)
+        
+        # Default date range (last 30 days)
+        if not start_date or not end_date:
+            end_date = timezone.now().date()
+            start_date = end_date - timedelta(days=30)
+        
+        # Get instructors
+        if instructor_id:
+            try:
+                instructor = User.objects.get(id=instructor_id, role='I')
+                # Verify instructor belongs to school
+                if not instructor.student_profiles.filter(school=school, status='A').exists():
+                    raise ValueError('Instructor not found in this school')
+                instructors = [instructor]
+            except User.DoesNotExist:
+                raise ValueError('Instructor not found')
+        else:
+            instructors = User.objects.filter(
+                role='I',
+                student_profiles__school=school,
+                student_profiles__status='A'
+            ).distinct()
+        
+        # Generate report for each instructor
+        instructor_reports = []
+        
+        for instructor in instructors:
+            # Get lessons
+            lessons = Lesson.objects.filter(
+                instructor=instructor,
+                school=school,
+                date__range=[
+                    timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                    timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))
+                ]
+            )
+            
+            # Get feedback
+            feedback = Feedback.objects.filter(
+                lesson__instructor=instructor,
+                lesson__school=school,
+                created_at__date__range=[start_date, end_date]
+            )
+            
+            # Calculate statistics
+            total_lessons = lessons.count()
+            completed_lessons = lessons.filter(status='C').count()
+            avg_rating = feedback.aggregate(avg=Avg('rating'))['avg'] or 0
+            
+            instructor_reports.append({
+                'instructor': {
+                    'id': instructor.id,
+                    'name': instructor.get_full_name() or instructor.username,
+                    'email': instructor.email
+                },
+                'performance': {
+                    'total_lessons': total_lessons,
+                    'completed_lessons': completed_lessons,
+                    'completion_rate': round((completed_lessons / total_lessons * 100), 2) if total_lessons > 0 else 0,
+                    'average_rating': round(avg_rating, 2),
+                    'total_feedback': feedback.count()
+                }
+            })
+        
+        # Sort by completion rate
+        instructor_reports.sort(key=lambda x: x['performance']['completion_rate'], reverse=True)
+        
+        # Add rankings
+        for idx, report in enumerate(instructor_reports, 1):
+            report['ranking'] = idx
+        
+        report = {
+            'report_type': 'instructor_performance',
+            'school': {'id': school.id, 'name': school.name},
+            'period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'days': (end_date - start_date).days + 1
+            },
+            'instructors': instructor_reports,
+            'generated_at': timezone.now().isoformat()
+        }
+        
+        return report
+    
+    @classmethod
+    def generate_student_progress_report(cls, school_id, student_id=None, 
+                                        course_type=None, user=None):
+        """Generate student progress report"""
+        # Check access
+        school = cls._check_school_access(school_id, user)
+        
+        # Get students
+        if student_id:
+            try:
+                students = [StudentProfile.objects.get(id=student_id, school=school)]
+            except StudentProfile.DoesNotExist:
+                raise ValueError('Student not found in this school')
+        else:
+            students = StudentProfile.objects.filter(
+                school=school,
+                user__role='S',
+                status='A'
+            )
+        
+        # Generate report for each student
+        student_reports = []
+        
+        for student in students:
+            # Calculate progress based on course type
+            if course_type == 'theory':
+                progress = student.progress_theory
+                total_hours = student.total_hours_theory
+            elif course_type == 'driving':
+                progress = student.progress_driving
+                total_hours = student.total_hours_driving
+            else:
+                progress = (student.progress_theory + student.progress_driving) / 2
+                total_hours = student.total_hours_theory + student.total_hours_driving
+            
+            # Get attendance
+            attendance = Attendance.objects.filter(student=student)
+            total_attendance = attendance.count()
+            present = attendance.filter(presence=True).count()
+            
+            student_reports.append({
+                'student': {
+                    'id': student.id,
+                    'name': student.user.get_full_name() or student.user.username,
+                    'email': student.user.email
+                },
+                'progress': {
+                    'overall': round(progress, 2),
+                    'theory': student.progress_theory,
+                    'driving': student.progress_driving,
+                    'total_hours': total_hours
+                },
+                'attendance': {
+                    'total': total_attendance,
+                    'present': present,
+                    'rate': round((present / total_attendance * 100), 2) if total_attendance > 0 else 0
+                }
+            })
+        
+        report = {
+            'report_type': 'student_progress',
+            'school': {'id': school.id, 'name': school.name},
+            'filters': {'student_id': student_id, 'course_type': course_type},
+            'students': student_reports,
+            'generated_at': timezone.now().isoformat()
+        }
+        
+        return report
+    
+    # ==================== HELPER METHODS ====================
+    
+    @staticmethod
+    def _calculate_summary_metrics(analytics_records):
+        """Calculate summary metrics from analytics records"""
+        return {
+            'total_students': analytics_records.last().total_students if analytics_records.exists() else 0,
+            'avg_active_students': round(analytics_records.aggregate(avg=Avg('active_students'))['avg'] or 0, 2),
+            'total_new_students': analytics_records.aggregate(total=Sum('new_students'))['total'] or 0,
+            'avg_completion_rate': round(analytics_records.aggregate(avg=Avg('completion_rate'))['avg'] or 0, 2),
+            'total_revenue': round(float(analytics_records.aggregate(total=Sum('revenue'))['total'] or 0), 2),
+            'avg_rating': round(analytics_records.aggregate(avg=Avg('average_rating'))['avg'] or 0, 2),
+            'total_lessons': analytics_records.aggregate(total=Sum('lessons_completed'))['total'] or 0
+        }
+    
+    @staticmethod
+    def _get_daily_breakdown(analytics_records):
+        """Get daily breakdown from analytics records"""
+        daily_data = []
+        for record in analytics_records:
+            daily_data.append({
+                'date': record.date,
+                'total_students': record.total_students,
+                'active_students': record.active_students,
+                'new_students': record.new_students,
+                'revenue': float(record.revenue),
+                'lessons_completed': record.lessons_completed
+            })
+        return daily_data
+    
+    @staticmethod
+    def _get_weekly_breakdown(analytics_records, start_date, end_date):
+        """Get weekly breakdown from analytics records"""
+        weekly_breakdown = []
+        current_week_start = start_date
+        week_num = 1
+        
+        while current_week_start <= end_date:
+            week_end = min(current_week_start + timedelta(days=6), end_date)
+            
+            week_analytics = analytics_records.filter(date__range=[current_week_start, week_end])
+            
+            if week_analytics.exists():
+                weekly_breakdown.append({
+                    'week': week_num,
+                    'start_date': current_week_start,
+                    'end_date': week_end,
+                    'avg_active_students': round(week_analytics.aggregate(avg=Avg('active_students'))['avg'] or 0, 2),
+                    'new_students': week_analytics.aggregate(total=Sum('new_students'))['total'] or 0,
+                    'revenue': round(float(week_analytics.aggregate(total=Sum('revenue'))['total'] or 0), 2),
+                    'lessons_completed': week_analytics.aggregate(total=Sum('lessons_completed'))['total'] or 0
+                })
+            
+            current_week_start = week_end + timedelta(days=1)
+            week_num += 1
+        
+        return weekly_breakdown
+    
+    @staticmethod
+    def _get_lesson_statistics(school, start_date, end_date):
+        """Get lesson statistics for date range"""
+        lessons = Lesson.objects.filter(
+            school=school,
+            date__range=[
+                timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))
+            ]
+        )
+        
+        total_scheduled = lessons.count()
+        completed = lessons.filter(status='C').count()
+        cancelled = lessons.filter(status='X').count()
+        
+        return {
+            'total_scheduled': total_scheduled,
+            'completed': completed,
+            'cancelled': cancelled,
+            'completion_rate': round((completed / total_scheduled * 100), 2) if total_scheduled > 0 else 0
+        }
+    
+    @staticmethod
+    def _get_attendance_statistics(school, start_date, end_date):
+        """Get attendance statistics for date range"""
+        attendance_records = Attendance.objects.filter(
+            lesson__school=school,
+            lesson__date__range=[
+                timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time())),
+                timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()))
+            ]
+        )
+        
+        total = attendance_records.count()
+        present = attendance_records.filter(presence=True).count()
+        
+        return {
+            'total_records': total,
+            'present': present,
+            'absent': total - present,
+            'attendance_rate': round((present / total * 100), 2) if total > 0 else 0
+        }
     
     @staticmethod
     def send_weekly_report(school, summary):
-        """Send weekly report email to school owner"""
+        """Send weekly report email"""
         from django.core.mail import send_mail
+        from django.conf import settings
+
+        # Check if email is configured
+        if not settings.EMAIL_HOST_USER:
+            raise ValueError('Email configuration is missing')
         
+
         subject = f"📊 Weekly Report for {school.name}"
         
         message = f"""
@@ -503,8 +946,7 @@ class ReportService:
         - Average Rating: {summary['summary_metrics']['avg_rating']:.1f}/5
         - New Students: {summary['summary_metrics']['total_new_students']}
         - Lessons Completed: {summary['summary_metrics']['total_lessons']}
-        - Instructor Utilization: {summary['summary_metrics']['avg_instructor_utilization']:.1f}%
-        
+
         View detailed analytics in your dashboard.
         
         Best regards,
@@ -518,6 +960,7 @@ class ReportService:
             recipient_list=[school.owner.email],
             fail_silently=False
         )
+
 
 
 class AnalyticsService:
@@ -4243,5 +4686,4 @@ class SchoolSubscriptionService:
             'stats': stats,
             'is_near_limits': len(warnings) > 0
         }
-    
     
