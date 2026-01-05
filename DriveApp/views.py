@@ -8814,3 +8814,1034 @@ class ReportViewSet(viewsets.ViewSet):
         output.close()
         
         return csv_content
+
+# DSS-15-create-DashboardViewSet
+class DashboardViewSet(viewsets.ViewSet):
+    """
+    ViewSet for dashboard data across different user roles.
+    
+    Provides role-specific dashboard views:
+    - Platform Admins: System-wide overview
+    - School Owners: Multi-school management dashboard
+    - Instructors: Teaching-focused dashboard
+    - Students: Personal learning dashboard
+    """
+    
+    permission_classes = [IsAuthenticated]
+    
+    @action(detail=False, methods=['get'], url_path='overview', url_name='overview')
+    def overview(self, request):
+        """
+        Get role-specific dashboard overview.
+        Automatically detects user role and returns appropriate dashboard.
+        
+        GET /api/dashboard/overview/
+        """
+        user = request.user
+        
+        if user.role == 'A' and user.is_staff:
+            return self._platform_admin_dashboard(user)
+        elif user.role == 'A' and not user.is_staff:
+            return self._school_owner_dashboard(user)
+        elif user.role == 'I':
+            return self._instructor_dashboard(user)
+        elif user.role == 'S':
+            return self._student_dashboard(user)
+        else:
+            return Response(
+                {'error': 'Invalid user role'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+    
+    @action(detail=False, methods=['get'], url_path='platform-admin', url_name='platform_admin')
+    def platform_admin_dashboard(self, request):
+        """
+        Platform Admin dashboard - system-wide overview.
+        
+        GET /api/dashboard/platform-admin/
+        """
+        user = request.user
+        
+        if user.role != 'A' or not user.is_staff:
+            return Response(
+                {'error': 'Only platform administrators can access this dashboard'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        return self._platform_admin_dashboard(user)
+    
+    @action(detail=False, methods=['get'], url_path='school-owner', url_name='school_owner')
+    def school_owner_dashboard(self, request):
+        """
+        School Owner dashboard - multi-school management.
+        
+        GET /api/dashboard/school-owner/
+        Query params:
+        - school_id: Optional (specific school, otherwise shows all schools)
+        """
+        user = request.user
+        
+        if user.role != 'A' or user.is_staff:
+            return Response(
+                {'error': 'Only school owners can access this dashboard'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        school_id = request.query_params.get('school_id')
+        
+        if school_id:
+            return self._single_school_dashboard(user, school_id)
+        else:
+            return self._school_owner_dashboard(user)
+    
+    @action(detail=False, methods=['get'], url_path='instructor', url_name='instructor')
+    def instructor_dashboard(self, request):
+        """
+        Instructor dashboard - teaching-focused view.
+        
+        GET /api/dashboard/instructor/
+        """
+        user = request.user
+        
+        if user.role != 'I':
+            return Response(
+                {'error': 'Only instructors can access this dashboard'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        return self._instructor_dashboard(user)
+    
+    @action(detail=False, methods=['get'], url_path='student', url_name='student')
+    def student_dashboard(self, request):
+        """
+        Student dashboard - personal learning view.
+        
+        GET /api/dashboard/student/
+        """
+        user = request.user
+        
+        if user.role != 'S':
+            return Response(
+                {'error': 'Only students can access this dashboard'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        return self._student_dashboard(user)
+    
+    @action(detail=False, methods=['get'], url_path='quick-stats', url_name='quick_stats')
+    def quick_stats(self, request):
+        """
+        Get quick statistics for current user.
+        
+        GET /api/dashboard/quick-stats/
+        """
+        user = request.user
+        
+        if user.role == 'A' and user.is_staff:
+            stats = {
+                'total_schools': DrivingSchool.objects.count(),
+                'total_students': StudentProfile.objects.filter(user__role='S').count(),
+                'total_instructors': User.objects.filter(role='I').count(),
+                'active_lessons_today': Lesson.objects.filter(
+                    date__date=timezone.now().date(),
+                    status='S'
+                ).count()
+            }
+        
+        elif user.role == 'A' and not user.is_staff:
+            schools = DrivingSchool.objects.filter(owner=user)
+            stats = {
+                'my_schools': schools.count(),
+                'total_students': StudentProfile.objects.filter(
+                    school__in=schools,
+                    user__role='S'
+                ).count(),
+                'active_students': StudentProfile.objects.filter(
+                    school__in=schools,
+                    user__role='S',
+                    status='A'
+                ).count(),
+                'today_lessons': Lesson.objects.filter(
+                    school__in=schools,
+                    date__date=timezone.now().date()
+                ).count()
+            }
+        
+        elif user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile:
+                return Response({'error': 'No active instructor profile'}, status=400)
+            
+            today_lessons = Lesson.objects.filter(
+                instructor=user,
+                date__date=timezone.now().date()
+            )
+            
+            stats = {
+                'today_lessons': today_lessons.count(),
+                'today_completed': today_lessons.filter(status='C').count(),
+                'this_week_lessons': Lesson.objects.filter(
+                    instructor=user,
+                    date__gte=timezone.now() - timedelta(days=7)
+                ).count(),
+                'average_rating': round(
+                    Feedback.objects.filter(
+                        lesson__instructor=user
+                    ).aggregate(avg=Avg('rating'))['avg'] or 0, 2
+                )
+            }
+        
+        elif user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if not student_profile:
+                return Response({'error': 'No active student profile'}, status=400)
+            
+            stats = {
+                'theory_progress': float(student_profile.progress_theory),
+                'driving_progress': float(student_profile.progress_driving),
+                'total_hours': float(student_profile.total_hours_theory + student_profile.total_hours_driving),
+                'achievements': Achievement.objects.filter(student=student_profile).count()
+            }
+        
+        else:
+            stats = {}
+        
+        return Response({
+            'user_role': user.role,
+            'stats': stats,
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    @action(detail=False, methods=['get'], url_path='notifications', url_name='notifications')
+    def notifications(self, request):
+        """
+        Get notifications/alerts for current user.
+        
+        GET /api/dashboard/notifications/
+        Query params:
+        - limit: Number of notifications (default: 10, max: 50)
+        """
+        user = request.user
+        limit = min(int(request.query_params.get('limit', 10)), 50)
+        
+        notifications = []
+        
+        if user.role == 'A' and user.is_staff:
+            # Platform admin notifications
+            # Pending messages
+            pending_messages = AutomatedMessage.objects.filter(
+                status='pending',
+                scheduled_for__lte=timezone.now()
+            ).count()
+            
+            if pending_messages > 0:
+                notifications.append({
+                    'type': 'warning',
+                    'title': 'Pending Messages',
+                    'message': f'{pending_messages} automated messages are pending delivery',
+                    'priority': 'medium',
+                    'timestamp': timezone.now()
+                })
+            
+            # Failed messages
+            failed_messages = AutomatedMessage.objects.filter(status='failed').count()
+            if failed_messages > 0:
+                notifications.append({
+                    'type': 'error',
+                    'title': 'Failed Messages',
+                    'message': f'{failed_messages} messages failed to send',
+                    'priority': 'high',
+                    'timestamp': timezone.now()
+                })
+        
+        elif user.role == 'A' and not user.is_staff:
+            # School owner notifications
+            schools = DrivingSchool.objects.filter(owner=user)
+            
+            for school in schools:
+                # Low completion rate
+                latest_analytics = SchoolAnalytics.objects.filter(school=school).order_by('-date').first()
+                if latest_analytics and latest_analytics.completion_rate < 50:
+                    notifications.append({
+                        'type': 'warning',
+                        'title': f'Low Completion Rate - {school.name}',
+                        'message': f'Completion rate is {latest_analytics.completion_rate}%',
+                        'priority': 'high',
+                        'school_id': school.id,
+                        'timestamp': latest_analytics.date
+                    })
+                
+                # At-risk students
+                at_risk = StudentProfile.objects.filter(
+                    school=school,
+                    status='A',
+                    progress_theory__lt=20,
+                    progress_driving__lt=20
+                ).count()
+                
+                if at_risk > 0:
+                    notifications.append({
+                        'type': 'info',
+                        'title': f'At-Risk Students - {school.name}',
+                        'message': f'{at_risk} students need additional support',
+                        'priority': 'medium',
+                        'school_id': school.id,
+                        'timestamp': timezone.now()
+                    })
+        
+        elif user.role == 'I':
+            # Instructor notifications
+            # Today's upcoming lessons
+            upcoming_today = Lesson.objects.filter(
+                instructor=user,
+                date__date=timezone.now().date(),
+                date__gt=timezone.now(),
+                status='S'
+            ).order_by('date')
+            
+            for lesson in upcoming_today[:3]:
+                notifications.append({
+                    'type': 'info',
+                    'title': 'Upcoming Lesson',
+                    'message': f'{lesson.title} at {lesson.date.strftime("%H:%M")}',
+                    'priority': 'low',
+                    'lesson_id': lesson.id,
+                    'timestamp': lesson.date
+                })
+            
+            # Pending feedback
+            pending_feedback = Lesson.objects.filter(
+                instructor=user,
+                status='C',
+                lesson_feedback__isnull=True,
+                date__gte=timezone.now() - timedelta(days=7)
+            ).count()
+            
+            if pending_feedback > 0:
+                notifications.append({
+                    'type': 'info',
+                    'title': 'Pending Feedback',
+                    'message': f'{pending_feedback} completed lessons need feedback',
+                    'priority': 'low',
+                    'timestamp': timezone.now()
+                })
+        
+        elif user.role == 'S':
+            # Student notifications
+            student_profile = user.student_profiles.filter(status='A').first()
+            
+            if student_profile:
+                # Upcoming lessons
+                upcoming = Lesson.objects.filter(
+                    school=student_profile.school,
+                    date__gte=timezone.now(),
+                    date__lte=timezone.now() + timedelta(days=7),
+                    status='S'
+                ).order_by('date')
+                
+                for lesson in upcoming[:3]:
+                    notifications.append({
+                        'type': 'info',
+                        'title': 'Upcoming Lesson',
+                        'message': f'{lesson.title} on {lesson.date.strftime("%b %d at %H:%M")}',
+                        'priority': 'low',
+                        'lesson_id': lesson.id,
+                        'timestamp': lesson.date
+                    })
+                
+                # Pending messages
+                pending_msg = AutomatedMessage.objects.filter(
+                    student=student_profile,
+                    status='sent'
+                ).count()
+                
+                if pending_msg > 0:
+                    notifications.append({
+                        'type': 'info',
+                        'title': 'New Messages',
+                        'message': f'You have {pending_msg} unread messages',
+                        'priority': 'low',
+                        'timestamp': timezone.now()
+                    })
+        
+        # Sort by priority and timestamp
+        priority_order = {'high': 0, 'medium': 1, 'low': 2}
+        notifications.sort(key=lambda x: (priority_order.get(x['priority'], 3), x['timestamp']), reverse=True)
+        
+        return Response({
+            'total_notifications': len(notifications),
+            'notifications': notifications[:limit],
+            'user_role': user.role,
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    # ==================== PRIVATE HELPER METHODS ====================
+    
+    def _platform_admin_dashboard(self, user):
+        """Generate platform admin dashboard"""
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        month_ago = today - timedelta(days=30)
+        
+        # System-wide statistics
+        total_schools = DrivingSchool.objects.count()
+        total_students = StudentProfile.objects.filter(user__role='S').count()
+        active_students = StudentProfile.objects.filter(user__role='S', status='A').count()
+        total_instructors = User.objects.filter(role='I').count()
+        
+        # Recent activity (last 7 days)
+        new_schools = DrivingSchool.objects.filter(created_at__date__gte=week_ago).count()
+        new_students = StudentProfile.objects.filter(
+            joined_at__date__gte=week_ago,
+            user__role='S'
+        ).count()
+        
+        # Lesson statistics
+        total_lessons_today = Lesson.objects.filter(date__date=today).count()
+        completed_today = Lesson.objects.filter(date__date=today, status='C').count()
+        
+        this_week_lessons = Lesson.objects.filter(date__date__gte=week_ago)
+        week_completed = this_week_lessons.filter(status='C').count()
+        
+        # Financial overview (from analytics)
+        week_analytics = SchoolAnalytics.objects.filter(date__gte=week_ago)
+        total_revenue_week = week_analytics.aggregate(total=Sum('revenue'))['total'] or 0
+        
+        # Top performing schools
+        top_schools = SchoolAnalytics.objects.filter(
+            date__gte=week_ago
+        ).values('school__id', 'school__name').annotate(
+            avg_completion=Avg('completion_rate'),
+            avg_rating=Avg('average_rating'),
+            total_students=Max('total_students')
+        ).order_by('-avg_completion')[:5]
+        
+        # System health
+        pending_messages = AutomatedMessage.objects.filter(
+            status='pending',
+            scheduled_for__lte=timezone.now()
+        ).count()
+        
+        failed_messages = AutomatedMessage.objects.filter(status='failed').count()
+        
+        # Recent feedback
+        recent_feedback = Feedback.objects.order_by('-created_at')[:10]
+        avg_platform_rating = Feedback.objects.aggregate(avg=Avg('rating'))['avg'] or 0
+        
+        return Response({
+            'dashboard_type': 'platform_admin',
+            'user': {
+                'id': user.id,
+                'name': user.get_full_name() or user.username,
+                'role': 'Platform Administrator'
+            },
+            'system_overview': {
+                'total_schools': total_schools,
+                'total_students': total_students,
+                'active_students': active_students,
+                'total_instructors': total_instructors,
+                'new_schools_this_week': new_schools,
+                'new_students_this_week': new_students
+            },
+            'today_snapshot': {
+                'total_lessons': total_lessons_today,
+                'completed_lessons': completed_today,
+                'completion_rate': round((completed_today / total_lessons_today * 100), 2) if total_lessons_today > 0 else 0
+            },
+            'this_week': {
+                'total_lessons': this_week_lessons.count(),
+                'completed_lessons': week_completed,
+                'completion_rate': round((week_completed / this_week_lessons.count() * 100), 2) if this_week_lessons.count() > 0 else 0,
+                'total_revenue': round(float(total_revenue_week), 2)
+            },
+            'top_performing_schools': list(top_schools),
+            'platform_metrics': {
+                'average_rating': round(avg_platform_rating, 2),
+                'pending_messages': pending_messages,
+                'failed_messages': failed_messages
+            },
+            'recent_feedback': [{
+                'id': f.id,
+                'student': f.student.user.username,
+                'lesson': f.lesson.title,
+                'rating': f.rating,
+                'created_at': f.created_at
+            } for f in recent_feedback],
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    def _school_owner_dashboard(self, user):
+        """Generate school owner dashboard (all schools)"""
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        
+        # Get all schools owned by user
+        schools = DrivingSchool.objects.filter(owner=user)
+        
+        if not schools.exists():
+            return Response({
+                'dashboard_type': 'school_owner',
+                'message': 'You do not own any schools yet',
+                'schools': []
+            })
+        
+        # Aggregate statistics across all schools
+        total_students = StudentProfile.objects.filter(
+            school__in=schools,
+            user__role='S'
+        ).count()
+        
+        active_students = StudentProfile.objects.filter(
+            school__in=schools,
+            user__role='S',
+            status='A'
+        ).count()
+        
+        total_instructors = StudentProfile.objects.filter(
+            school__in=schools,
+            user__role='I',
+            status='A'
+        ).count()
+        
+        # Week statistics
+        week_lessons = Lesson.objects.filter(
+            school__in=schools,
+            date__date__gte=week_ago
+        )
+        
+        week_completed = week_lessons.filter(status='C').count()
+        
+        # Revenue
+        week_analytics = SchoolAnalytics.objects.filter(
+            school__in=schools,
+            date__gte=week_ago
+        )
+        
+        total_revenue_week = week_analytics.aggregate(total=Sum('revenue'))['total'] or 0
+        avg_completion_rate = week_analytics.aggregate(avg=Avg('completion_rate'))['avg'] or 0
+        
+        # Per-school breakdown
+        school_summaries = []
+        
+        for school in schools:
+            latest_analytics = SchoolAnalytics.objects.filter(school=school).order_by('-date').first()
+            
+            school_students = StudentProfile.objects.filter(school=school, user__role='S')
+            
+            school_summaries.append({
+                'school_id': school.id,
+                'school_name': school.name,
+                'total_students': school_students.count(),
+                'active_students': school_students.filter(status='A').count(),
+                'completion_rate': float(latest_analytics.completion_rate) if latest_analytics else 0,
+                'average_rating': float(latest_analytics.average_rating) if latest_analytics else 0,
+                'last_updated': latest_analytics.date if latest_analytics else None
+            })
+        
+        # Sort by completion rate
+        school_summaries.sort(key=lambda x: x['completion_rate'], reverse=True)
+        
+        # Today's lessons across all schools
+        today_lessons = Lesson.objects.filter(
+            school__in=schools,
+            date__date=today
+        )
+        
+        return Response({
+            'dashboard_type': 'school_owner',
+            'user': {
+                'id': user.id,
+                'name': user.get_full_name() or user.username,
+                'role': 'School Owner'
+            },
+            'overview': {
+                'total_schools': schools.count(),
+                'total_students': total_students,
+                'active_students': active_students,
+                'total_instructors': total_instructors
+            },
+            'this_week_performance': {
+                'total_lessons': week_lessons.count(),
+                'completed_lessons': week_completed,
+                'completion_rate': round((week_completed / week_lessons.count() * 100), 2) if week_lessons.count() > 0 else 0,
+                'total_revenue': round(float(total_revenue_week), 2),
+                'avg_completion_rate': round(avg_completion_rate, 2)
+            },
+            'today': {
+                'scheduled_lessons': today_lessons.count(),
+                'completed_lessons': today_lessons.filter(status='C').count()
+            },
+            'schools': school_summaries,
+            'best_performing_school': school_summaries[0] if school_summaries else None,
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    def _single_school_dashboard(self, user, school_id):
+        """Generate dashboard for a single school"""
+        try:
+            school = DrivingSchool.objects.get(id=school_id, owner=user)
+        except DrivingSchool.DoesNotExist:
+            return Response(
+                {'error': 'School not found or you do not own this school'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        month_ago = today - timedelta(days=30)
+        
+        # Get latest analytics
+        latest_analytics = SchoolAnalytics.objects.filter(school=school).order_by('-date').first()
+        
+        # Student metrics
+        students = StudentProfile.objects.filter(school=school, user__role='S')
+        active_students = students.filter(status='A')
+        
+        # Instructor metrics
+        instructors = StudentProfile.objects.filter(school=school, user__role='I', status='A')
+        
+        # Lesson metrics
+        week_lessons = Lesson.objects.filter(school=school, date__date__gte=week_ago)
+        month_lessons = Lesson.objects.filter(school=school, date__date__gte=month_ago)
+        
+        # Financial metrics
+        month_analytics = SchoolAnalytics.objects.filter(school=school, date__gte=month_ago)
+        month_revenue = month_analytics.aggregate(total=Sum('revenue'))['total'] or 0
+        
+        # Average rating
+        avg_rating = Feedback.objects.filter(lesson__school=school).aggregate(avg=Avg('rating'))['avg'] or 0
+        
+        # Top students
+        top_students = students.filter(status='A').annotate(
+            avg_progress=((F('progress_theory') + F('progress_driving')) / 2)
+        ).order_by('-avg_progress')[:5]
+        
+        # Instructor performance
+        instructor_stats = []
+        for instructor_profile in instructors:
+            instructor = instructor_profile.user
+            instructor_lessons = week_lessons.filter(instructor=instructor)
+            instructor_rating = Feedback.objects.filter(
+                lesson__instructor=instructor
+            ).aggregate(avg=Avg('rating'))['avg'] or 0
+            
+            instructor_stats.append({
+                'id': instructor.id,
+                'name': instructor.get_full_name() or instructor.username,
+                'lessons_this_week': instructor_lessons.count(),
+                'average_rating': round(instructor_rating, 2)
+            })
+        
+        return Response({
+            'dashboard_type': 'single_school',
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'email': school.email,
+                'address': school.address
+            },
+            'current_metrics': {
+                'total_students': students.count(),
+                'active_students': active_students.count(),
+                'completed_students': students.filter(status='C').count(),
+                'total_instructors': instructors.count(),
+                'completion_rate': float(latest_analytics.completion_rate) if latest_analytics else 0,
+                'average_rating': round(avg_rating, 2)
+            },
+            'this_week': {
+                'total_lessons': week_lessons.count(),
+                'completed_lessons': week_lessons.filter(status='C').count(),
+                'new_students': students.filter(joined_at__date__gte=week_ago).count()
+            },
+            'this_month': {
+                'total_lessons': month_lessons.count(),
+                'completed_lessons': month_lessons.filter(status='C').count(),
+                'revenue': round(float(month_revenue), 2),
+                'new_students': students.filter(joined_at__date__gte=month_ago).count()
+            },
+            'top_students': [{
+                'id': s.id,
+                'name': s.user.get_full_name() or s.user.username,
+                'progress': round((s.progress_theory + s.progress_driving) / 2, 2)
+            } for s in top_students],
+            'instructor_performance': instructor_stats,
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    def _instructor_dashboard(self, user):
+        """Generate instructor dashboard"""
+        # Get instructor's school
+        instructor_profile = user.student_profiles.filter(status='A').first()
+        
+        if not instructor_profile:
+            return Response({
+                'error': 'You are not associated with any active school'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        school = instructor_profile.school
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        
+        # Today's lessons
+        today_lessons = Lesson.objects.filter(
+            instructor=user,
+            date__date=today
+        ).order_by('date')
+        
+        # Week statistics
+        week_lessons = Lesson.objects.filter(
+            instructor=user,
+            date__date__gte=week_ago
+        )
+        
+        week_completed = week_lessons.filter(status='C').count()
+        
+        # Upcoming lessons (next 7 days)
+        upcoming_lessons = Lesson.objects.filter(
+            instructor=user,
+            date__gte=timezone.now(),
+            date__lte=timezone.now() + timedelta(days=7),
+            status='S'
+        ).order_by('date')[:10]
+        
+        # Students taught
+        students_taught = Attendance.objects.filter(
+            lesson__instructor=user,
+            presence=True
+        ).values('student').distinct().count()
+        
+        # Performance metrics
+        avg_rating = Feedback.objects.filter(
+            lesson__instructor=user
+        ).aggregate(avg=Avg('rating'))['avg'] or 0
+        
+        total_feedback = Feedback.objects.filter(lesson__instructor=user).count()
+        
+        # Recent feedback
+        recent_feedback = Feedback.objects.filter(
+            lesson__instructor=user
+        ).order_by('-created_at')[:5]
+        
+        # Attendance rate
+        my_attendance = Attendance.objects.filter(lesson__instructor=user)
+        total_attendance = my_attendance.count()
+        present = my_attendance.filter(presence=True).count()
+        attendance_rate = round((present / total_attendance * 100), 2) if total_attendance > 0 else 0
+        
+        return Response({
+            'dashboard_type': 'instructor',
+            'user': {
+                'id': user.id,
+                'name': user.get_full_name() or user.username,
+                'role': 'Instructor'
+            },
+            'school': {
+                'id': school.id,
+                'name': school.name
+            },
+            'today': {
+                'total_lessons': today_lessons.count(),
+                'completed': today_lessons.filter(status='C').count(),
+                'upcoming': today_lessons.filter(
+                    date__gt=timezone.now(),
+                    status='S'
+                ).count(),
+                'lessons': [{
+                    'id': lesson.id,
+                    'title': lesson.title,
+                    'time': lesson.date.strftime('%H:%M'),
+                    'status': lesson.get_status_display()
+                } for lesson in today_lessons]
+            },
+            'this_week_performance': {
+                'total_lessons': week_lessons.count(),
+                'completed_lessons': week_completed,
+                'completion_rate': round((week_completed / week_lessons.count() * 100), 2) if week_lessons.count() > 0 else 0,
+                'students_taught': students_taught
+            },
+            'upcoming_lessons': [{
+                'id': lesson.id,
+                'title': lesson.title,
+                'date': lesson.date.strftime('%Y-%m-%d'),
+                'time': lesson.date.strftime('%H:%M'),
+                'duration': lesson.duration
+            } for lesson in upcoming_lessons],
+            'performance_metrics': {
+                'average_rating': round(avg_rating, 2),
+                'total_feedback': total_feedback,
+                'attendance_rate': attendance_rate,
+                'total_students_taught': students_taught
+            },
+            'recent_feedback': [{
+                'id': f.id,
+                'student': f.student.user.username,
+                'lesson': f.lesson.title,
+                'rating': f.rating,
+                'comment': f.comment[:100] if f.comment else None,
+                'created_at': f.created_at
+            } for f in recent_feedback],
+            'timestamp': timezone.now().isoformat()
+        })
+    
+    def _student_dashboard(self, user):
+        """Generate student dashboard"""
+        # Get student's profile
+        student_profile = user.student_profiles.filter(status='A').first()
+        
+        if not student_profile:
+            return Response({
+                'error': 'You do not have an active student profile'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        school = student_profile.school
+        
+        # Progress metrics
+        avg_progress = (student_profile.progress_theory + student_profile.progress_driving) / 2
+        total_hours = student_profile.total_hours_theory + student_profile.total_hours_driving
+        
+        # Upcoming lessons
+        upcoming_lessons = Lesson.objects.filter(
+            school=school,
+            date__gte=timezone.now(),
+            date__lte=timezone.now() + timedelta(days=7),
+            status='S'
+        ).order_by('date')[:5]
+        
+        # Recent attendance
+        recent_attendance = Attendance.objects.filter(
+            student=student_profile
+        ).select_related('lesson').order_by('-created_at')[:10]
+        
+        # Calculate attendance statistics
+        all_attendance = Attendance.objects.filter(student=student_profile)
+        attendance_count = all_attendance.count()
+        present_count = all_attendance.filter(presence=True).count()
+        attendance_rate = round((present_count / attendance_count * 100), 2) if attendance_count > 0 else 0
+        
+        # Achievements
+        achievements = Achievement.objects.filter(student=student_profile).order_by('-earned_at')[:5]
+        total_achievements = Achievement.objects.filter(student=student_profile).count()
+        
+        # Recent feedback given
+        recent_feedback = Feedback.objects.filter(
+            student=student_profile
+        ).select_related('lesson', 'lesson__instructor').order_by('-created_at')[:5]
+        
+        # Messages/notifications
+        messages = AutomatedMessage.objects.filter(
+            student=student_profile,
+            status__in=['sent', 'delivered']
+        ).order_by('-scheduled_for')[:5]
+        
+        # Course milestones
+        milestones = []
+        
+        # Theory milestones
+        if student_profile.progress_theory >= 100:
+            milestones.append({
+                'type': 'theory',
+                'title': 'Theory Course Completed',
+                'icon': '🎓',
+                'completed': True,
+                'date': student_profile.completion_date if student_profile.completion_date else student_profile.joined_at
+            })
+        elif student_profile.progress_theory >= 75:
+            milestones.append({
+                'type': 'theory',
+                'title': 'Theory 75% Complete',
+                'icon': '📚',
+                'completed': False,
+                'progress': float(student_profile.progress_theory)
+            })
+        
+        # Driving milestones
+        if student_profile.progress_driving >= 100:
+            milestones.append({
+                'type': 'driving',
+                'title': 'Driving Course Completed',
+                'icon': '🚗',
+                'completed': True,
+                'date': student_profile.completion_date if student_profile.completion_date else student_profile.joined_at
+            })
+        elif student_profile.progress_driving >= 50:
+            milestones.append({
+                'type': 'driving',
+                'title': 'Driving 50% Complete',
+                'icon': '🎯',
+                'completed': False,
+                'progress': float(student_profile.progress_driving)
+            })
+        
+        # Attendance milestone
+        if attendance_count >= 10 and attendance_rate >= 90:
+            milestones.append({
+                'type': 'attendance',
+                'title': 'Excellent Attendance',
+                'icon': '⭐',
+                'completed': True,
+                'description': f'{attendance_rate}% attendance rate'
+            })
+        
+        # Class rank estimation (simple implementation)
+        similar_students = StudentProfile.objects.filter(
+            school=school,
+            status='A',
+            license_type=student_profile.license_type
+        ).annotate(
+            avg_progress=((F('progress_theory') + F('progress_driving')) / 2)
+        ).order_by('-avg_progress')
+        
+        student_rank = None
+        for idx, student in enumerate(similar_students, 1):
+            if student.id == student_profile.id:
+                student_rank = idx
+                total_similar = similar_students.count()
+                break
+        
+        # Next recommended actions
+        recommendations = []
+        
+        if student_profile.progress_theory < 100 and student_profile.progress_driving < 100:
+            if student_profile.progress_theory < 50:
+                recommendations.append({
+                    'type': 'study',
+                    'title': 'Focus on Theory',
+                    'message': 'Complete more theory lessons to reach 50% progress',
+                    'priority': 'high'
+                })
+            elif student_profile.progress_driving < 30:
+                recommendations.append({
+                    'type': 'practice',
+                    'title': 'Schedule Driving Practice',
+                    'message': 'Book driving lessons to improve your practical skills',
+                    'priority': 'medium'
+                })
+        
+        if attendance_rate < 80 and attendance_count > 5:
+            recommendations.append({
+                'type': 'attendance',
+                'title': 'Improve Attendance',
+                'message': f'Your attendance rate is {attendance_rate}%. Try to attend more lessons.',
+                'priority': 'medium'
+            })
+        
+        if total_achievements < 3:
+            recommendations.append({
+                'type': 'achievement',
+                'title': 'Earn Achievements',
+                'message': 'Complete more lessons to unlock achievements',
+                'priority': 'low'
+            })
+        
+        return Response({
+            'dashboard_type': 'student',
+            'user': {
+                'id': user.id,
+                'name': user.get_full_name() or user.username,
+                'role': 'Student'
+            },
+            'school': {
+                'id': school.id,
+                'name': school.name,
+                'address': school.address
+            },
+            'progress_summary': {
+                'theory': {
+                    'progress': float(student_profile.progress_theory),
+                    'hours': float(student_profile.total_hours_theory),
+                    'status': 'Completed' if student_profile.progress_theory >= 100 else 'In Progress'
+                },
+                'driving': {
+                    'progress': float(student_profile.progress_driving),
+                    'hours': float(student_profile.total_hours_driving),
+                    'status': 'Completed' if student_profile.progress_driving >= 100 else 'In Progress'
+                },
+                'overall': {
+                    'progress': round(avg_progress, 2),
+                    'total_hours': round(total_hours, 2),
+                    'status': student_profile.get_status_display()
+                },
+                'completion_date': student_profile.completion_date,
+                'days_enrolled': (timezone.now().date() - student_profile.joined_at.date()).days if student_profile.joined_at else 0
+            },
+            'attendance': {
+                'total_lessons': attendance_count,
+                'present': present_count,
+                'absent': attendance_count - present_count,
+                'attendance_rate': attendance_rate,
+                'recent_attendance': [{
+                    'id': a.id,
+                    'lesson_title': a.lesson.title if a.lesson else 'N/A',
+                    'date': a.created_at.date(),
+                    'presence': a.presence,
+                    'hours_completed': float(a.hours_completed) if a.hours_completed else 0
+                } for a in recent_attendance]
+            },
+            'achievements': {
+                'total': total_achievements,
+                'recent': [{
+                    'id': a.id,
+                    'title': a.title,
+                    'description': a.description,
+                    'icon': a.icon,
+                    'earned_at': a.earned_at
+                } for a in achievements]
+            },
+            'upcoming_lessons': [{
+                'id': lesson.id,
+                'title': lesson.title,
+                'date': lesson.date.strftime('%Y-%m-%d'),
+                'time': lesson.date.strftime('%H:%M'),
+                'duration': lesson.duration,
+                'type': lesson.get_lesson_type_display(),
+                'instructor': lesson.instructor.get_full_name() or lesson.instructor.username if lesson.instructor else 'TBD'
+            } for lesson in upcoming_lessons],
+            'recent_feedback': [{
+                'id': f.id,
+                'lesson_title': f.lesson.title,
+                'instructor': f.lesson.instructor.get_full_name() or f.lesson.instructor.username if f.lesson.instructor else 'Unknown',
+                'rating': f.rating,
+                'comment': f.comment[:50] + '...' if f.comment and len(f.comment) > 50 else f.comment,
+                'created_at': f.created_at
+            } for f in recent_feedback],
+            'messages': [{
+                'id': m.id,
+                'template_name': m.template.name if m.template else 'Notification',
+                'scheduled_for': m.scheduled_for,
+                'status': m.status,
+                'read': m.status == 'read'
+            } for m in messages],
+            'milestones': milestones,
+            'class_position': {
+                'rank': student_rank,
+                'total_in_group': similar_students.count() if student_rank else 0,
+                'percentile': round((student_rank / similar_students.count() * 100), 2) if student_rank and similar_students.count() > 0 else 0
+            } if student_rank else None,
+            'recommendations': recommendations,
+            'quick_actions': [
+                {
+                    'id': 'book_lesson',
+                    'title': 'Book a Lesson',
+                    'description': 'Schedule your next driving lesson',
+                    'icon': '📅',
+                    'url': '/lessons/book/'
+                },
+                {
+                    'id': 'view_progress',
+                    'title': 'View Detailed Progress',
+                    'description': 'See your complete learning journey',
+                    'icon': '📊',
+                    'url': f'/students/{student_profile.id}/progress/'
+                },
+                {
+                    'id': 'give_feedback',
+                    'title': 'Give Feedback',
+                    'description': 'Share your experience about recent lessons',
+                    'icon': '💬',
+                    'url': '/feedback/create/'
+                }
+            ],
+            'timestamp': timezone.now().isoformat()
+        })
