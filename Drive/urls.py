@@ -20,7 +20,8 @@ from rest_framework.routers import DefaultRouter
 from DriveApp.views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
                             LessonViewSet,AttendanceViewSet, FeedbackViewSet, VehicleViewSet,
                             ScheduleViewSet,AchievemtViewSet,CommunicationTemplateViewSet,
-                            AutomatedMessageViewSet,SchoolAnalyticsViewSet,ReportViewSet)
+                            AutomatedMessageViewSet,SchoolAnalyticsViewSet,ReportViewSet,
+                            DashboardViewSet)
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -36,6 +37,7 @@ router.register(r'communicationtemplate',CommunicationTemplateViewSet, basename=
 router.register(r'automatedmessage',AutomatedMessageViewSet, basename='automatedmessage')
 router.register(r'schoolanalytics',SchoolAnalyticsViewSet, basename='schoolanalytics')
 router.register(r'report', ReportViewSet, basename='report')
+router.register(r'dashboard',DashboardViewSet, basename='dashboard')
 urlpatterns = [
     path('admin/', admin.site.urls),
 ]+ router.urls
