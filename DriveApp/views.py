@@ -2260,7 +2260,6 @@ class VehicleViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 #DSS-8-create-schedule-views
-
 class ScheduleViewSet(viewsets.ModelViewSet):
     serializer_class = ScheduleSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
@@ -4113,7 +4112,6 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             'total_badges': len(badges),
             'badges': badges
         })
-
 
 # DSS-12-create-CommunicationViewSet
 class CommunicationTemplateViewSet(viewsets.ModelViewSet):
@@ -7470,9 +7468,6 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 })
         
         return recommendations
-
-
-
 
 class CSVRenderer:
     """Custom renderer for CSV responses"""
