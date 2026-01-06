@@ -10161,4 +10161,333 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
             'statistics': stats
         })
 
+class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
+    """
+    Manage school subscriptions.
+    - Platform Admins: Full CRUD on all subscriptions
+    - School Owners: View and manage their own subscription
+    - Others: No access
+    """
+    serializer_class = SchoolSubscriptionSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    search_fields = ['school__name', 'plan__name']
+    ordering_fields = ['current_period_end', 'created_at', 'status']
+    ordering = ['-created_at']
+    filterset_fields = ['status', 'plan']
+    
+    def get_queryset(self):
+        """
+        Filter subscriptions based on user role.
+        """
+        user = self.request.user
+        
+        if not user.is_authenticated:
+            return SchoolSubscription.objects.none()
+        
+        # Platform Admins can see all subscriptions
+        if user.role == 'A' and user.is_staff:
+            return SchoolSubscription.objects.all().select_related('school', 'plan')
+        
+        # School Owners can see only their own subscription
+        if user.role == 'A':  # School owner (admin but not staff)
+            return SchoolSubscription.objects.filter(school__owner=user).select_related('school', 'plan')
+        
+        if user.role == 'I':
+            return SchoolSubscription.objects.none()
 
+        if user.role == 'S':
+            return SchoolSubscription.objects.none()
+        # Instructors and Students cannot see subscriptions
+        return SchoolSubscription.objects.none()
+    
+    def get_permissions(self):
+        """
+        Define permissions per action.
+        """
+        if self.action in ['create', 'destroy']:
+            # Only platform admins can create or delete subscriptions
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        
+        elif self.action in ['update', 'partial_update', 'cancel', 'renew', 'upgrade']:
+            # Platform admins and school owners can update
+            return [IsAuthenticated()]
+        
+        elif self.action == 'list':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+
+        elif self.action in ['retrieve', 'check_limits', 'usage_stats']:
+            # Platform admins and school owners can view
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """
+        Create new subscription with validation.
+        """
+        # Check if school already has subscription
+        school = serializer.validated_data.get('school')
+        if hasattr(school, 'subscriptions'):
+            raise PermissionDenied({
+                'school': 'This school already has an active subscription'
+            })
+        
+        serializer.save()
+    
+    def perform_update(self, serializer):
+        """
+        Update subscription with permission checks.
+        """
+        user = self.request.user
+        instance = self.get_object()
+        
+        # School owners can only update their own subscription
+        if user.role == 'A' and not user.is_staff:  # School owner
+            if instance.school.owner != user:
+                raise PermissionDenied("You can only update your own school's subscription")
+        
+        serializer.save()
+    
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """
+        Cancel a subscription.
+        """
+        subscription = self.get_object()
+        user = request.user
+        
+        # Permission check
+        if user.role == 'A' and not user.is_staff:  # School owner
+            if subscription.school.owner != user:
+                raise PermissionDenied("You can only cancel your own school's subscription")
+        
+        # Validate cancellation
+        if subscription.status == 'canceled':
+            return Response(
+                {'error': 'Subscription is already canceled'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        subscription.status = 'canceled'
+        subscription.save()
+        
+        return Response({
+            'message': 'Subscription canceled successfully',
+            'subscription_id': subscription.id,
+            'status': subscription.status,
+            'period_end': subscription.current_period_end
+        })
+    
+    @action(detail=True, methods=['post'])
+    def renew(self, request, pk=None):
+        """
+        Renew a subscription (extend period).
+        """
+        subscription = self.get_object()
+        user = request.user
+        
+        # Permission check
+        if user.role == 'A' and not user.is_staff:  # School owner
+            if subscription.school.owner != user:
+                raise PermissionDenied("You can only renew your own school's subscription")
+        
+        # Check if subscription is active
+        if subscription.status not in ['active', 'trialing']:
+            return Response(
+                {'error': 'Only active or trial subscriptions can be renewed'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Extend subscription period
+        new_period_end = subscription.current_period_end + timedelta(days=subscription.plan.duration_days)
+        subscription.current_period_end = new_period_end
+        
+        # If past due, mark as active
+        if subscription.status == 'past_due':
+            subscription.status = 'active'
+        
+        subscription.save()
+        
+        return Response({
+            'message': 'Subscription renewed successfully',
+            'subscription_id': subscription.id,
+            'new_period_end': subscription.current_period_end,
+            'days_added': subscription.plan.duration_days
+        })
+    
+    @action(detail=True, methods=['post'])
+    def upgrade(self, request, pk=None):
+        """
+        Upgrade subscription to a higher plan.
+        """
+        subscription = self.get_object()
+        user = request.user
+        
+        # Permission check
+        if user.role == 'A' and not user.is_staff:  # School owner
+            if subscription.school.owner != user:
+                raise PermissionDenied("You can only upgrade your own school's subscription")
+        
+        new_plan_id = request.data.get('new_plan_id')
+        if not new_plan_id:
+            return Response(
+                {'error': 'new_plan_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            new_plan = SubscriptionPlan.objects.get(id=new_plan_id, is_active=True)
+        except SubscriptionPlan.DoesNotExist:
+            return Response(
+                {'error': 'Invalid plan ID'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if upgrade is valid
+        if new_plan.price < subscription.plan.price:
+            return Response(
+                {'error': 'Cannot downgrade using upgrade endpoint. Use change_plan instead.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if school can afford new plan (student/instructor limits)
+        current_students = subscription.school.student_profiles.count()
+        current_instructors = subscription.school.student_profiles.filter(user__role='I').count()
+        
+        if current_students > new_plan.max_students:
+            return Response({
+                'error': f'New plan supports only {new_plan.max_students} students. '
+                         f'Current: {current_students} students.',
+                'requires_downgrade': True
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if current_instructors > new_plan.max_instructors:
+            return Response({
+                'error': f'New plan supports only {new_plan.max_instructors} instructors. '
+                         f'Current: {current_instructors} instructors.',
+                'requires_downgrade': True
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Perform upgrade
+        old_plan = subscription.plan
+        subscription.plan = new_plan
+        subscription.save()
+        
+        return Response({
+            'message': 'Subscription upgraded successfully',
+            'from_plan': old_plan.name,
+            'to_plan': new_plan.name,
+            'price_change': f'${old_plan.price} → ${new_plan.price}',
+            'student_limit_change': f'{old_plan.max_students} → {new_plan.max_students}',
+            'instructor_limit_change': f'{old_plan.max_instructors} → {new_plan.max_instructors}'
+        })
+    
+    @action(detail=True, methods=['get'])
+    def check_limits(self, request, pk=None):
+        """
+        Check if school is approaching subscription limits.
+        """
+        subscription = self.get_object()
+        user = request.user
+        
+        # Permission check
+        if user.role == 'A' and not user.is_staff:  # School owner
+            if subscription.school.owner != user:
+                raise PermissionDenied("You can only check limits for your own school")
+        
+        limits_info = SchoolSubscriptionService.check_usage_limits(subscription)
+        
+        return Response(limits_info)
+    
+    @action(detail=True, methods=['get'])
+    def usage_stats(self, request, pk=None):
+        """
+        Get detailed usage statistics for a subscription.
+        """
+        subscription = self.get_object()
+        user = request.user
+        
+        # Permission check
+        if user.role == 'A' and not user.is_staff:  # School owner
+            if subscription.school.owner != user:
+                raise PermissionDenied("You can only view usage stats for your own school")
+        
+        stats = SchoolSubscriptionService.get_usage_stats(subscription)
+        
+        # Add additional metrics
+        student_profiles = subscription.school.student_profiles.select_related('user')
+        active_students = student_profiles.filter(status='A', user__role='S').count()
+        completed_students = student_profiles.filter(status='C', user__role='S').count()
+        
+        stats['additional_metrics'] = {
+            'active_students': active_students,
+            'completed_students': completed_students,
+            'student_completion_rate': round((completed_students / active_students * 100), 2) if active_students > 0 else 0,
+            'available_student_slots': subscription.plan.max_students - active_students,
+            'available_instructor_slots': subscription.plan.max_instructors - stats['instructors']['current']
+        }
+        
+        return Response(stats)
+    
+    @action(detail=False, methods=['get'])
+    def expired_subscriptions(self, request):
+        """
+        Get all expired subscriptions (admin only).
+        """
+        if not (request.user.role == 'A' and request.user.is_staff):
+            raise PermissionDenied("Only platform admins can view expired subscriptions")
+        
+        expired_subs = SchoolSubscription.objects.filter(
+            current_period_end__lt=timezone.now(),
+            status__in=['active', 'trialing']
+        ).select_related('school', 'plan')
+        
+        serializer = self.get_serializer(expired_subs, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def trial_expiring_soon(self, request):
+        """
+        Get trial subscriptions expiring in next 7 days (admin only).
+        """
+        if not (request.user.role == 'A' and request.user.is_staff):
+            raise PermissionDenied("Only platform admins can view trial expirations")
+        
+        soon = timezone.now() + timedelta(days=7)
+        expiring_trials = SchoolSubscription.objects.filter(
+            status='trialing',
+            current_period_end__lte=soon,
+            current_period_end__gt=timezone.now()
+        ).select_related('school', 'plan')
+        
+        serializer = self.get_serializer(expiring_trials, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def extend_trial(self, request, pk=None):
+        """
+        Extend trial period (admin only).
+        """
+        if not (request.user.role == 'A' and request.user.is_staff):
+            raise PermissionDenied("Only platform admins can extend trials")
+        
+        subscription = self.get_object()
+        
+        if subscription.status != 'trialing':
+            return Response(
+                {'error': 'Only trial subscriptions can be extended'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        extension_days = int(request.data.get('extension_days', 7))
+        subscription.current_period_end += timedelta(days=extension_days)
+        subscription.save()
+        
+        return Response({
+            'message': f'Trial extended by {extension_days} days',
+            'new_expiry': subscription.current_period_end,
+            'days_remaining': SchoolSubscriptionService.get_days_remaining(subscription)
+        })
+
+
+        
