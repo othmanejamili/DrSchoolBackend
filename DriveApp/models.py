@@ -422,7 +422,7 @@ class SchoolSubscription(models.Model):
         ('past_due', 'Past Due'), ('trialing', 'Trialing')
     ]
     
-    school = models.OneToOneField(DrivingSchool, on_delete=models.CASCADE, related_name='subscription')
+    school = models.OneToOneField(DrivingSchool, on_delete=models.CASCADE, related_name='subscriptions')
     plan = models.ForeignKey(SubscriptionPlan, on_delete=models.CASCADE, related_name='subscriptions')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='trialing')
     stripe_subscription_id = models.CharField(max_length=255, blank=True, null=True)

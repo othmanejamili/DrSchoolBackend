@@ -21,7 +21,7 @@ from DriveApp.views import (UserViewSet, DrivingSchoolViewSet, StudentProfileVie
                             LessonViewSet,AttendanceViewSet, FeedbackViewSet, VehicleViewSet,
                             ScheduleViewSet,AchievemtViewSet,CommunicationTemplateViewSet,
                             AutomatedMessageViewSet,SchoolAnalyticsViewSet,ReportViewSet,
-                            DashboardViewSet)
+                            DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet)
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -38,6 +38,8 @@ router.register(r'automatedmessage',AutomatedMessageViewSet, basename='automated
 router.register(r'schoolanalytics',SchoolAnalyticsViewSet, basename='schoolanalytics')
 router.register(r'report', ReportViewSet, basename='report')
 router.register(r'dashboard',DashboardViewSet, basename='dashboard')
+router.register(r'subscriptionplan',SubscriptionPlanViewSet, basename='subscriptionplan')
+router.register(r'schoolsubscription',SchoolSubscriptionViewSet, basename='schoolsubscription')
 urlpatterns = [
     path('admin/', admin.site.urls),
 ]+ router.urls
