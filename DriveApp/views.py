@@ -8,18 +8,20 @@ from django.utils import timezone
 from .models import (User, DrivingSchool, StudentProfile, Lesson, 
                      Attendance, Schedule, Feedback, Vehicle, VehiclePicture,
                      Achievement, CommunicationTemplate, AutomatedMessage,
-                     SchoolAnalytics)
+                     SchoolAnalytics,SubscriptionPlan,SchoolSubscription)
 from .serializers import (UserSerializer, DrivingSchoolSerializer, ScheduleSerializer, VehicleSerializer,
                           VehiclePictureSerializer,StudentProfileSerializer, LessonSerializer,AttendanceSerializer,
                           FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer, 
-                          AutomatedMessageSerializer, SchoolAnalyticsSerializer)
+                          AutomatedMessageSerializer, SchoolAnalyticsSerializer,SubscriptionPlanSerializer,
+                          SchoolSubscriptionSerializer)
 from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
                            IsPlatformAdminOrSchoolOwner, IsPlatformAdminOrSchoolOwnerOrInstructor,
                            IsStudent)
 from rest_framework.exceptions import PermissionDenied
 from django.db import transaction
 from .services import (StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService, 
-                       CommunicationService, CommunicationTemplateService, AnalyticsService, ReportService)
+                       CommunicationService, CommunicationTemplateService, AnalyticsService, ReportService,
+                       SubscriptionPlanService, SchoolSubscriptionService)
 from django.db.models import Avg, Sum, Q, Count, F, Max, Min
 from django_filters.rest_framework import DjangoFilterBackend 
 from datetime import datetime, timedelta, date
@@ -30,6 +32,7 @@ import csv
 from django.core.cache import cache
 from django.db import connection
 import io
+from decimal import Decimal
 
 
 User = get_user_model()
@@ -7471,9 +7474,6 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         return recommendations
 
-
-
-
 class CSVRenderer:
     """Custom renderer for CSV responses"""
     media_type = 'text/csv'
@@ -9845,3 +9845,320 @@ class DashboardViewSet(viewsets.ViewSet):
             ],
             'timestamp': timezone.now().isoformat()
         })
+
+# DSS-16-create-SubscriptionPlanViewSet
+class SubscriptionPlanViewSet(viewsets.ModelViewSet):
+    """
+    Manage subscription plans in the platform.
+    - Platform Admins: Full CRUD operations
+    - School Owners: View available plans (read-only)
+    - Instructors/Students: No access
+    """
+    serializer_class = SubscriptionPlanSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    search_fields = ['name']
+    ordering_fields = ['price', 'created_at', 'max_students']
+    ordering = ['price']  # Default: cheapest first
+    filterset_fields = ['is_active', 'duration_days']
+    
+    def get_queryset(self):
+        """
+        Filter subscription plans based on user role.
+        - Platform Admins: See all plans
+        - School Owners: See only active plans
+        - Others: See only active plans (read-only)
+        """
+        user = self.request.user
+        
+        if not user.is_authenticated:
+            return SubscriptionPlan.objects.none()
+        
+        # Platform Admins can see all plans (including inactive)
+        if user.role == 'A' and user.is_staff:
+            return SubscriptionPlan.objects.all()
+        
+        # School Owners and others only see active plans
+        return SubscriptionPlan.objects.filter(is_active=True)
+    
+    def get_permissions(self):
+        """
+        Define permissions per action.
+        """
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'deactivate', 'activate']:
+            # Only platform admins can modify plans
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        
+        elif self.action in ['list', 'retrieve', 'popular_plans', 'compare_plans', 'recommended_plan']:
+            # Authenticated users can view plans
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def perform_create(self, serializer):
+        """
+        Create new subscription plan.
+        Only platform admins can create plans.
+        """
+        # All validations are handled in the serializer
+        serializer.save()
+    
+    def perform_update(self, serializer):
+        """
+        Update subscription plan with validation.
+        """
+        instance = self.get_object()
+        
+        # Check if plan can be updated (no active subscriptions for deactivation)
+        if 'is_active' in serializer.validated_data:
+            if not serializer.validated_data['is_active'] and not SubscriptionPlanService.can_deactivate_plan(instance):
+                raise PermissionDenied("Cannot deactivate plan with active subscriptions")
+        
+        serializer.save()
+    
+    @action(detail=False, methods=['get'])
+    def popular_plans(self, request):
+        """
+        Get most popular subscription plans.
+        """
+        popular_plans = SubscriptionPlanService.get_popular_plans()
+        serializer = self.get_serializer(popular_plans, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def compare_plans(self, request):
+        """
+        Get comparison data for all active plans.
+        """
+        comparison_data = SubscriptionPlanService.get_plan_comparison()
+        
+        # Custom serializer for comparison view
+        response_data = []
+        for item in comparison_data:
+            plan_data = SubscriptionPlanSerializer(item['plan']).data
+            response_data.append({
+                **plan_data,
+                'stats': item['stats'],
+                'price_per_student': item['price_per_student'],
+                'is_popular': item['is_popular']
+            })
+        
+        return Response(response_data)
+    
+    @action(detail=False, methods=['get'])
+    def recommended_plan(self, request):
+        """
+        Get recommended plan based on school size and budget.
+        """
+        try:
+            school_size = int(request.query_params.get('school_size', 10))
+            budget = Decimal(request.query_params.get('budget', '100'))
+            duration = request.query_params.get('duration', 'monthly')
+
+            if school_size <= 0:
+                return Response(
+                    {'error': 'School size must be positive'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if budget <= 0:
+                return Response(
+                    {'error': 'Budget must be positive'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            recommended_plan = SubscriptionPlanService.get_recommended_plan(
+                school_size, budget, duration
+            )
+
+            if not recommended_plan:
+                return Response(
+                    {
+                        'recommended_plan': None,
+                        'message': 'No suitable plan found. Consider increasing budget or reducing school size.',
+                        'suggestions': [
+                            'Increase your budget',
+                            'Consider a plan with fewer features',
+                            'Look for annual billing for discounts'
+                        ]
+                    },
+                    status=status.HTTP_200_OK
+                )
+
+            serializer = self.get_serializer(recommended_plan)
+
+            return Response(
+                {
+                    'recommended_plan': serializer.data,
+                    'message': None,
+                    'reasoning': f"Best value for {school_size} students within ${budget}/month budget"
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid parameters. school_size and budget must be numbers.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        @action(detail=True, methods=['post'])
+        def deactivate(self, request, pk=None):
+            """
+            Deactivate a subscription plan.
+            Only possible if no active subscriptions exist.
+            """
+            plan = self.get_object()
+            
+            if not SubscriptionPlanService.can_deactivate_plan(plan):
+                return Response(
+                    {'error': 'Cannot deactivate plan with active subscriptions'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            plan.is_active = False
+            plan.save()
+            
+            return Response({
+                'message': f'Plan "{plan.name}" deactivated successfully',
+                'plan_id': plan.id,
+                'status': 'inactive'
+            })
+        
+        @action(detail=True, methods=['post'])
+        def activate(self, request, pk=None):
+            """
+            Activate a subscription plan.
+            """
+            plan = self.get_object()
+            plan.is_active = True
+            plan.save()
+            
+            return Response({
+                'message': f'Plan "{plan.name}" activated successfully',
+                'plan_id': plan.id,
+                'status': 'active'
+            })
+        
+        @action(detail=True, methods=['get'])
+        def statistics(self, request, pk=None):
+            """
+            Get detailed statistics for a subscription plan.
+            """
+            plan = self.get_object()
+            stats = SubscriptionPlanService.get_plan_statistics(plan)
+            
+            return Response({
+                'plan': SubscriptionPlanSerializer(plan).data,
+                'statistics': stats
+            })
+        
+        @action(detail=False, methods=['get'])
+        def active_plans(self, request):
+            """
+            Get all active subscription plans.
+            """
+            active_plans = SubscriptionPlanService.get_active_plans()
+            serializer = self.get_serializer(active_plans, many=True)
+            return Response(serializer.data)
+        
+        @action(detail=False, methods=['get'])
+        def pricing_tiers(self, request):
+            """
+            Get plans grouped by pricing tiers.
+            """
+            plans = SubscriptionPlan.objects.filter(is_active=True).order_by('price')
+            
+            tiers = {
+                'basic': [],
+                'standard': [],
+                'premium': []
+            }
+            
+            for plan in plans:
+                # Simple tier classification based on price and features
+                price = float(plan.price)
+                max_students = plan.max_students
+                
+                if price < 50 and max_students <= 20:
+                    tiers['basic'].append(SubscriptionPlanSerializer(plan).data)
+                elif price < 150 and max_students <= 50:
+                    tiers['standard'].append(SubscriptionPlanSerializer(plan).data)
+                else:
+                    tiers['premium'].append(SubscriptionPlanSerializer(plan).data)
+            
+            return Response(tiers)
+
+    @action(detail=True, methods=['post'])
+    def deactivate(self, request, pk=None):
+        """Deactivate a subscription plan."""
+        plan = self.get_object()
+        
+        if not SubscriptionPlanService.can_deactivate_plan(plan):
+            return Response(
+                {'error': 'Cannot deactivate plan with active subscriptions'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        plan.is_active = False
+        plan.save()
+        
+        return Response({
+            'message': f'Plan "{plan.name}" deactivated successfully',
+            'plan_id': plan.id,
+            'status': 'inactive'
+        })
+    
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
+        """Activate a subscription plan."""
+        plan = self.get_object()
+        plan.is_active = True
+        plan.save()
+        
+        return Response({
+            'message': f'Plan "{plan.name}" activated successfully',
+            'plan_id': plan.id,
+            'status': 'active'
+        })
+
+    @action(detail=False, methods=['get'])
+    def pricing_tiers(self, request):
+        """
+        Get plans grouped by pricing tiers.
+        """
+        plans = SubscriptionPlan.objects.filter(is_active=True).order_by('price')
+        
+        tiers = {
+            'basic': [],
+            'standard': [],
+            'premium': []
+        }
+        
+        for plan in plans:
+            price = float(plan.price)
+            max_students = plan.max_students
+            
+            # Classification logic (adjust as needed)
+            if price < 50:
+                tiers['basic'].append(self.get_serializer(plan).data)
+            elif price < 150:
+                tiers['standard'].append(self.get_serializer(plan).data)
+            else:
+                tiers['premium'].append(self.get_serializer(plan).data)
+        
+        return Response(tiers)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """
+        Get detailed statistics for a subscription plan.
+        """
+        plan = self.get_object()
+        stats = SubscriptionPlanService.get_plan_statistics(plan)
+        
+        return Response({
+            'plan': self.get_serializer(plan).data,
+            'statistics': stats
+        })
+
+
