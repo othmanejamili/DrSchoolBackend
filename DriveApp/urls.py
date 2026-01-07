@@ -5,7 +5,8 @@ from .views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
                     LessonViewSet, AttendanceViewSet, FeedbackViewSet, VehicleViewSet,
                     ScheduleViewSet,AchievemtViewSet, CommunicationTemplateViewSet,
                     AutomatedMessageViewSet, SchoolAnalyticsViewSet, ReportViewSet,
-                    DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet)
+                    DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet,
+                    StudentDocumentViewSet)
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -24,6 +25,7 @@ router.register(r'report', ReportViewSet, basename='report')
 router.register(r'dashboard',DashboardViewSet, basename='dashboard')
 router.register(r'subscriptionplan',SubscriptionPlanViewSet, basename='subscriptionplan')
 router.register(r'schoolsubscription',SchoolSubscriptionViewSet, basename='schoolsubscription')
+router.register(r'studentdocument',StudentDocumentViewSet, basename='studentdocument')
 urlpatterns = [
     path('admin/', admin.site.urls)
 ]+ router.urls

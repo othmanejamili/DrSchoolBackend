@@ -17,6 +17,9 @@ from .services import (AnalyticsService, StudentProgressService, StudentProfileS
                         StudentDocumentService, SubscriptionPlanService, SchoolSubscriptionService,
                         CommunicationService)
 
+import os
+import re
+from django.utils.text import slugify
 # Serializer For Model User
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True,
@@ -1258,8 +1261,6 @@ class StudentPerformancePredictionSerializer(serializers.ModelSerializer):
 
         return instance
 
-
-
 # ========== STUDENT DOCUMENT SERIALIZER ==========
 class StudentDocumentSerializer(serializers.ModelSerializer):
     student_name = serializers.CharField(source='student.user.username', read_only=True)
@@ -1280,20 +1281,32 @@ class StudentDocumentSerializer(serializers.ModelSerializer):
         ]
 
     def get_file_url(self, obj):
-        """Get full URL for file"""
+        if not obj or isinstance(obj, dict):
+            return None
+
         request = self.context.get('request')
-        return StudentDocumentService.get_file_url(obj, request)
+        return StudentDocumentService.get_file_url(obj.file, request)
+
 
     def get_file_size(self, obj):
-        """Get file size in human-readable format"""
-        return StudentDocumentService.validate_file_size(obj.file)
+        if not obj or isinstance(obj, dict):
+            return None
+
+        return StudentDocumentService.get_file_size(obj.file)
+
 
     def get_file_extension(self, obj):
-        """Get file extension"""
-        if obj.file:
-            import os
-            return os.path.splitext(obj.file.name)[1].lower()  # This is a utility, not validation
-        return None
+        # 🔒 Guard against dicts or invalid objects
+        if not obj or isinstance(obj, dict):
+            return None
+
+        if not hasattr(obj, 'file') or not obj.file:
+            return None
+
+        import os
+        return os.path.splitext(obj.file.name)[1].lower()
+
+        # This is a utility, not validation
 
     def validate(self, attrs):
         """Validate document data"""
@@ -1327,6 +1340,92 @@ class StudentDocumentSerializer(serializers.ModelSerializer):
         """Update document - prevent student change"""
         return StudentDocumentService.update_document(instance, validated_data)
 
+class StudentDocumentUploadSerializer(serializers.Serializer):
+    """Serializer for uploading multiple documents"""
+    student_id = serializers.IntegerField(required=False)
+    document_type = serializers.CharField(max_length=50)
+    files = serializers.ListField(
+        child=serializers.FileField(
+            max_length=50 * 1024 * 1024,  # 50MB per file
+            allow_empty_file=False
+        ),
+        allow_empty=False,
+        max_length=5,  # Max 5 files at once
+        min_length=1   # At least 1 file
+    )
+    
+    def validate_file(self, value):
+        """Validate file upload"""
+        StudentDocumentService.validate_file_upload(value)
+        
+        # Optional: Check file extension
+        StudentDocumentService.validate_file_extension(value)
+        
+        StudentDocumentService.validate_file_size(value)
+
+        
+        name, ext = os.path.splitext(value.name)
+        sanitized_name = slugify(name)
+        value.name = f"{sanitized_name}{ext}"
+        
+        return value
+    
+    def validate_document_type(self, value):
+        """Validate document type"""
+        valid_types = ['ID Card', 'Driver\'s License', 'Medical Certificate', 'Passport', 'Other']
+        if value not in valid_types:
+            raise serializers.ValidationError(
+                f'Invalid document type. Must be one of: {", ".join(valid_types)}'
+            )
+        return value
+    
+    def validate(self, attrs):
+        """Validate the entire upload"""
+        request = self.context.get('request')
+        user = request.user if request and request.user.is_authenticated else None
+        
+        student_id = attrs.get('student_id')
+        
+        if user and user.role == 'S':
+            # Students can only upload for themselves
+            student_profile = user.student_profiles.filter(status='A').first()
+            if not student_profile:
+                raise serializers.ValidationError({
+                    'student_id': 'No active student profile found'
+                })
+            
+            if student_id and student_id != student_profile.id:
+                raise serializers.ValidationError({
+                    'student_id': 'Students can only upload documents for themselves'
+                })
+            
+            # Set student_id to the student's own ID
+            attrs['student_id'] = student_profile.id
+        
+        elif student_id:
+            # For non-students, validate they have access to this student
+            try:
+                student_profile = StudentProfile.objects.get(id=student_id)
+            except StudentProfile.DoesNotExist:
+                raise serializers.ValidationError({
+                    'student_id': 'Student not found'
+                })
+            
+            # Check permissions (could be moved to service)
+            if user.role == 'I':
+                instructor_profile = user.student_profiles.filter(status='A').first()
+                if not instructor_profile or instructor_profile.school != student_profile.school:
+                    raise serializers.ValidationError({
+                        'student_id': 'You can only upload documents for students in your school'
+                    })
+            
+            if user.role == 'A' and not user.is_staff:
+                if student_profile.school.owner != user:
+                    raise serializers.ValidationError({
+                        'student_id': 'You can only upload documents for students in your schools'
+                    })
+        
+        return attrs
 
 # ========== SUBSCRIPTION PLAN SERIALIZER ==========
 class SubscriptionPlanSerializer(serializers.ModelSerializer):

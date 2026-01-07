@@ -8,12 +8,12 @@ from django.utils import timezone
 from .models import (User, DrivingSchool, StudentProfile, Lesson, 
                      Attendance, Schedule, Feedback, Vehicle, VehiclePicture,
                      Achievement, CommunicationTemplate, AutomatedMessage,
-                     SchoolAnalytics,SubscriptionPlan,SchoolSubscription)
+                     SchoolAnalytics,SubscriptionPlan,SchoolSubscription,StudentDocument)
 from .serializers import (UserSerializer, DrivingSchoolSerializer, ScheduleSerializer, VehicleSerializer,
                           VehiclePictureSerializer,StudentProfileSerializer, LessonSerializer,AttendanceSerializer,
                           FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer, 
                           AutomatedMessageSerializer, SchoolAnalyticsSerializer,SubscriptionPlanSerializer,
-                          SchoolSubscriptionSerializer)
+                          SchoolSubscriptionSerializer, StudentDocumentSerializer, StudentDocumentUploadSerializer)
 from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
                            IsPlatformAdminOrSchoolOwner, IsPlatformAdminOrSchoolOwnerOrInstructor,
                            IsStudent)
@@ -21,7 +21,7 @@ from rest_framework.exceptions import PermissionDenied
 from django.db import transaction
 from .services import (StudentProfileService, LessonService, AttendanceService, VehicleService, AchievementService, 
                        CommunicationService, CommunicationTemplateService, AnalyticsService, ReportService,
-                       SubscriptionPlanService, SchoolSubscriptionService)
+                       SubscriptionPlanService, SchoolSubscriptionService, StudentDocumentService)
 from django.db.models import Avg, Sum, Q, Count, F, Max, Min
 from django_filters.rest_framework import DjangoFilterBackend 
 from datetime import datetime, timedelta, date
@@ -10161,6 +10161,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
             'statistics': stats
         })
 
+# DSS-17-create-SubscriptionPlanViewSet
 class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
     """
     Manage school subscriptions.
@@ -10489,5 +10490,433 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
             'days_remaining': SchoolSubscriptionService.get_days_remaining(subscription)
         })
 
-
+# DSS-20-create-DocumentViewSet
+class StudentDocumentViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing student documents.
+    
+    Students can upload and view their own documents.
+    Instructors can view documents of students in their school.
+    School owners can manage all documents in their schools.
+    Platform admins have full access.
+    
+    Supported document types:
+    - ID Card
+    - Driver's License
+    - Medical Certificate
+    - Passport
+    - Other
+    """
+    
+    serializer_class = StudentDocumentSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_fields = ['student', 'document_type', 'student__school']
+    search_fields = ['student__user__username', 'student__user__email', 'document_type']
+    ordering_fields = ['uploaded_at', 'document_type']
+    ordering = ['-uploaded_at']
+    
+    def get_queryset(self):
+        """Filter documents based on user role"""
+        user = self.request.user
+        if not user.is_authenticated:
+            return StudentDocument.objects.none()
         
+        # Platform Admin (staff) sees all documents
+        if user.role == 'A' and user.is_staff:
+            return StudentDocument.objects.all().select_related(
+                'student__user', 'student__school'
+            )
+        
+        # School Owner sees documents in their schools
+        if user.role == 'A' and not user.is_staff:
+            return StudentDocument.objects.filter(
+                student__school__owner=user
+            ).select_related('student__user', 'student__school')
+        
+        # Instructor sees documents of students in their school
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if instructor_profile:
+                return StudentDocument.objects.filter(
+                    student__school=instructor_profile.school
+                ).select_related('student__user', 'student__school')
+            return StudentDocument.objects.none()
+        
+        # Student sees only their own documents
+        if user.role == 'S':
+            student_profile = user.student_profiles.filter(status='A').first()
+            if student_profile:
+                return StudentDocument.objects.filter(
+                    student=student_profile
+                ).select_related('student__user', 'student__school')
+            return StudentDocument.objects.none()
+        
+        return StudentDocument.objects.none()
+    
+    def get_permissions(self):
+        """Define permissions per action"""
+        if self.action == 'create':
+            # Students, instructors, owners, and admins can upload
+            return [IsAuthenticated()]
+        
+        elif self.action in ['update', 'partial_update']:
+            # Only admins and owners can update
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action == 'destroy':
+            # Only admins and owners can delete
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
+        
+        elif self.action in ['bulk_upload', 'download']:
+            return [IsAuthenticated()]
+        
+        elif self.action in ['my_documents', 'student_documents']:
+            return [IsAuthenticated()]
+        
+        return [IsAuthenticated()]
+    
+    def get_serializer_context(self):
+        """Add request to serializer context"""
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+    
+    @transaction.atomic
+    def perform_create(self, serializer):
+        """Create document with validation"""
+        user = self.request.user
+        student = serializer.validated_data.get('student')
+        file = serializer.validated_data.get('file')
+        
+        # Use service to create document
+        StudentDocumentService.create_document(
+            serializer.validated_data,
+            user
+        )
+    
+    @transaction.atomic
+    def perform_update(self, serializer):
+        """Update document with validation"""
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Check permissions
+        if not StudentDocumentService.can_modify_document(user, instance):
+            raise PermissionDenied("You don't have permission to update this document")
+        
+        # Save using serializer (this will call the serializer's update method)
+        serializer.save()
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """Delete document with permission checks"""
+        user = self.request.user
+        
+        # Check permissions
+        if not StudentDocumentService.can_modify_document(user, instance):
+            raise PermissionDenied("You don't have permission to delete this document")
+        
+        # Delete the file and database record
+        instance.delete()
+    
+    # ==================== CUSTOM ACTIONS ====================
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_documents(self, request):
+        """
+        Get documents for the current student.
+        
+        GET /api/student-documents/my_documents/
+        """
+        user = request.user
+        
+        if user.role != 'S':
+            return Response(
+                {'error': 'This endpoint is only for students'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            student_profile = StudentProfile.objects.get(user=user, status='A')
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {'error': 'No active student profile found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get student's documents
+        documents = StudentDocument.objects.filter(
+            student=student_profile
+        ).order_by('-uploaded_at')
+        
+        # Group by document type
+        documents_by_type = {}
+        for doc in documents:
+            doc_type = doc.document_type
+            if doc_type not in documents_by_type:
+                documents_by_type[doc_type] = []
+            documents_by_type[doc_type].append(doc)
+        
+        serializer = self.get_serializer(documents, many=True)
+        
+        return Response({
+            'student': {
+                'id': student_profile.id,
+                'name': user.get_full_name() or user.username,
+                'school': student_profile.school.name
+            },
+            'total_documents': documents.count(),
+            'documents_by_type': {
+                doc_type: len(docs) for doc_type, docs in documents_by_type.items()
+            },
+            'documents': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    def student_documents(self, request):
+        """
+        Get documents for a specific student.
+        
+        GET /api/student-documents/student_documents/?student_id=123
+        """
+        student_id = request.query_params.get('student_id')
+        
+        if not student_id:
+            return Response(
+                {'error': 'student_id query parameter is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            student_profile = StudentProfile.objects.select_related('user', 'school').get(id=student_id)
+        except StudentProfile.DoesNotExist:
+            return Response(
+                {'error': 'Student not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check permissions
+        user = request.user
+        
+        if user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != student_profile.school:
+                raise PermissionDenied("You can only view documents of students in your school")
+        
+        if user.role == 'A' and not user.is_staff:
+            if student_profile.school.owner != user:
+                raise PermissionDenied("You can only view documents in your schools")
+        
+        # Get student's documents
+        documents = StudentDocument.objects.filter(
+            student=student_profile
+        ).order_by('-uploaded_at')
+        
+        serializer = self.get_serializer(documents, many=True)
+        
+        return Response({
+            'student': {
+                'id': student_profile.id,
+                'name': student_profile.user.get_full_name() or student_profile.user.username,
+                'email': student_profile.user.email,
+                'school': student_profile.school.name
+            },
+            'total_documents': documents.count(),
+            'documents': serializer.data
+        })
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    @transaction.atomic
+    def bulk_upload(self, request):
+        """
+        Upload multiple documents at once.
+        
+        POST /api/student-documents/bulk_upload/
+        Body: multipart/form-data
+        - student_id: int (optional for students)
+        - document_type: string
+        - files[]: array of files
+        """
+        serializer = StudentDocumentUploadSerializer(data=request.data, context={'request': request})
+        
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        user = request.user
+        files = serializer.validated_data['files']
+        document_type = serializer.validated_data['document_type']
+        student_id = serializer.validated_data.get('student_id')
+        
+        # Determine student
+        if user.role == 'S':
+            # Student uploads their own documents
+            student_profile = user.student_profiles.filter(status='A').first()
+            if not student_profile:
+                return Response(
+                    {'error': 'No active student profile found'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            # Admin/Owner/Instructor uploads for a specific student
+            if not student_id:
+                return Response(
+                    {'error': 'student_id is required for non-students'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                student_profile = StudentProfile.objects.get(id=student_id)
+            except StudentProfile.DoesNotExist:
+                return Response(
+                    {'error': 'Student not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Check permissions
+            if user.role == 'I':
+                instructor_profile = user.student_profiles.filter(status='A').first()
+                if not instructor_profile or instructor_profile.school != student_profile.school:
+                    raise PermissionDenied("You can only upload documents for students in your school")
+            
+            if user.role == 'A' and not user.is_staff:
+                if student_profile.school.owner != user:
+                    raise PermissionDenied("You can only upload documents for students in your schools")
+        
+        # Upload each file
+        uploaded_documents = []
+        failed_uploads = []
+        
+        for idx, file in enumerate(files):
+            try:
+                # Validate file
+                StudentDocumentService.validate_file_upload(file)
+                
+                # Create document
+                document = StudentDocument.objects.create(
+                    student=student_profile,
+                    document_type=document_type,
+                    file=file
+                )
+                
+                uploaded_documents.append({
+                    'id': document.id,
+                    'filename': file.name,
+                    'size': StudentDocumentService.get_file_size(file),
+                    'document_type': document_type
+                })
+            
+            except Exception as e:
+                failed_uploads.append({
+                    'filename': file.name,
+                    'error': str(e)
+                })
+        
+        return Response({
+            'message': f'Uploaded {len(uploaded_documents)} documents',
+            'summary': {
+                'total_files': len(files),
+                'successful': len(uploaded_documents),
+                'failed': len(failed_uploads)
+            },
+            'uploaded_documents': uploaded_documents,
+            'failed_uploads': failed_uploads,
+            'student': {
+                'id': student_profile.id,
+                'name': student_profile.user.get_full_name() or student_profile.user.username
+            }
+        }, status=status.HTTP_201_CREATED if uploaded_documents else status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def download(self, request, pk=None):
+        """
+        Download a document file.
+        
+        GET /api/student-documents/{id}/download/
+        """
+        document = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'S':
+            if document.student.user != user:
+                raise PermissionDenied("You can only download your own documents")
+        
+        elif user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != document.student.school:
+                raise PermissionDenied("You can only download documents from your school")
+        
+        elif user.role == 'A' and not user.is_staff:
+            if document.student.school.owner != user:
+                raise PermissionDenied("You can only download documents from your schools")
+        
+        # Get file URL
+        file_url = StudentDocumentService.get_file_url(document, request)
+        
+        if not file_url:
+            return Response(
+                {'error': 'Document file not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Return file info for download
+        return Response({
+            'document_id': document.id,
+            'filename': document.file.name.split('/')[-1],
+            'document_type': document.document_type,
+            'file_url': file_url,
+            'file_size': StudentDocumentService.get_file_size(document.file),
+            'uploaded_at': document.uploaded_at,
+            'student': document.student.user.get_full_name() or document.student.user.username
+        })
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def statistics(self, request):
+        """
+        Get document statistics.
+        
+        GET /api/student-documents/statistics/
+        Query params:
+        - school_id: Optional (admins only)
+        """
+        user = request.user
+        queryset = self.get_queryset()
+        
+        # Filter by school if provided (admin only)
+        school_id = request.query_params.get('school_id')
+        if school_id:
+            if user.role == 'A' and user.is_staff:
+                queryset = queryset.filter(student__school_id=school_id)
+            else:
+                return Response(
+                    {'error': 'Only platform admins can filter by school_id'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        # Calculate statistics
+        total_documents = queryset.count()
+        
+        # Documents by type
+        by_type = dict(
+            queryset.values('document_type').annotate(
+                count=Count('id')
+            ).values_list('document_type', 'count')
+        )
+        
+        # Recent uploads (last 30 days)
+        from datetime import timedelta
+        from django.utils import timezone
+        recent_cutoff = timezone.now() - timedelta(days=30)
+        recent_uploads = queryset.filter(uploaded_at__gte=recent_cutoff).count()
+        
+        # Students with documents
+        students_with_docs = queryset.values('student').distinct().count()
+        
+        return Response({
+            'total_documents': total_documents,
+            'documents_by_type': by_type,
+            'recent_uploads_30days': recent_uploads,
+            'students_with_documents': students_with_docs,
+            'scope': 'school' if school_id else 'all_accessible'
+        })  

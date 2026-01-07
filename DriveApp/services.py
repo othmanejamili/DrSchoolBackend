@@ -4150,32 +4150,67 @@ class VehicleService:
 
 class StudentDocumentService:
 
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+    MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 50MB for bulk upload
+
     @staticmethod
-    def get_file_url(student_document, request=None) -> Optional[str]:
-        if not student_document.file:
-            return None
+    def validate_file_size_limit(file) -> None:
+        if file.size > StudentDocumentService.MAX_FILE_SIZE:
+            raise serializers.ValidationError(
+                f"File too large. Max size is {StudentDocumentService.MAX_FILE_SIZE // (1024*1024)}MB"
+            )
         
+    @staticmethod
+    def validate_bulk_upload(files):
+        total_size = sum(f.size for f in files)
+        if total_size > StudentDocumentService.MAX_TOTAL_SIZE:
+            raise serializers.ValidationError(
+                "Total upload size exceeds 50MB limit"
+            )
+
+    @staticmethod
+    def get_file_url(file, request=None):
+        """
+        Accepts only Django FieldFile.
+        Returns None safely for dicts or invalid objects.
+        """
+        if not file:
+            return None
+
+        # 🔒 Guard against dicts or invalid objects
+        if isinstance(file, dict):
+            return None
+
+        if not hasattr(file, 'url'):
+            return None
+
         try:
-            if request:
-                return request.build_absolute_uri(student_document.file.url)
-            return student_document.file.url
-        except Exception :
+            return request.build_absolute_uri(file.url) if request else file.url
+        except Exception:
             return None
+
         
     @staticmethod
-    def validate_file_size(file) -> str:
-        if file:
-            try:
-                size_bytes = file.size
-                if size_bytes < 1024:
-                    return f"{size_bytes} B"
-                elif size_bytes < 1024 * 1024:
-                    return f"{size_bytes / 1024:.2f} KB"
-                else:
-                    return f"{size_bytes / (1024 * 1024):.2f} MB"
-            except Exception:
-                return "Unknown"
-        return None
+    def get_file_size(file) -> Optional[str]:
+        if not file:
+            return None
+
+        # 🔒 Guard against dicts or invalid objects
+        if isinstance(file, dict):
+            return None
+
+        if not hasattr(file, 'size'):
+            return None
+        try:
+            size = file.size
+            if size < 1024:
+                return f"{size} B"
+            elif size < 1024 * 1024:
+                return f"{size / 1024:.2f} KB"
+            return f"{size / (1024 * 1024):.2f} MB"
+        except ValueError:
+            return None
+
     
     @staticmethod
     def validate_file_extension(file) -> None:
@@ -4194,22 +4229,42 @@ class StudentDocumentService:
         if student is None:
             raise serializers.ValidationError("Student is required")
         
+        if file.size > StudentDocumentService.MAX_FILE_SIZE:
+            raise serializers.ValidationError(
+                f"File too large. Max size is {StudentDocumentService.MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+        
+        if getattr(student, 'status', None) != 'A':
+            raise serializers.ValidationError({
+                'student': 'Cannot upload documents for an inactive student'
+            })
+        
         if request_user and request_user.role == 'S':
             if student.user != request_user:
                 raise serializers.ValidationError("You can only upload your own documents")
         
+        if request_user and request_user.role == 'I':
+            profile = request_user.student_profiles.filter(status='A').first()
+            if profile:
+                if student.school != profile.school:
+                    raise serializers.ValidationError("You can only upload documents for students in your school")
+
         StudentDocumentService.validate_file_upload(file)
 
     @staticmethod
     def can_modify_document(user, document) -> bool:
         """Check if user can modify this document"""
-        if user.role == 'A':
+        if user.role == 'A' and user.is_active:
+            return True
+        if user.role == 'A' and not user.is_active:
             return document.student.school.owner == user
         elif user.role == 'I':
-            # Check if instructor is assigned to the same school
-            return document.student.school == user.student_profiles.first().school
+            profile = user.student_profiles.filter(status='A').first()
+            return profile and document.student.school == profile.school
+
         elif user.role == 'S':
-            return document.student.user == user
+            profile = user.student_profiles.filter(status='A').first()
+            return profile and document.student.user == user
         return False
 
     @staticmethod
