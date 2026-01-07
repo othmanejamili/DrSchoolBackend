@@ -616,7 +616,96 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
                 {'error': 'Student profile not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+    #DSS-19-PerformancePredictionViewSet
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def performance_prediction(self, request, pk=None):
+        """
+        Get performance prediction for a student.
         
+        GET /api/student-profiles/{id}/performance_prediction/
+        
+        Returns:
+        - Predicted completion date
+        - Success probability
+        - Risk factors
+        - Personalized recommendations
+        """
+        student_profile = self.get_object()
+        user = request.user
+        
+        # Check permissions
+        if user.role == 'S' and student_profile.user != user:
+            raise PermissionDenied("You can only view your own prediction")
+        
+        elif user.role == 'I':
+            instructor_profile = user.student_profiles.filter(status='A').first()
+            if not instructor_profile or instructor_profile.school != student_profile.school:
+                raise PermissionDenied("You can only view predictions for students in your school")
+        
+        elif user.role == 'A' and not user.is_staff:
+            if student_profile.school.owner != user:
+                raise PermissionDenied("You can only view predictions for students in your schools")
+        
+        # Generate/retrieve prediction
+        from .services import StudentProgressService
+        prediction = StudentProgressService.calculate_completion_estimate(student_profile, force_refresh=False)
+        
+        if not prediction:
+            return Response({
+                'student': {
+                    'id': student_profile.id,
+                    'name': student_profile.user.get_full_name() or student_profile.user.username
+                },
+                'message': 'Insufficient data for prediction. Student needs more attendance records.',
+                'minimum_data_required': {
+                    'days_enrolled': 7,
+                    'lessons_attended': 3
+                }
+            }, status=status.HTTP_200_OK)
+        
+        # Calculate additional metrics
+        days_until_completion = None
+        if prediction.predicted_completion_date:
+            from django.utils import timezone
+            delta = prediction.predicted_completion_date - timezone.now().date()
+            days_until_completion = delta.days
+        
+        # Risk level
+        risk_level = StudentProgressService.calculate_risk_level(prediction.success_probability)
+        
+        # Format response
+        return Response({
+            'student': {
+                'id': student_profile.id,
+                'name': student_profile.user.get_full_name() or student_profile.user.username,
+                'school': student_profile.school.name,
+                'current_status': student_profile.get_status_display()
+            },
+            'current_progress': {
+                'theory': float(student_profile.progress_theory),
+                'driving': float(student_profile.progress_driving),
+                'overall': round((student_profile.progress_theory + student_profile.progress_driving) / 2, 2)
+            },
+            'prediction': {
+                'predicted_completion_date': prediction.predicted_completion_date,
+                'days_until_completion': days_until_completion,
+                'success_probability': float(prediction.success_probability),
+                'confidence_level': float(prediction.confidence_level) if prediction.confidence_level else 0,
+                'confidence_percentage': StudentProgressService.format_confidence_percentage(
+                    prediction.confidence_level
+                ) if prediction.confidence_level else '0%',
+                'risk_level': risk_level,
+                'last_updated': prediction.last_updated
+            },
+            'risk_factors': prediction.risk_factors or {},
+            'recommendations': prediction.recommendations or [],
+            'risk_summary': {
+                'total_risks': len(prediction.risk_factors) if prediction.risk_factors else 0,
+                'high_severity': len([r for r in (prediction.risk_factors or {}).values() if r.get('severity') == 'high']),
+                'medium_severity': len([r for r in (prediction.risk_factors or {}).values() if r.get('severity') == 'medium'])
+            },
+            'generated_at': timezone.now().isoformat()
+        })
 class LessonViewSet(viewsets.ModelViewSet):
     """
     Manage lessons in the platform
