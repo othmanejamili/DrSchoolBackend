@@ -4,7 +4,7 @@ venv/
 # Python cache
 __pycache__/
 *.pyc
-
+*.pdf
 # Environment variables
 .env
 
