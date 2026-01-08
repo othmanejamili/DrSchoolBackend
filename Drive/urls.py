@@ -15,7 +15,7 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from DriveApp.views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
                             LessonViewSet,AttendanceViewSet, FeedbackViewSet, VehicleViewSet,
@@ -44,4 +44,5 @@ router.register(r'schoolsubscription',SchoolSubscriptionViewSet, basename='schoo
 router.register(r'studentdocument',StudentDocumentViewSet, basename='studentdocument')
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/', include(router.urls)),
 ]+ router.urls
