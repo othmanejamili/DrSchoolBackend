@@ -43,6 +43,8 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
+    'debug_toolbar',
+    'django_ratelimit',
     'django_filters',
     'django_extensions',
     'cloudinary',
@@ -86,6 +88,7 @@ STATICFILES_STORAGE = 'cloudinary_storage.storage.StaticHashedCloudinaryStorage'
 
 
 MIDDLEWARE = [
+    'debug_toolbar.middleware.DebugToolbarMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -94,6 +97,42 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# Debug Toolbar settings
+
+
+# OR better: Conditionally include debug_toolbar
+import sys
+TESTING = 'test' in sys.argv
+
+if not TESTING:
+    INSTALLED_APPS += ['debug_toolbar']
+    MIDDLEWARE.insert(0, 'debug_toolbar.middleware.DebugToolbarMiddleware')
+    
+TESTING = 'test' in sys.argv
+
+# Configure Debug Toolbar only when not testing
+if DEBUG and not TESTING:
+    INSTALLED_APPS += ['debug_toolbar']
+    MIDDLEWARE.insert(0, 'debug_toolbar.middleware.DebugToolbarMiddleware')
+    
+    DEBUG_TOOLBAR_CONFIG = {
+        'SHOW_TOOLBAR_CALLBACK': lambda request: True,
+        'RESULTS_CACHE_SIZE': 100,
+        'SHOW_COLLAPSED': True,
+    }
+    
+    INTERNAL_IPS = ['127.0.0.1', 'localhost']
+else:
+    # Disable debug toolbar during tests
+    DEBUG_TOOLBAR_CONFIG = {
+        'IS_RUNNING_TESTS': True,  # This bypasses the toolbar check
+    }
+
+INTERNAL_IPS = ['127.0.0.1']
+
+
+
 
 ROOT_URLCONF = 'Drive.urls'
 
@@ -125,7 +164,12 @@ DATABASES = {
         'USER': 'root',
         'PASSWORD': 'Othmane491!',
         'HOST': '127.0.0.1',
-        'PORT': '3306'
+        'PORT': '3306',
+        'CONN_MAX_AGE':600,
+        'OPTIONS': {
+            'connect_timeout': 10,
+        }
+
     }
 }
 
@@ -139,11 +183,55 @@ CORS_ALLOWED_ORIGINS = [
 
 # REST Framework Settings
 REST_FRAMEWORK = {
+    # Pagination
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 10,
-    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
+    'PAGE_SIZE': 50,
+    
+    # Authentication
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.TokenAuthentication',
+        # 'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ],
+    
+    # Permissions
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    
+    # Throttling (Rate Limiting)
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        # General rates
+        'anon': '100/hour',          # Anonymous users
+        'user': '1000/hour',         # Authenticated users
+        
+        # Specific endpoint rates
+        'login': '5/minute',         # Login attempts (prevent brute force)
+        'register': '10/hour',       # Student registration
+        'stats': '30/minute',        # Statistics endpoints
+        'school_users': '60/minute', # School user listing
+        'burst': '60/minute',        # Burst traffic allowance
+    },
+    
+    # Filtering
+    'DEFAULT_FILTER_BACKENDS': [
+        'django_filters.rest_framework.DjangoFilterBackend',
+        'rest_framework.filters.SearchFilter',
+        'rest_framework.filters.OrderingFilter',
+    ],
+    
+    # Error handling
+    'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
+    
+    # Renderer classes
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
 }
-
 
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
@@ -231,7 +319,132 @@ EMAIL_HOST_USER = 'othmanejamili19@gmail.com'
 EMAIL_HOST_PASSWORD = 'xldajgfebylgdhsa'
 DEFAULT_FROM_EMAIL = 'othmanejamili19@gmail.com'
 
-# Fix for macOS SSL certificate issues
+# ================ CORRECT EMAIL CONFIGURATION ================
+
+# Rate limiting configuration
+RATELIMIT_ENABLE = True  # Set to False to disable in development
+RATELIMIT_USE_CACHE = 'default'
 
 
-# For development only - disable SSL verification
+# Cache configuration (choose one based on your needs)
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/1'),
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'CONNECTION_POOL_KWARGS': {
+                'max_connections': 50,
+                'retry_on_timeout': True,
+            },
+            'SOCKET_CONNECT_TIMEOUT': 5,
+            'SOCKET_TIMEOUT': 5,
+            'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+            'IGNORE_EXCEPTIONS': True,  # Don't break the app if Redis is down
+        },
+        'KEY_PREFIX': 'driving_school',
+        'TIMEOUT': 300,  # Default 5 minutes
+    }
+}
+
+
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
+
+# ============================================
+# LOGGING CONFIGURATION (FIXED)
+# ============================================
+
+import os
+
+# Create logs directory if it doesn't exist
+LOGS_DIR = os.path.join(BASE_DIR, 'logs')
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} {message}',
+            'style': '{',
+        },
+    },
+    
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+        'file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': os.path.join(LOGS_DIR, 'django.log'),
+            'maxBytes': 1024 * 1024 * 10,  # 10 MB
+            'backupCount': 5,
+            'formatter': 'verbose',
+        },
+        'cache_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': os.path.join(LOGS_DIR, 'cache.log'),
+            'maxBytes': 1024 * 1024 * 5,  # 5 MB
+            'backupCount': 3,
+            'formatter': 'simple',
+        },
+    },
+    
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': True,
+        },
+        'django.db.backends': {
+            'handlers': ['console'],
+            'level': 'WARNING',  # DEBUG to see SQL queries
+            'propagate': False,
+        },
+        'django.request': {
+            'handlers': ['console', 'file'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+        'django_ratelimit': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'django.core.cache': {
+            'handlers': ['console', 'cache_file'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+    },
+    
+    'root': {
+        'handlers': ['console'],
+        'level': 'WARNING',
+    },
+}
+
+
+
+if DEBUG:
+    # Enable more verbose logging for debugging
+    LOGGING['loggers']['django.db.backends']['level'] = 'DEBUG'
+    LOGGING['loggers']['django.core.cache'] = {
+        'handlers': ['console'],
+        'level': 'DEBUG',
+    }
+# ============================================
+# SECURITY SETTINGS
+# ============================================
+
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'

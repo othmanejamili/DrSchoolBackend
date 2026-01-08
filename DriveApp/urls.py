@@ -1,5 +1,5 @@
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
                     LessonViewSet, AttendanceViewSet, FeedbackViewSet, VehicleViewSet,
@@ -27,5 +27,6 @@ router.register(r'subscriptionplan',SubscriptionPlanViewSet, basename='subscript
 router.register(r'schoolsubscription',SchoolSubscriptionViewSet, basename='schoolsubscription')
 router.register(r'studentdocument',StudentDocumentViewSet, basename='studentdocument')
 urlpatterns = [
-    path('admin/', admin.site.urls)
+    path('admin/', admin.site.urls),
+    path('api/', include(router.urls)),
 ]+ router.urls

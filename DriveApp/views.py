@@ -33,14 +33,37 @@ from django.core.cache import cache
 from django.db import connection
 import io
 from decimal import Decimal
+from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
+from django.views.decorators.cache import cache_page
+from django.utils.decorators import method_decorator
+from .throttles import (
+    RegisterStudentThrottle,  # This now exists
+    StatsThrottle,            # This now exists
+    SchoolUsersThrottle,      # This now exists
+    BurstRateThrottle         # Optional if needed
+)
+from .cache_utils import (get_user_queryset_cache_key, get_user_stats_cache_key, 
+                         get_school_users_cache_key, get_school_student_count_cache_key,
+                         invalidate_user_caches)
 
 
 User = get_user_model()
 
 
+
+# ============================================
+# USER VIEWSET WITH CACHING & RATE LIMITING
+# ============================================
+
 class UserViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing users in a SaaS driving school platform.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Rate limiting to prevent abuse
+    - Query caching for performance
+    - Optimized database queries
     
     Access Control:
     - Platform Admins (A): Full access to all users across all schools
@@ -48,93 +71,141 @@ class UserViewSet(viewsets.ModelViewSet):
     - Students (S): View their own profile only
     """
     serializer_class = UserSerializer
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     search_fields = ['username', 'email', 'first_name', 'last_name', 'phone_number']
     ordering_fields = ['created_at', 'username', 'role', 'last_name']
     ordering = ['-created_at']
+    
+    # Default throttling for the viewset
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
         """
         Filter users based on role and school association.
         Multi-tenancy: Users only see users from their own school.
+        Implements query result caching for performance.
         """
         user = self.request.user
         
-        # Platform Admin sees all users
-        if user.role == 'A':
-            return User.objects.all()
+        # Generate cache key based on user and role
+        cache_key = get_user_queryset_cache_key(user.id, user.role)
         
-        # Instructor sees students and other instructors in their school
+        # Try to get from cache (disabled for list actions with search/filter)
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role
+        if user.role == 'A' and user.is_active:
+            # Platform Admin sees all users
+            queryset = User.objects.all()
+        
+        elif user.role == 'A' and not user.is_active:
+            # School owners can see only their school users
+            if hasattr(user, 'driving_schools') and user.driving_schools.exists():
+                school = user.driving_schools.first()
+                queryset = User.objects.filter(
+                    student_profiles__school=school
+                ).distinct()
+            else:
+                queryset = User.objects.none()
+
         elif user.role == 'I':
-            # Get instructor's school through their student profile
+            # Instructor sees students and other instructors in their school
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
                 school = student_profile.school
-                # Get all users who have student profiles in this school
                 queryset = User.objects.filter(
                     student_profiles__school=school
                 ).distinct()
             else:
                 queryset = User.objects.none()
         
-        # Students see only themselves
         else:
+            # Students see only themselves
             queryset = User.objects.filter(id=user.id)
         
-        return queryset.select_related()
+        # Optimize query with select_related and prefetch_related
+        queryset = queryset.select_related().prefetch_related('student_profiles__school')
+        
+        # Cache the queryset for 5 minutes if no query params
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+        
+        return queryset
+
+    def get_throttles(self):
+        """
+        Apply different rate limits based on action.
+        """
+        if self.action == 'register_student':
+            return [RegisterStudentThrottle()]
+        elif self.action == 'stats':
+            return [StatsThrottle()]
+        elif self.action == 'school_users':
+            return [SchoolUsersThrottle()]
+        return super().get_throttles()
 
     def get_permissions(self):
-        """
-        Define permissions per action.
-        Only Platform Admins can create users (except public student registration).
-        """
+        """Define permissions per action."""
         if self.action == 'create':
-            # Only admins can create users via the admin panel
-            return [IsAuthenticated(), IsPlatformAdmin()]
-        
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action in ['update', 'partial_update']:
-            # Users can update themselves, admins can update any user
-            return [IsAuthenticated()]
-        
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action == 'destroy':
-            # Only admins can delete users
-            return [IsAuthenticated(), IsPlatformAdmin()]
-        
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action == 'register_student':
-            # Admin-only registration for students
-            return [IsAuthenticated(), IsPlatformAdmin()]
-        
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action in ['deactivate', 'activate', 'stats']:
-            # Only admins can activate/deactivate and view stats
-            return [IsAuthenticated(), IsPlatformAdmin()]
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         
         return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        """Invalidate cache when creating a user"""
+        user = serializer.save()
+        invalidate_user_caches(user.id)
 
     def perform_update(self, serializer):
         """
         Prevent users from escalating their own privileges.
+        Invalidate cache after update.
         """
         user = self.request.user
         instance = self.get_object()
         
-        # Users cannot change their own role (only admins can)
+        # Validate role change
         if instance.id == user.id and 'role' in serializer.validated_data:
             if serializer.validated_data['role'] != user.role:
                 if user.role != 'A':
                     raise PermissionDenied("You cannot change your own role.")
         
         serializer.save()
+        
+        # Invalidate related caches
+        invalidate_user_caches(instance.id)
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    def perform_destroy(self, instance):
+        """Invalidate cache when deleting a user"""
+        user_id = instance.id
+        instance.delete()
+        invalidate_user_caches(user_id)
+
+    @action(detail=False, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner],
+            throttle_classes=[RegisterStudentThrottle])
     @transaction.atomic
     def register_student(self, request):
         """
         Endpoint for admins to register students.
+        Rate limited to prevent abuse.
         Students must be assigned to a driving school during registration.
         """
         data = request.data.copy()
-        
-        # Force role to student
         data['role'] = 'S'
         
         # Validate driving school
@@ -146,7 +217,7 @@ class UserViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            school = DrivingSchool.objects.get(id=school_id)
+            school = DrivingSchool.objects.select_related('subscriptions__plan').get(id=school_id)
         except DrivingSchool.DoesNotExist:
             return Response(
                 {'error': 'Invalid driving school'},
@@ -154,9 +225,9 @@ class UserViewSet(viewsets.ModelViewSet):
             )
         
         user = request.user
-        # Platform admins can register for any school
+        
+        # Authorization check
         if user.role != 'A':
-            # Non-platform admins must register for their own school
             if not hasattr(user, 'student_profiles'):
                 return Response(
                     {'error': 'You can only register students for your own school'},
@@ -169,81 +240,111 @@ class UserViewSet(viewsets.ModelViewSet):
                     {'error': 'You can only register students for your own school'},
                     status=status.HTTP_403_FORBIDDEN
                 )
-            
-        # Check if school has available slots (subscription limits)
-        if hasattr(school, 'subscription'):
-            subscription = school.subscription
-            # Count active student profiles in this school
-            current_students = school.student_profiles.filter(status='A', user__role='S').count()
+        
+        # Check subscription limits (cached to reduce DB queries)
+        cache_key = f'school_{school_id}_student_count'
+        current_students = cache.get(cache_key)
+        
+        if current_students is None:
+            current_students = school.student_profiles.filter(
+                status='A', user__role='S'
+            ).count()
+            cache.set(cache_key, current_students, 60 * 5)  # Cache for 5 minutes
+        
+        if hasattr(school, 'subscriptions'):
+            subscription = school.subscriptions
             if current_students >= subscription.plan.max_students:
                 return Response(
                     {
-                        'error': f'This school has reached its student limit ({subscription.plan.max_students} students maximum). '
-                        f'Current: {current_students} students.'
+                        'error': f'This school has reached its student limit '
+                                f'({subscription.plan.max_students} students maximum). '
+                                f'Current: {current_students} students.'
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
         
+        # Create user
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         
-        # Create student profile automatically
+        # Create student profile
         StudentProfile.objects.create(
             user=user,
             school=school,
             joined_at=timezone.now(),
-            status='A'  # Active status
+            status='A'
         )
         
-        return Response(
-            serializer.data,
-            status=status.HTTP_201_CREATED
-        )
-    
+        # Invalidate caches
+        invalidate_user_caches(user.id)
+        cache.delete(cache_key)  # Invalidate student count cache
+        
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
+    @method_decorator(cache_page(60 * 2))  # Cache for 2 minutes
     def me(self, request):
         """
         Get current user's profile with related data.
+        Cached to reduce database load.
         """
         serializer = self.get_serializer(request.user)
         return Response(serializer.data)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[SchoolUsersThrottle])
     def school_users(self, request):
         """
         Get all users in the current user's school with optional role filtering.
         Available to Instructors and Admins.
+        Implements manual caching with query parameter awareness.
         """
         user = request.user
         role_filter = request.query_params.get('role')
         
-        # Only instructors and admins can use this endpoint
+        # Authorization check
         if user.role not in ['A', 'I']:
             return Response(
                 {'error': 'Only instructors and admins can view school users'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
+        # Generate cache key including query parameters
+        cache_key = f'school_users_{user.id}_{role_filter or "all"}'
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+        
+        # Get queryset
         queryset = self.get_queryset()
         
         if role_filter:
             queryset = queryset.filter(role=role_filter)
         
+        # Paginate
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            response_data = self.get_paginated_response(serializer.data).data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            response_data = serializer.data
         
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        # Cache the response for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdmin])
     def deactivate(self, request, pk=None):
         """
         Soft delete: deactivate a user instead of hard deletion.
-        Only Platform Admins can deactivate users.
+        Invalidates all related caches.
         """
         target_user = self.get_object()
         
@@ -257,46 +358,88 @@ class UserViewSet(viewsets.ModelViewSet):
         target_user.is_active = False
         target_user.save()
         
+        # Invalidate caches
+        invalidate_user_caches(target_user.id)
+        
         return Response(
             {'message': 'User deactivated successfully'},
             status=status.HTTP_200_OK
         )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdmin])
     def activate(self, request, pk=None):
         """
         Reactivate a deactivated user.
-        Only Platform Admins can activate users.
+        Invalidates all related caches.
         """
         target_user = self.get_object()
         target_user.is_active = True
         target_user.save()
+        
+        # Invalidate caches
+        invalidate_user_caches(target_user.id)
         
         return Response(
             {'message': 'User activated successfully'},
             status=status.HTTP_200_OK
         )
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdmin],
+            throttle_classes=[StatsThrottle])
     def stats(self, request):
         """
         Get user statistics across the platform.
-        Only available to Platform Admins.
+        Heavily cached since stats don't change frequently.
         """
+        cache_key = get_user_stats_cache_key()
+        stats = cache.get(cache_key)
         
-        stats = {
-            'total_users': User.objects.count(),
-            'active_users': User.objects.filter(is_active=True).count(),
-            'users_by_role': dict(
-                User.objects.values('role').annotate(count=Count('id')).values_list('role', 'count')
-            ),
-            'recent_registrations': User.objects.filter(
-                created_at__gte=timezone.now() - timezone.timedelta(days=30)
-            ).count()
-        }
+        if stats is None:
+            # Calculate stats (expensive operation)
+            stats = {
+                'total_users': User.objects.count(),
+                'active_users': User.objects.filter(is_active=True).count(),
+                'users_by_role': dict(
+                    User.objects.values('role')
+                    .annotate(count=Count('id'))
+                    .values_list('role', 'count')
+                ),
+                'recent_registrations': User.objects.filter(
+                    created_at__gte=timezone.now() - timedelta(days=30)
+                ).count(),
+                'inactive_users': User.objects.filter(is_active=False).count(),
+            }
+            
+            # Cache for 10 minutes
+            cache.set(cache_key, stats, 60 * 10)
         
         return Response(stats)
     
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    def rate_limit_status(self, request):
+        """Get current rate limit status"""
+        import redis
+        from django.conf import settings
+        
+        try:
+            r = redis.Redis.from_url(settings.CACHES['default']['LOCATION'])
+            
+            # Get throttle keys
+            user_key = f"throttle_user_{request.user.id}"
+            anon_key = "throttle_anon_*"
+            
+            status = {
+                'user_id': request.user.id,
+                'user_throttle_keys': r.keys(f"{user_key}_*"),
+                'cache_size': r.info().get('used_memory_human', 'N/A'),
+            }
+            
+            return Response(status)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+        
 class DrivingSchoolViewSet(viewsets.ModelViewSet):
     """
     Manage driving schools in the platform
@@ -706,6 +849,7 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
             },
             'generated_at': timezone.now().isoformat()
         })
+
 class LessonViewSet(viewsets.ModelViewSet):
     """
     Manage lessons in the platform
