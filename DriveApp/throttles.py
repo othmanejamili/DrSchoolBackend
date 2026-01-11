@@ -35,6 +35,20 @@ class BurstRateThrottle(UserRateThrottle):
     rate = '60/minute'
 
 
+class SchoolListThrottle(UserRateThrottle):
+    """Limit school listing for authenticated users"""
+    scope = 'school'
+    rate = '200/hour'
+
+class SchoolCreateThrottle(UserRateThrottle):
+    """Limit school creation (admins only)"""
+    scope = 'school_create'
+    rate = '10/hour' 
+
+
+
+
+# ========================= CREATE THROTTLE FOR HEADERS =================================
 class HeaderRateThrottle(SimpleRateThrottle):
     """Throttle that adds rate limit headers to responses"""
     

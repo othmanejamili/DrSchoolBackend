@@ -215,6 +215,8 @@ REST_FRAMEWORK = {
         'stats': '30/minute',        # Statistics endpoints
         'school_users': '60/minute', # School user listing
         'burst': '60/minute',        # Burst traffic allowance
+        'school':'200/hour',
+        'school_create':'10/hour'
     },
     
     # Filtering
