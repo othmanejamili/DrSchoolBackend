@@ -7,6 +7,10 @@ import hashlib
 import json
 
 
+# ============================================
+# USER CACHE KEYS
+# ============================================
+
 def get_user_queryset_cache_key(user_id, role):
     """Generate cache key for user queryset"""
     return f'user_queryset_{user_id}_{role}'
@@ -16,6 +20,10 @@ def get_user_stats_cache_key():
     """Generate cache key for user stats"""
     return 'user_stats_v1'
 
+
+# ============================================
+# SCHOOL CACHE KEYS
+# ============================================
 
 def get_school_stats_cache_key(school_id=None):
     """Generate cache key for school stats"""
@@ -35,9 +43,37 @@ def get_school_student_count_cache_key(school_id):
 
 
 def get_schools_cache_key(user_id, role):
-    """Generate cache key for schools queryset - ✅ ADD THIS!"""
+    """Generate cache key for schools queryset"""
     return f'schools_queryset_{user_id}_{role}'
 
+
+# ============================================
+# STUDENT PROFILE CACHE KEYS (NEW)
+# ============================================
+
+def get_student_profile_cache_key(user_id, role):
+    """Generate cache key for student profile queryset"""
+    return f'student_profiles_queryset_{user_id}_{role}'
+
+
+def get_student_profile_detail_cache_key(profile_id):
+    """Generate cache key for single student profile"""
+    return f'student_profile_detail_{profile_id}'
+
+
+def get_student_progress_cache_key(profile_id):
+    """Generate cache key for student progress data"""
+    return f'student_progress_{profile_id}'
+
+
+def get_student_prediction_cache_key(profile_id):
+    """Generate cache key for student performance prediction"""
+    return f'student_prediction_{profile_id}'
+
+
+# ============================================
+# GENERIC CACHE KEY GENERATOR
+# ============================================
 
 def generate_cache_key_from_request(request, prefix):
     """Generate a unique cache key from request parameters"""
@@ -51,6 +87,10 @@ def generate_cache_key_from_request(request, prefix):
     return hashlib.md5(key_data.encode()).hexdigest()
 
 
+# ============================================
+# USER CACHE INVALIDATION
+# ============================================
+
 def invalidate_user_caches(user_id=None):
     """Invalidate all user-related caches"""
     # Delete user stats
@@ -60,21 +100,31 @@ def invalidate_user_caches(user_id=None):
         # Delete specific user caches
         for role in ['A', 'I', 'S']:
             cache.delete(get_user_queryset_cache_key(user_id, role))
+            cache.delete(get_student_profile_cache_key(user_id, role))
         
         # Delete user-specific patterns
         patterns = [
             f'user_{user_id}_*',
+            f'student_profile_user_{user_id}',
             f'*_{user_id}_*',
         ]
         for pattern in patterns:
             try:
                 cache.delete_pattern(pattern)
-            except:
-                pass  # Some cache backends don't support delete_pattern
+            except AttributeError:
+                # Some cache backends don't support delete_pattern
+                pass
 
+
+# ============================================
+# SCHOOL CACHE INVALIDATION
+# ============================================
 
 def invalidate_school_caches(school_id):
     """Invalidate school-related caches"""
+    if not school_id:
+        return
+    
     # Delete specific school caches
     cache.delete(get_school_stats_cache_key(school_id))
     cache.delete(get_school_student_count_cache_key(school_id))
@@ -87,12 +137,12 @@ def invalidate_school_caches(school_id):
     for pattern in patterns:
         try:
             cache.delete_pattern(pattern)
-        except:
-            pass  # Some cache backends don't support delete_pattern
+        except AttributeError:
+            pass
 
 
 def invalidate_schools_cache(user_id, role):
-    """Invalidate schools cache for a user."""
+    """Invalidate schools cache for a user"""
     # Delete the main schools cache
     cache.delete(get_schools_cache_key(user_id, role))
     
@@ -105,15 +155,192 @@ def invalidate_schools_cache(user_id, role):
     for pattern in patterns:
         try:
             cache.delete_pattern(pattern)
-        except:
+        except AttributeError:
             pass
 
 
+# ============================================
+# STUDENT PROFILE CACHE INVALIDATION (NEW)
+# ============================================
+
+def invalidate_student_profile_cache(user_id):
+    """Invalidate all caches related to a student profile"""
+    if not user_id:
+        return
+    
+    # Delete specific student profile caches
+    for role in ['A', 'I', 'S']:
+        cache.delete(get_student_profile_cache_key(user_id, role))
+    
+    # Delete student-specific caches
+    patterns_to_delete = [
+        f'student_profile_user_{user_id}',
+        f'student_profile_detail_*',
+        f'student_progress_{user_id}',
+        f'student_prediction_{user_id}',
+        f'*student*{user_id}*',
+    ]
+    
+    for pattern in patterns_to_delete:
+        try:
+            if '*' in pattern:
+                cache.delete_pattern(pattern)
+            else:
+                cache.delete(pattern)
+        except AttributeError:
+            # Fallback for cache backends without delete_pattern
+            cache.delete(pattern.replace('*', ''))
+
+
+def invalidate_student_profiles_by_school(school_id):
+    """Invalidate all student profile caches for a specific school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'*school_{school_id}*student*',
+        f'student_profiles_*_school_{school_id}',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+# ============================================
+# BULK CACHE OPERATIONS
+# ============================================
+
+def invalidate_all_student_caches():
+    """Invalidate ALL student-related caches (use sparingly!)"""
+    patterns = [
+        'student_*',
+        '*_student_*',
+        'student_profile_*',
+        'student_progress_*',
+        'student_prediction_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_all_caches():
+    """Clear entire cache (nuclear option - use only in emergencies)"""
+    cache.clear()
+
+
+# ============================================
+# CACHE PATTERN UTILITIES
+# ============================================
+
 def delete_pattern_with_fallback(pattern):
-    """Delete pattern with fallback for cache backends without delete_pattern"""
+    """
+    Delete pattern with fallback for cache backends without delete_pattern.
+    Returns number of keys deleted, or -1 if unknown.
+    """
     try:
         return cache.delete_pattern(pattern)
     except AttributeError:
-        # Fallback for cache backends without delete_pattern
+        # Fallback: just clear everything (not ideal but works)
         cache.clear()
         return -1  # Unknown count
+
+
+def cache_exists(key):
+    """Check if a cache key exists"""
+    return cache.get(key) is not None
+
+
+def get_cache_ttl(key):
+    """
+    Get time-to-live for a cache key (if supported by backend).
+    Returns None if not supported or key doesn't exist.
+    """
+    try:
+        return cache.ttl(key)
+    except AttributeError:
+        return None
+
+
+# ============================================
+# CACHE STATISTICS (for monitoring)
+# ============================================
+
+def get_cache_stats():
+    """
+    Get cache statistics (if supported by backend).
+    Useful for monitoring cache performance.
+    """
+    try:
+        return cache.get_stats()
+    except AttributeError:
+        return {
+            'message': 'Cache backend does not support statistics',
+            'backend': str(type(cache))
+        }
+
+
+# ============================================
+# CACHE WARMING (Optional)
+# ============================================
+
+def warm_user_cache(user):
+    """
+    Pre-populate cache for a user.
+    Useful after login or significant data changes.
+    """
+    from .models import User, StudentProfile
+    
+    # Warm user queryset cache
+    cache_key = get_user_queryset_cache_key(user.id, user.role)
+    
+    if user.role == 'S':
+        # Warm student profile cache
+        try:
+            profile = StudentProfile.objects.select_related('user', 'school').get(user=user)
+            profile_cache_key = f'student_profile_user_{user.id}'
+            from .serializers import StudentProfileSerializer
+            serializer = StudentProfileSerializer(profile)
+            cache.set(profile_cache_key, serializer.data, 60 * 3)
+        except StudentProfile.DoesNotExist:
+            pass
+
+
+# ============================================
+# CACHE DECORATORS (Helper functions)
+# ============================================
+
+def cache_result(timeout=300, key_prefix=''):
+    """
+    Decorator to cache function results.
+    
+    Usage:
+        @cache_result(timeout=600, key_prefix='expensive_calc')
+        def expensive_calculation(param1, param2):
+            # ... expensive operation
+            return result
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            # Generate cache key from function name and args
+            key_data = f"{key_prefix}_{func.__name__}_{str(args)}_{str(kwargs)}"
+            cache_key = hashlib.md5(key_data.encode()).hexdigest()
+            
+            # Try to get from cache
+            result = cache.get(cache_key)
+            if result is not None:
+                return result
+            
+            # Execute function and cache result
+            result = func(*args, **kwargs)
+            cache.set(cache_key, result, timeout)
+            return result
+        
+        return wrapper
+    return decorator
