@@ -37,11 +37,10 @@ from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
 from django.views.decorators.cache import cache_page
 from django.utils.decorators import method_decorator
 from .throttles import (
-    RegisterStudentThrottle,  # This now exists
-    StatsThrottle,            # This now exists
-    SchoolUsersThrottle,      # This now exists
-    SchoolListThrottle,
-    SchoolCreateThrottle
+    RegisterStudentThrottle,StatsThrottle,SchoolUsersThrottle,
+    SchoolListThrottle,SchoolCreateThrottle,StudentProgressThrottle,
+    StudentProgressUpdateThrottle
+
 )
 from .cache_utils import (get_user_queryset_cache_key, get_user_stats_cache_key, 
                          invalidate_user_caches, invalidate_school_caches)
@@ -663,9 +662,47 @@ class DrivingSchoolViewSet(viewsets.ModelViewSet):
         
         return Response(stats)   
 
+# views.py - Complete StudentProfileViewSet
+
+from django.shortcuts import render
+from rest_framework import viewsets, status, permissions, filters
+from rest_framework.response import Response
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.throttling import UserRateThrottle
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from django.db import transaction
+from django.core.cache import cache
+from django.views.decorators.cache import cache_page
+from django.utils.decorators import method_decorator
+from rest_framework.exceptions import PermissionDenied
+
+from .models import StudentProfile
+from .serializers import StudentProfileSerializer
+from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
+                         IsPlatformAdminOrSchoolOwner)
+from .throttles import (RegisterStudentThrottle, StudentProgressThrottle,
+                       StudentProgressUpdateThrottle, StudentPerformancePredictionThrottle)
+from .cache_utils import (get_student_profile_cache_key, 
+                          invalidate_student_profile_cache,
+                          invalidate_school_caches)
+from .services import StudentProfileService
+
+User = get_user_model()
+
+
 class StudentProfileViewSet(viewsets.ModelViewSet):
     """
-    Manage student profiles
+    Manage student profiles with caching and rate limiting.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Query result caching for performance
+    - Rate limiting per action
+    - Automatic cache invalidation
+    
+    Access Control:
     - Platform Admins: Full access to all student profiles
     - School Owners: Manage students in their schools
     - Instructors: View students in their school
@@ -676,67 +713,110 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
     search_fields = ['user__username', 'user__email', 'user__first_name', 'user__last_name']
     ordering_fields = ['progress_theory', 'progress_driving', 'joined_at']
     ordering = ['-joined_at']
+    
     # Default throttling for the viewset
     throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
-        """Filter student profiles based on user role and school"""
+        """
+        Filter student profiles based on user role and school.
+        Implements query result caching for performance.
+        """
         user = self.request.user
 
-
         if not user.is_authenticated:
-            queryset = StudentProfile.objects.none()
+            return StudentProfile.objects.none()
+
+        # Generate cache key
+        cache_key = get_student_profile_cache_key(user.id, user.role)
+
+        # Only cache if NO query parameters (search/filter disables cache)
+        use_cache = not bool(self.request.query_params)
         
-        # Platform Admin sees all
-        elif user.role == 'A' and user.is_staff:
-            queryset = StudentProfile.objects.all().select_related('user', 'school')
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
         
-        # School Owner sees students in their schools
-        elif user.role == 'A':
-            queryset = StudentProfile.objects.filter(school__owner=user).select_related('user', 'school')
+        # Build queryset based on role
+        if user.role == 'A' and user.is_staff:
+            # Platform Admin sees all
+            queryset = StudentProfile.objects.all()
         
-        # Instructor sees students in their school
+        elif user.role == 'A' and not user.is_staff:
+            # School Owner sees students in their schools
+            queryset = StudentProfile.objects.filter(school__owner=user)
+        
         elif user.role == 'I':
-            # Get instructor's school
-            instructor_profile = user.student_profiles.filter(status='A').first()  # FIXED: status='A'
+            # Instructor sees students in their school
+            instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
                 queryset = StudentProfile.objects.filter(
                     school=instructor_profile.school,
                     user__role='S'  # Only students, not other instructors
-                ).select_related('user', 'school')
+                )
             else:
                 queryset = StudentProfile.objects.none()
         
-        # Student sees only their own profile
         elif user.role == 'S':
-            queryset = StudentProfile.objects.filter(user=user).select_related('user', 'school')       
+            # Student sees only their own profile
+            queryset = StudentProfile.objects.filter(user=user)
         
         else:
             queryset = StudentProfile.objects.none()
 
+        # Optimize query with select_related and prefetch_related
+        queryset = queryset.select_related('user', 'school').prefetch_related(
+            'user__student_profiles',
+            'school__student_profiles'
+        )
+
+        # Cache the queryset for 5 minutes if no query params
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+
         return queryset
 
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        if self.action == 'create':
+            return [RegisterStudentThrottle()]
+        elif self.action == 'progress':
+            return [StudentProgressThrottle()]
+        elif self.action == 'update_progress':
+            return [StudentProgressUpdateThrottle()]
+        elif self.action == 'performance_prediction':
+            return [StudentPerformancePredictionThrottle()]
+        return super().get_throttles()
+        
     def get_permissions(self):
         """Define permissions per action"""
         if self.action == 'create':
-            # Only platform admins and school owners can create student profiles
-            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner() ]
-        
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action in ['update', 'partial_update']:
-            # Students can update their own profile, admins/owners can update any
-            return [CanUpdateStudentProfile()]
-        
+            return [IsAuthenticated(), CanUpdateStudentProfile()]
         elif self.action == 'destroy':
-            # Only platform admins can delete student profiles
             return [IsAuthenticated(), IsPlatformAdmin()]
-        
         elif self.action == 'update_progress':
             return [IsAuthenticated(), IsInstructor()]
-        
         return [IsAuthenticated()]
 
+    def perform_create(self, serializer):
+        """Create student profile and invalidate caches"""
+        student = serializer.save()
+        
+        # Invalidate related caches
+        invalidate_student_profile_cache(student.user_id)
+        invalidate_school_caches(student.school_id)
+        
+        # Invalidate creator's cache
+        cache.delete(get_student_profile_cache_key(
+            self.request.user.id, 
+            self.request.user.role
+        ))
+
     def perform_update(self, serializer):
-        """Custom update logic with permission checks"""
+        """Update with permission checks and cache invalidation"""
         user = self.request.user
         instance = self.get_object()
         
@@ -744,54 +824,87 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         if user.role == 'S' and instance.user != user:
             raise PermissionDenied("You can only update your own profile.")
         
-        # School owners (admin but not staff) can only update profiles in their schools
-        if user.role == 'A' and not user.is_staff:  # FIXED: Added 'not user.is_staff'
+        # School owners can only update profiles in their schools
+        if user.role == 'A' and not user.is_staff:
             if instance.school.owner != user:
                 raise PermissionDenied("You can only update profiles in your own school.")
         
-        # Platform admins (is_staff=True) can update any profile
-        
+        # Save and invalidate caches
         serializer.save()
+        invalidate_student_profile_cache(instance.user_id)
+        invalidate_school_caches(instance.school_id)
 
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def perform_destroy(self, instance):
+        """Delete and invalidate caches"""
+        student_id = instance.user_id
+        school_id = instance.school_id
+        
+        instance.delete()
+        
+        # Invalidate caches
+        invalidate_student_profile_cache(student_id)
+        invalidate_school_caches(school_id)
+        
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[StudentProgressThrottle])
+    @method_decorator(cache_page(60 * 2))  # Cache for 2 minutes
     def progress(self, request, pk=None):
-        """Get detailed progress for a student"""
+        """
+        Get detailed progress for a student.
+        Cached to reduce database load.
+        """
         student_profile = self.get_object()
+        user = request.user
         
         # Check permissions
-        user = request.user
         if user.role == 'S' and student_profile.user != user:
             raise PermissionDenied("You can only view your own progress.")
         
         if user.role == 'I':
-            # Instructor can only view students in their school
             instructor_profile = user.student_profiles.filter(status='A').first()
             if not instructor_profile or instructor_profile.school != student_profile.school:
                 raise PermissionDenied("You can only view progress of students in your school.")
         
         if user.role == 'A' and not user.is_staff:
-            # School owner can only view students in their schools
             if student_profile.school.owner != user:
                 raise PermissionDenied("You can only view progress of students in your schools.")
         
-        # Calculate progress
-        completion_percentage = StudentProfileService.calculate_completion_percentage(student_profile)
+        # Calculate progress (use service layer)
+        completion_percentage = StudentProfileService.calculate_completion_percentage(
+            student_profile
+        )
         
         response_data = {
-            'student': student_profile.user.username,
+            'student': {
+                'id': student_profile.user.id,
+                'username': student_profile.user.username,
+                'full_name': student_profile.user.get_full_name(),
+            },
+            'school': {
+                'id': student_profile.school.id,
+                'name': student_profile.school.name,
+            },
             'completion_percentage': completion_percentage,
-            'theory_progress': student_profile.progress_theory,
-            'driving_progress': student_profile.progress_driving,
+            'theory_progress': float(student_profile.progress_theory),
+            'driving_progress': float(student_profile.progress_driving),
             'theory_hours': student_profile.total_hours_theory,
             'driving_hours': student_profile.total_hours_driving,
             'status': student_profile.get_status_display(),
+            'joined_at': student_profile.joined_at,
         }
         
         return Response(response_data)
 
-    @action(detail=True, methods=['POST'], permission_classes=[IsAuthenticated, IsInstructor])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsInstructor],
+            throttle_classes=[StudentProgressUpdateThrottle])
+    @transaction.atomic
     def update_progress(self, request, pk=None):
-        """Update student progress (for instructors only)"""
+        """
+        Update student progress (for instructors only).
+        Rate limited to prevent excessive updates.
+        """
         student_profile = self.get_object()
         instructor = request.user
         
@@ -804,6 +917,7 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         lesson_type = request.data.get('lesson_type')  # 'T' or 'D'
         hours_completed = request.data.get('hours_completed')
         
+        # Validation
         if not lesson_type or lesson_type not in ['T', 'D']:
             return Response(
                 {'error': 'Lesson type must be "T" (Theory) or "D" (Driving)'},
@@ -828,13 +942,22 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         # Check if student should be auto-completed
         StudentProfileService.auto_complete_student(student_profile)
         
+        # Invalidate caches
+        invalidate_student_profile_cache(student_profile.user_id)
+        invalidate_school_caches(student_profile.school_id)
+        
         # Return updated profile
         serializer = self.get_serializer(student_profile)
         return Response(serializer.data)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
+    @method_decorator(cache_page(60 * 3))  # Cache for 3 minutes
     def my_profile(self, request):
-        """Get current user's student profile"""
+        """
+        Get current user's student profile.
+        Cached for better performance.
+        """
         user = request.user
         
         if user.role != 'S':
@@ -843,20 +966,34 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Try cache first
+        cache_key = f'student_profile_user_{user.id}'
+        cached_profile = cache.get(cache_key)
+        
+        if cached_profile:
+            return Response(cached_profile)
+        
         try:
-            profile = StudentProfile.objects.get(user=user)
+            profile = StudentProfile.objects.select_related('user', 'school').get(user=user)
             serializer = self.get_serializer(profile)
+            
+            # Cache the response
+            cache.set(cache_key, serializer.data, 60 * 3)
+            
             return Response(serializer.data)
         except StudentProfile.DoesNotExist:
             return Response(
                 {'error': 'Student profile not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-    #DSS-19-PerformancePredictionViewSet
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[StudentPerformancePredictionThrottle])
     def performance_prediction(self, request, pk=None):
         """
         Get performance prediction for a student.
+        Rate limited due to computational cost.
         
         GET /api/student-profiles/{id}/performance_prediction/
         
@@ -882,12 +1019,22 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
             if student_profile.school.owner != user:
                 raise PermissionDenied("You can only view predictions for students in your schools")
         
+        # Check cache first (predictions are expensive to compute)
+        cache_key = f'student_prediction_{student_profile.id}'
+        cached_prediction = cache.get(cache_key)
+        
+        if cached_prediction:
+            return Response(cached_prediction)
+        
         # Generate/retrieve prediction
         from .services import StudentProgressService
-        prediction = StudentProgressService.calculate_completion_estimate(student_profile, force_refresh=False)
+        prediction = StudentProgressService.calculate_completion_estimate(
+            student_profile, 
+            force_refresh=False
+        )
         
         if not prediction:
-            return Response({
+            response_data = {
                 'student': {
                     'id': student_profile.id,
                     'name': student_profile.user.get_full_name() or student_profile.user.username
@@ -897,20 +1044,22 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
                     'days_enrolled': 7,
                     'lessons_attended': 3
                 }
-            }, status=status.HTTP_200_OK)
+            }
+            return Response(response_data, status=status.HTTP_200_OK)
         
         # Calculate additional metrics
         days_until_completion = None
         if prediction.predicted_completion_date:
-            from django.utils import timezone
             delta = prediction.predicted_completion_date - timezone.now().date()
             days_until_completion = delta.days
         
         # Risk level
-        risk_level = StudentProgressService.calculate_risk_level(prediction.success_probability)
+        risk_level = StudentProgressService.calculate_risk_level(
+            prediction.success_probability
+        )
         
         # Format response
-        return Response({
+        response_data = {
             'student': {
                 'id': student_profile.id,
                 'name': student_profile.user.get_full_name() or student_profile.user.username,
@@ -920,7 +1069,10 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
             'current_progress': {
                 'theory': float(student_profile.progress_theory),
                 'driving': float(student_profile.progress_driving),
-                'overall': round((student_profile.progress_theory + student_profile.progress_driving) / 2, 2)
+                'overall': round(
+                    (student_profile.progress_theory + student_profile.progress_driving) / 2, 
+                    2
+                )
             },
             'prediction': {
                 'predicted_completion_date': prediction.predicted_completion_date,
@@ -937,11 +1089,22 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
             'recommendations': prediction.recommendations or [],
             'risk_summary': {
                 'total_risks': len(prediction.risk_factors) if prediction.risk_factors else 0,
-                'high_severity': len([r for r in (prediction.risk_factors or {}).values() if r.get('severity') == 'high']),
-                'medium_severity': len([r for r in (prediction.risk_factors or {}).values() if r.get('severity') == 'medium'])
+                'high_severity': len([
+                    r for r in (prediction.risk_factors or {}).values() 
+                    if r.get('severity') == 'high'
+                ]),
+                'medium_severity': len([
+                    r for r in (prediction.risk_factors or {}).values() 
+                    if r.get('severity') == 'medium'
+                ])
             },
             'generated_at': timezone.now().isoformat()
-        })
+        }
+        
+        # Cache prediction for 10 minutes (predictions change slowly)
+        cache.set(cache_key, response_data, 60 * 10)
+        
+        return Response(response_data)
 
 class LessonViewSet(viewsets.ModelViewSet):
     """
