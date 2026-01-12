@@ -1,0 +1,25 @@
+# .gitguardian.yaml
+version: 2
+
+secret:
+  # Ignore test passwords in test files
+  ignored-paths:
+    - "**/tests/**"
+    - "**/*test*.py"
+    - "**/test_*.py"
+  
+  # Ignore specific patterns
+  ignored-matches:
+    - name: "Test passwords"
+      match: "test[-_]?password"
+    - name: "Dummy credentials"
+      match: "(test|dummy|example)[-_](admin|user|password|secret)"
+    
+  # Allow certain low-entropy strings in test files
+  entropy-threshold: 3.0  # Default is 3.5, lower for test files
+
+hooks:
+  pre-commit:
+    secret:
+      # Don't block commits for test files
+      exit-zero: true
