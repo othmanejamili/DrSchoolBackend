@@ -234,6 +234,122 @@ def invalidate_all_caches():
     """Clear entire cache (nuclear option - use only in emergencies)"""
     cache.clear()
 
+# ============================================
+# LESSON CACHE KEYS
+# ============================================
+    
+def get_lesson_queryset_cache_key(user_id, role):
+    """Generate cache key for lesson queryset"""
+    return f'lessons_queryset_{user_id}_{role}'
+
+def get_lesson_detail_cache_key(lesson_id):
+    """Generate cache key for single lesson"""
+    return f'lesson_detail_{lesson_id}'
+
+def get_lesson_attendance_cache_key(lesson_id):
+    """Generate cache key for lesson attendance"""
+    return f'lesson_attendance_{lesson_id}'
+
+def get_lesson_feedback_cache_key(lesson_id):
+    """Generate cache key for lesson feedback"""
+    return f'lesson_feedback_{lesson_id}'
+
+def get_lesson_schedule_cache_key(lesson_id):
+    """Generate cache key for lesson schedule"""
+    return f'lesson_schedule_{lesson_id}'
+
+def get_upcoming_lessons_cache_key(user_id, role):
+    """Generate cache key for upcoming lessons"""
+    return f'upcoming_lessons_{user_id}_{role}'
+
+
+def get_my_lessons_cache_key(user_id, role, status_filter=None):
+    """Generate cache key for my lessons"""
+    status_part = f'_{status_filter}' if status_filter else '_all'
+    return f'my_lessons_{user_id}_{role}{status_part}'
+
+
+def get_lesson_statistics_cache_key(user_id, role):
+    """Generate cache key for lesson statistics"""
+    return f'lesson_stats_{user_id}_{role}'
+
+# ============================================
+# LESSON CACHE INVALIDATION
+# ============================================
+def invalidate_lesson_cache(lesson_id):
+    """Invalidate all caches related to a specific lesson"""
+    if not lesson_id:
+        return 
+    
+    # Delete specific lesson caches
+    cache_key = [
+        get_lesson_detail_cache_key(lesson_id),
+        get_lesson_attendance_cache_key(lesson_id),
+        get_lesson_feedback_cache_key(lesson_id),
+        get_lesson_schedule_cache_key(lesson_id)
+    ]
+
+    for key in cache_key:
+        cache.delete(key)
+
+    #Delete patterns
+    patterns = [
+        f'lesson_{lesson_id}_*',
+        f'*_lesson_{lesson_id}_*'
+    ]
+
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AssertionError:
+            pass
+    
+def invalidate_lesson_queryset_caches():
+    """Invalidate all lesson queryset caches"""
+    patterns = [
+        'lessons_queryset_*',
+        'upcoming_lessons_*',
+        'my_lessons_*',
+        'lesson_stats_*',
+    ]
+
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+def invalidate_instructor_lesson_caches(instructor_id):
+    """Invalidate caches for all lessons of an instructor"""
+    patterns = [
+        f'lessons_queryset_{instructor_id}_*',
+        f'upcoming_lessons_{instructor_id}_*',
+        f'my_lessons_{instructor_id}_*',
+        f'lesson_stats_{instructor_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+        
+def invalidate_school_lesson_caches(school_id):
+    """Invalidate caches for all lessons in a school"""
+
+    patterns = [
+        f'*_school_{school_id}_lessons_*',
+        f'lessons_*_school_{school_id}_*',
+    ]
+
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+        
+
+
 
 # ============================================
 # CACHE PATTERN UTILITIES

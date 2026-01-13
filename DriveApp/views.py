@@ -37,14 +37,26 @@ from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
 from django.views.decorators.cache import cache_page
 from django.utils.decorators import method_decorator
 from .throttles import (
-    RegisterStudentThrottle,StatsThrottle,SchoolUsersThrottle,
-    SchoolListThrottle,SchoolCreateThrottle,StudentProgressThrottle,
-    StudentProgressUpdateThrottle
-
-)
-from .cache_utils import (get_user_queryset_cache_key, get_user_stats_cache_key, 
-                         invalidate_user_caches, invalidate_school_caches)
-
+        RegisterStudentThrottle,StatsThrottle,SchoolUsersThrottle,
+        SchoolListThrottle,SchoolCreateThrottle,StudentProgressThrottle,
+        StudentProgressUpdateThrottle, StudentPerformancePredictionThrottle,
+        LessonListThrottle, LessonCreateThrottle,LessonUpdateThrottle, MarkAttendanceThrottle,
+        CompleteLessonThrottle, LessonStatisticsThrottle,LessonFeedbackThrottle
+    )
+from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
+                            get_user_queryset_cache_key, invalidate_user_caches,
+                            invalidate_school_caches, get_user_stats_cache_key,
+                            get_lesson_queryset_cache_key,
+                            get_lesson_attendance_cache_key,
+                            get_lesson_feedback_cache_key,
+                            get_lesson_schedule_cache_key,
+                            get_upcoming_lessons_cache_key,
+                            get_my_lessons_cache_key,
+                            get_lesson_statistics_cache_key,
+                            invalidate_lesson_cache,
+                            invalidate_lesson_queryset_caches,
+                            invalidate_instructor_lesson_caches,
+                            invalidate_school_lesson_caches)
 
 User = get_user_model()
 
@@ -664,34 +676,6 @@ class DrivingSchoolViewSet(viewsets.ModelViewSet):
 
 # views.py - Complete StudentProfileViewSet
 
-from django.shortcuts import render
-from rest_framework import viewsets, status, permissions, filters
-from rest_framework.response import Response
-from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.throttling import UserRateThrottle
-from django.contrib.auth import get_user_model
-from django.utils import timezone
-from django.db import transaction
-from django.core.cache import cache
-from django.views.decorators.cache import cache_page
-from django.utils.decorators import method_decorator
-from rest_framework.exceptions import PermissionDenied
-
-from .models import StudentProfile
-from .serializers import StudentProfileSerializer
-from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
-                         IsPlatformAdminOrSchoolOwner)
-from .throttles import (RegisterStudentThrottle, StudentProgressThrottle,
-                       StudentProgressUpdateThrottle, StudentPerformancePredictionThrottle)
-from .cache_utils import (get_student_profile_cache_key, 
-                          invalidate_student_profile_cache,
-                          invalidate_school_caches)
-from .services import StudentProfileService
-
-User = get_user_model()
-
-
 class StudentProfileViewSet(viewsets.ModelViewSet):
     """
     Manage student profiles with caching and rate limiting.
@@ -1108,7 +1092,13 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
 
 class LessonViewSet(viewsets.ModelViewSet):
     """
-    Manage lessons in the platform
+    Manage lessons in the platform with caching and rate limiting.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Query result caching for performance
+    - Rate limiting per action
+    - Automatic cache invalidation
     
     Access Control:
     - Platform Admins: Full access to all lessons
@@ -1118,61 +1108,99 @@ class LessonViewSet(viewsets.ModelViewSet):
     """
     serializer_class = LessonSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
-    filterset_fields = ['lesson_type', 'status', 'instructor', 'school']  # Add this line
+    filterset_fields = ['lesson_type', 'status', 'instructor', 'school']
     search_fields = ['title', 'description']
     ordering_fields = ['date', 'status', 'lesson_type']
     ordering = ['-date']
+    
+    # Default throttling
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
-        """Filter lessons based on user role and school"""
+        """
+        Filter lessons based on user role and school.
+        Implements query result caching.
+        """
         user = self.request.user
+        
         if not user.is_authenticated:
             return Lesson.objects.none()
         
-        # Platform Admin (staff) sees all lessons
+        # Generate cache key
+        cache_key = get_lesson_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role
         if user.role == 'A' and user.is_staff:
-            return Lesson.objects.all().select_related('instructor', 'school')
+            # Platform Admin sees all lessons
+            queryset = Lesson.objects.all()
         
-        # School Owner (admin but not staff) sees lessons in their schools
-        if user.role == 'A' and not user.is_staff:
-            return Lesson.objects.filter(
-                school__owner=user
-            ).select_related('instructor', 'school')
+        elif user.role == 'A' and not user.is_staff:
+            # School Owner sees lessons in their schools
+            queryset = Lesson.objects.filter(school__owner=user)
         
-        # Instructor sees their own lessons
-        if user.role == 'I':
-            return Lesson.objects.filter(
-                instructor=user
-            ).select_related('instructor', 'school')
+        elif user.role == 'I':
+            # Instructor sees their own lessons
+            queryset = Lesson.objects.filter(instructor=user)
         
-        # Student sees lessons in their school
-        if user.role == 'S':
+        elif user.role == 'S':
+            # Student sees lessons in their school
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
-                return Lesson.objects.filter(
-                    school=student_profile.school
-                ).select_related('instructor', 'school')
+                queryset = Lesson.objects.filter(school=student_profile.school)
+            else:
+                queryset = Lesson.objects.none()
+        else:
+            queryset = Lesson.objects.none()
         
-        return Lesson.objects.none()
+        # Optimize query
+        queryset = queryset.select_related('instructor', 'school').prefetch_related(
+            'lesson_attendance__student',
+            'lesson_feedback'
+        )
+        
+        # Cache the queryset for 3 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 3)
+        
+        return queryset
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [LessonListThrottle()],
+            'create': [LessonCreateThrottle()],
+            'update': [LessonUpdateThrottle()],
+            'partial_update': [LessonUpdateThrottle()],
+            'mark_attendance': [MarkAttendanceThrottle()],
+            'complete_lesson': [CompleteLessonThrottle()],
+            'statistics': [LessonStatisticsThrottle()],
+            'feedback': [LessonFeedbackThrottle()],
+        }
+        
+        return throttle_map.get(self.action, super().get_throttles())
     
     def get_permissions(self):
         """Define permissions per action"""
         if self.action == 'create':
-            return [IsAuthenticated(),IsPlatformAdminOrSchoolOwner()]
-        
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action in ['update', 'partial_update']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-        
         elif self.action == 'destroy':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-
         elif self.action in ['mark_attendance', 'complete_lesson']:
             return [IsAuthenticated(), IsInstructor()]
-        
         return [IsAuthenticated()]
     
     def perform_create(self, serializer):
-        """Create lesson with validation"""
+        """Create lesson with validation and cache invalidation"""
         user = self.request.user
         instructor = serializer.validated_data.get('instructor')
         
@@ -1182,9 +1210,10 @@ class LessonViewSet(viewsets.ModelViewSet):
         
         # Platform admin can create for any instructor
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            lesson = serializer.save()
+            invalidate_lesson_queryset_caches()
+            invalidate_instructor_lesson_caches(instructor.id)
             return
-        
         
         # School owner can create for instructors in their schools
         if user.role == 'A' and not user.is_staff:
@@ -1192,70 +1221,81 @@ class LessonViewSet(viewsets.ModelViewSet):
             if not instructor_profile:
                 raise PermissionDenied("Instructor has no active school profile")
             
-            # Check if instructor is in owner's school
-
-            
-            serializer.save()
+            lesson = serializer.save()
+            invalidate_lesson_queryset_caches()
+            invalidate_instructor_lesson_caches(instructor.id)
+            invalidate_school_lesson_caches(instructor_profile.school_id)
             return
         
         raise PermissionDenied("You don't have permission to create lessons")
     
     def perform_update(self, serializer):
-        """Update lesson with permission checks"""
+        """Update lesson with permission checks and cache invalidation"""
         user = self.request.user
         instance = self.get_object()
 
-        # Platform Admin (staff) can update any lesson
+        # Platform Admin can update any lesson
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            lesson = serializer.save()
+            self._invalidate_lesson_caches(instance)
             return
 
         # School Owner can update lessons in their schools
         if user.role == 'A' and not user.is_staff:
             instructor_profile = instance.instructor.student_profiles.filter(status='A').first()
             if instructor_profile and instructor_profile.school.owner == user:
-                serializer.save()
+                lesson = serializer.save()
+                self._invalidate_lesson_caches(instance)
                 return
             raise PermissionDenied("You can only update lessons in your own schools")
         
         # Instructor can update their own lessons
         if user.role == 'I':
             if instance.instructor == user:
-                serializer.save()
+                lesson = serializer.save()
+                self._invalidate_lesson_caches(instance)
                 return
             raise PermissionDenied("You can only update your own lessons")
         
-        # Students cannot update lessons
-        if user.role == 'S':
-            raise PermissionDenied("Students cannot update lessons")
-        
         raise PermissionDenied("You don't have permission to update this lesson")
     
-    def perform_destroy(self, serializer):
-        """Delete lesson with permission checks"""
-        user = self.request.user
-        instance = self.get_object()
+    def perform_destroy(self, instance):
+        """Delete lesson with cache invalidation"""
+        lesson_id = instance.id
+        instructor_id = instance.instructor_id
+        school_id = instance.school_id
         
-        # Only platform admins and school owners can delete lessons
-        if user.role == 'A' and user.is_staff:
-            instance.delete()
-            return
+        instance.delete()
         
-        if user.role == 'A' and not user.is_staff:
-            instructor_profile = instance.instructor.student_profiles.filter(status='A').first()
-            if instructor_profile and instructor_profile.school.owner == user:
-                instance.delete()
-                return
-        
-        raise PermissionDenied("You don't have permission to delete this lesson")
+        # Invalidate caches
+        invalidate_lesson_cache(lesson_id)
+        invalidate_lesson_queryset_caches()
+        invalidate_instructor_lesson_caches(instructor_id)
+        invalidate_school_lesson_caches(school_id)
     
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def _invalidate_lesson_caches(self, lesson):
+        """Helper method to invalidate all caches related to a lesson"""
+        invalidate_lesson_cache(lesson.id)
+        invalidate_lesson_queryset_caches()
+        invalidate_instructor_lesson_caches(lesson.instructor_id)
+        if lesson.school_id:
+            invalidate_school_lesson_caches(lesson.school_id)
+    
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[UserRateThrottle])
     def attendance(self, request, pk=None):
-        """Get attendance records for a lesson"""
+        """
+        Get attendance records for a lesson.
+        Cached for 2 minutes.
+        """
         lesson = self.get_object()
         user = request.user
-
-        # Students can only view their own attendance
+        
+        # Check cache
+        cache_key = get_lesson_attendance_cache_key(lesson.id)
+        
+        # Students can only view their own attendance (no cache)
         if user.role == 'S':
             attendance_records = Attendance.objects.filter(
                 lesson=lesson,
@@ -1268,26 +1308,42 @@ class LessonViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_404_NOT_FOUND
                 )
         else:
-            # Admins and instructors can view all attendance
+            # Try cache for admin/instructor views
+            cached_data = cache.get(cache_key)
+            if cached_data is not None:
+                return Response(cached_data)
+            
+            # Query database
             attendance_records = Attendance.objects.filter(
                 lesson=lesson
             ).select_related('student__user')
         
         serializer = AttendanceSerializer(attendance_records, many=True)
-
-        return Response({
+        
+        response_data = {
             'lesson': lesson.title,
             'lesson_date': lesson.date,
             'total_attendance': attendance_records.count(),
             'present_count': attendance_records.filter(presence=True).count(),
             'absent_count': attendance_records.filter(presence=False).count(),
             'attendance_list': serializer.data
-        })
+        }
+        
+        # Cache for 2 minutes (only for admin/instructor)
+        if user.role != 'S':
+            cache.set(cache_key, response_data, 60 * 2)
+        
+        return Response(response_data)
     
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsInstructor])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsInstructor],
+            throttle_classes=[MarkAttendanceThrottle])
     @transaction.atomic
     def mark_attendance(self, request, pk=None):
-        """Mark attendance for multiple students in a lesson"""
+        """
+        Mark attendance for multiple students in a lesson.
+        Rate limited to prevent excessive updates.
+        """
         lesson = self.get_object()
         instructor = request.user
 
@@ -1322,12 +1378,12 @@ class LessonViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validate students exist and are active in this school
+        # Validate students
         students = StudentProfile.objects.filter(
             id__in=student_ids,
             school=instructor_profile.school,
             status='A',
-            user__role='S'  # Only actual students
+            user__role='S'
         )
         
         # Check if all students were found
@@ -1375,6 +1431,10 @@ class LessonViewSet(viewsets.ModelViewSet):
                     student, lesson.lesson_type, hours_completed
                 )
         
+        # Invalidate caches
+        invalidate_lesson_cache(lesson.id)
+        cache.delete(get_lesson_attendance_cache_key(lesson.id))
+        
         # Return response
         serializer = AttendanceSerializer(attendance_records, many=True)
         return Response({
@@ -1384,9 +1444,11 @@ class LessonViewSet(viewsets.ModelViewSet):
             'attendance_records': serializer.data
         }, status=status.HTTP_200_OK)
     
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated])
+    @method_decorator(cache_page(60 * 5))  # Cache for 5 minutes
     def schedule(self, request, pk=None):
-        """Get schedule for this lesson"""
+        """Get schedule for this lesson (cached)"""
         lesson = self.get_object()
         
         try:
@@ -1399,11 +1461,23 @@ class LessonViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[LessonFeedbackThrottle])
     def feedback(self, request, pk=None):
-        """Get feedback for this lesson"""
+        """
+        Get feedback for this lesson.
+        Cached for 3 minutes.
+        """
         lesson = self.get_object()
         user = request.user
+        
+        # Check cache (only for admin/instructor)
+        if user.role != 'S':
+            cache_key = get_lesson_feedback_cache_key(lesson.id)
+            cached_data = cache.get(cache_key)
+            if cached_data is not None:
+                return Response(cached_data)
         
         # Students can only view their own feedback
         if user.role == 'S':
@@ -1422,17 +1496,28 @@ class LessonViewSet(viewsets.ModelViewSet):
         # Calculate average rating
         avg_rating = feedback_records.aggregate(avg=Avg('rating'))['avg'] or 0
         
-        return Response({
+        response_data = {
             'lesson': lesson.title,
             'lesson_date': lesson.date,
             'total_feedback': feedback_records.count(),
             'average_rating': round(avg_rating, 2),
             'feedback_list': serializer.data
-        })
+        }
+        
+        # Cache for 3 minutes (only for admin/instructor)
+        if user.role != 'S':
+            cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
     
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsInstructor])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsInstructor],
+            throttle_classes=[CompleteLessonThrottle])
     def complete_lesson(self, request, pk=None):
-        """Mark lesson as completed"""
+        """
+        Mark lesson as completed.
+        Rate limited to prevent accidental multiple completions.
+        """
         lesson = self.get_object()
         instructor = request.user
         
@@ -1457,25 +1542,36 @@ class LessonViewSet(viewsets.ModelViewSet):
         # Mark lesson as completed using service
         lesson = LessonService.mark_lesson_completed(lesson)
         
+        # Invalidate caches
+        self._invalidate_lesson_caches(lesson)
+        
         serializer = self.get_serializer(lesson)
         return Response({
             'message': 'Lesson marked as completed',
             'lesson': serializer.data
         })
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
     def upcoming(self, request):
-        """Get upcoming lessons for the current user"""
+        """
+        Get upcoming lessons for the current user.
+        Cached for 2 minutes.
+        """
         user = request.user
         now = timezone.now()
         
+        # Check cache
+        cache_key = get_upcoming_lessons_cache_key(user.id, user.role)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         # Filter based on user role
         if user.role == 'A' and user.is_staff:
-            # Platform admin sees all upcoming lessons
             queryset = Lesson.objects.filter(date__gte=now, status='scheduled')
         
         elif user.role == 'A' and not user.is_staff:
-            # School owner sees upcoming lessons in their schools
             queryset = Lesson.objects.filter(
                 instructor__student_profiles__school__owner=user,
                 date__gte=now,
@@ -1483,7 +1579,6 @@ class LessonViewSet(viewsets.ModelViewSet):
             )
         
         elif user.role == 'I':
-            # Instructor sees their upcoming lessons
             queryset = Lesson.objects.filter(
                 instructor=user,
                 date__gte=now,
@@ -1491,11 +1586,10 @@ class LessonViewSet(viewsets.ModelViewSet):
             )
         
         elif user.role == 'S':
-            # Student sees upcoming lessons in their school
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
                 queryset = Lesson.objects.filter(
-                    instructor__student_profiles__school=student_profile.school,
+                    school=student_profile.school,
                     date__gte=now,
                     status='scheduled'
                 ).distinct()
@@ -1505,24 +1599,40 @@ class LessonViewSet(viewsets.ModelViewSet):
             queryset = Lesson.objects.none()
         
         # Apply ordering and pagination
-        queryset = queryset.order_by('date').select_related('instructor')
+        queryset = queryset.order_by('date').select_related('instructor', 'school')
         page = self.paginate_queryset(queryset)
+        
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            response_data = self.get_paginated_response(serializer.data).data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            response_data = serializer.data
         
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        # Cache for 2 minutes
+        cache.set(cache_key, response_data, 60 * 2)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
     def my_lessons(self, request):
-        """Get lessons for the current user based on their role"""
+        """
+        Get lessons for the current user based on their role.
+        Cached for 3 minutes.
+        """
         user = request.user
+        status_filter = request.query_params.get('status')
+        
+        # Check cache (with status filter in key)
+        cache_key = get_my_lessons_cache_key(user.id, user.role, status_filter)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         if user.role == 'I':
             queryset = Lesson.objects.filter(instructor=user)
         elif user.role == 'S':
-            # Get lessons where student has attendance record
             queryset = Lesson.objects.filter(
                 lesson_attendance__student__user=user
             ).distinct()
@@ -1533,26 +1643,41 @@ class LessonViewSet(viewsets.ModelViewSet):
             )
         
         # Apply filters
-        status_filter = request.query_params.get('status')
         if status_filter:
             queryset = queryset.filter(status=status_filter)
         
         # Apply ordering
-        queryset = queryset.order_by('-date').select_related('instructor')
+        queryset = queryset.order_by('-date').select_related('instructor', 'school')
         
         # Paginate
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            response_data = self.get_paginated_response(serializer.data).data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            response_data = serializer.data
         
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        # Cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[LessonStatisticsThrottle])
     def statistics(self, request):
-        """Get lesson statistics for the current user"""
+        """
+        Get lesson statistics for the current user.
+        Heavily cached (5 minutes) due to expensive calculations.
+        """
         user = request.user
+        
+        # Check cache
+        cache_key = get_lesson_statistics_cache_key(user.id, user.role)
+        cached_stats = cache.get(cache_key)
+        if cached_stats is not None:
+            return Response(cached_stats)
         
         if user.role == 'I':
             # Instructor statistics
@@ -1575,7 +1700,10 @@ class LessonViewSet(viewsets.ModelViewSet):
             # Student statistics
             student_profile = user.student_profiles.filter(status='A').first()
             if not student_profile:
-                return Response({'error': 'No active student profile found'}, status=404)
+                return Response(
+                    {'error': 'No active student profile found'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
             
             attended = Attendance.objects.filter(
                 student=student_profile,
@@ -1599,8 +1727,11 @@ class LessonViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Cache for 5 minutes
+        cache.set(cache_key, stats, 60 * 5)
+        
         return Response(stats)
-
+    
 class AttendanceViewSet(viewsets.ModelViewSet):
 
     serializer_class = AttendanceSerializer
