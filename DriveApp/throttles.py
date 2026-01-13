@@ -97,6 +97,30 @@ class LessonFeedbackThrottle(UserRateThrottle):
     """Limit feedback viewing"""
     scope = 'lesson_feedback'
 
+
+# ============================================
+# ATTENDANCE MANAGEMENT THROTTLES
+# ============================================
+
+class AttendanceListThrottle(UserRateThrottle):
+    """Limit attendance listing"""
+    scope = 'attendance_list'
+
+class AttendanceCreateThrottle(UserRateThrottle):
+    """Limit attendance creation (Instructors/Admins)"""
+    scope = 'attendance_create'
+
+class AttendanceUpdateThrottle(UserRateThrottle):
+    """Limit attendance updates"""
+    scope = 'attendance_update'
+
+class AttendanceBulkCreateThrottle(UserRateThrottle):
+    """Limit bulk attendance creation (more restrictive)"""
+    scope = 'attendance_bulk_create'
+
+class AttendanceStatisticsThrottle(UserRateThrottle):
+    """Limit attendance statistics queries"""
+    scope = 'attendance_stats'
 # ============================================
 # GENERAL PURPOSE THROTTLES
 # ============================================

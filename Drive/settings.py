@@ -231,6 +231,12 @@ REST_FRAMEWORK = {
         'lesson_stats': '60/minute',        # Lesson statistics
         'lesson_feedback': '100/hour',      # Viewing feedback
 
+        # Attendance management
+        'attendance_list': '100/min',
+        'attendance_create': '50/hour',
+        'attendance_update': '60/hour',
+        'attendance_bulk_create': '10/hour',  # More restrictive
+        'attendance_stats': '50/min',
     },
     
     # Filtering
@@ -491,4 +497,22 @@ CACHE_TIMEOUTS = {
     'upcoming_lessons': 60 * 2,         # 2 minutes
     'my_lessons': 60 * 3,               # 3 minutes
     'lesson_statistics': 60 * 5,        # 5 minutes (expensive calculation)
+
+        'attendance_queryset': 60 * 3,      # 3 minutes for attendance lists
+    'attendance_detail': 60 * 5,        # 5 minutes for single attendance record
+    
+    # Custom Attendance Endpoints
+    'my_attendance': 60 * 2,            # 2 minutes for student's own attendance
+    'lesson_attendance_summary': 60 * 3, # 3 minutes for lesson summaries
+    'student_attendance_summary': 60 * 3, # 3 minutes for student summaries
+    'attendance_statistics': 60 * 5,    # 5 minutes for statistics (expensive queries)
+    
+    # Bulk Operations Cache
+    'attendance_bulk_operations': 60 * 10, # 10 minutes for bulk operation results
+    
+    # Filters and Search Results
+    'attendance_filters': 60 * 2,       # 2 minutes for filtered results
+     
+     #Default
+     'default': 60 * 5,
 }
