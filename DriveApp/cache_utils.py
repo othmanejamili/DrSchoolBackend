@@ -350,6 +350,166 @@ def invalidate_school_lesson_caches(school_id):
         
 
 # ============================================
+# FEEDBACK CACHE KEYS
+# ============================================
+
+def get_feedback_queryset_cache_key(user_id, role):
+    """Generate cache key for feedback queryset"""
+    return f'feedback_queryset_{user_id}_{role}'
+
+
+def get_feedback_detail_cache_key(feedback_id):
+    """Generate cache key for single feedback"""
+    return f'feedback_detail_{feedback_id}'
+
+
+def get_lesson_feedback_cache_key(lesson_id):
+    """Generate cache key for lesson's feedback list"""
+    return f'lesson_feedback_{lesson_id}'
+
+
+def get_student_feedback_cache_key(student_id):
+    """Generate cache key for student's feedback list"""
+    return f'student_feedback_{student_id}'
+
+
+def get_instructor_feedback_cache_key(instructor_id):
+    """Generate cache key for instructor's feedback"""
+    return f'instructor_feedback_{instructor_id}'
+
+
+def get_my_feedback_cache_key(user_id):
+    """Generate cache key for current student's feedback"""
+    return f'my_feedback_{user_id}'
+
+
+def get_lesson_feedback_stats_cache_key(lesson_id):
+    """Generate cache key for lesson feedback statistics"""
+    return f'lesson_feedback_stats_{lesson_id}'
+
+
+def get_instructor_feedback_stats_cache_key(instructor_id):
+    """Generate cache key for instructor feedback statistics"""
+    return f'instructor_feedback_stats_{instructor_id}'
+
+
+# ============================================
+# FEEDBACK CACHE INVALIDATION
+# ============================================
+
+def invalidate_feedback_cache(feedback_id):
+    """Invalidate all caches related to a specific feedback"""
+    if not feedback_id:
+        return
+    
+    cache_keys = [
+        get_feedback_detail_cache_key(feedback_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    # Delete patterns
+    patterns = [
+        f'feedback_{feedback_id}_*',
+        f'*_feedback_{feedback_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_feedback_queryset_caches():
+    """Invalidate all feedback queryset caches"""
+    patterns = [
+        'feedback_queryset_*',
+        'my_feedback_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_lesson_feedback_caches(lesson_id):
+    """Invalidate caches for all feedback of a lesson"""
+    if not lesson_id:
+        return
+    
+    cache_keys = [
+        get_lesson_feedback_cache_key(lesson_id),
+        get_lesson_feedback_stats_cache_key(lesson_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    patterns = [
+        f'lesson_feedback_{lesson_id}_*',
+        f'lesson_{lesson_id}_feedback_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_student_feedback_caches(student_id):
+    """Invalidate caches for all feedback from a student"""
+    if not student_id:
+        return
+    
+    cache_keys = [
+        get_student_feedback_cache_key(student_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    patterns = [
+        f'student_feedback_{student_id}_*',
+        f'my_feedback_{student_id}',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_instructor_feedback_caches(instructor_id):
+    """Invalidate caches for all feedback for an instructor"""
+    if not instructor_id:
+        return
+    
+    cache_keys = [
+        get_instructor_feedback_cache_key(instructor_id),
+        get_instructor_feedback_stats_cache_key(instructor_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    patterns = [
+        f'instructor_feedback_{instructor_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+        
+# ============================================
 # ATTENDANCE CACHE KEYS
 # ============================================
 

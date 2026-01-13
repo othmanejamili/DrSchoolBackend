@@ -129,7 +129,38 @@ class BurstRateThrottle(UserRateThrottle):
     """Higher rate limit for burst traffic"""
     scope = 'burst'
 
+# ============================================
+# FEEDBACK MANAGEMENT THROTTLES
+# ============================================
 
+class FeedbackListThrottle(UserRateThrottle):
+    """Limit feedback listing"""
+    scope = 'feedback_list'
+
+
+class FeedbackCreateThrottle(UserRateThrottle):
+    """Limit feedback creation (students only)"""
+    scope = 'feedback_create'
+
+
+class FeedbackUpdateThrottle(UserRateThrottle):
+    """Limit feedback updates (students editing their own)"""
+    scope = 'feedback_update'
+
+
+class FeedbackLessonViewThrottle(UserRateThrottle):
+    """Limit lesson feedback viewing"""
+    scope = 'feedback_lesson_view'
+
+
+class FeedbackMyViewThrottle(UserRateThrottle):
+    """Limit student's own feedback viewing"""
+    scope = 'feedback_my_view'
+
+
+class FeedbackInstructorViewThrottle(UserRateThrottle):
+    """Limit instructor feedback viewing"""
+    scope = 'feedback_instructor_view'
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================

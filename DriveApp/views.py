@@ -43,7 +43,8 @@ from .throttles import (
         LessonListThrottle, LessonCreateThrottle,LessonUpdateThrottle, MarkAttendanceThrottle,
         CompleteLessonThrottle, LessonStatisticsThrottle,LessonFeedbackThrottle,
         AttendanceListThrottle, AttendanceCreateThrottle, AttendanceUpdateThrottle, AttendanceBulkCreateThrottle,
-        AttendanceStatisticsThrottle,
+        AttendanceStatisticsThrottle,FeedbackListThrottle, FeedbackCreateThrottle, FeedbackUpdateThrottle, FeedbackLessonViewThrottle,
+        FeedbackMyViewThrottle, FeedbackInstructorViewThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -54,7 +55,10 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_attendance_queryset_cache_key, get_attendance_detail_cache_key, get_student_attendance_cache_key,
                             get_lesson_attendance_summary_cache_key, get_attendance_statistics_cache_key, invalidate_attendance_cache, 
                             invalidate_attendance_queryset_caches, invalidate_student_attendance_caches, invalidate_lesson_attendance_caches,
-                            )
+                            get_feedback_queryset_cache_key, get_lesson_feedback_cache_key, get_my_feedback_cache_key,
+                            get_instructor_feedback_cache_key, get_lesson_feedback_stats_cache_key, get_instructor_feedback_stats_cache_key,
+                            invalidate_feedback_cache, invalidate_feedback_queryset_caches, invalidate_lesson_feedback_caches,
+                            invalidate_student_feedback_caches, invalidate_instructor_feedback_caches)
 
 User = get_user_model()
 
@@ -2339,58 +2343,115 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         }, status=status.HTTP_201_CREATED if created_records else status.HTTP_400_BAD_REQUEST)
  
 class FeedbackViewSet(viewsets.ModelViewSet):
+    """
+    Manage feedback/reviews with caching and rate limiting.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Query result caching for performance
+    - Rate limiting per action
+    - Automatic cache invalidation
+    - Rating distribution analytics
+    
+    Access Control:
+    - Platform Admins: Full access to all feedback
+    - School Owners: View/delete feedback in their schools
+    - Instructors: View feedback for their lessons
+    - Students: Create/update their own feedback, view own feedback
+    """
     serializer_class = FeedbackSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
-    filterset_fields = ['student', 'lesson', 'rating']  # Simplified
+    filterset_fields = ['student', 'lesson', 'rating']
     search_fields = ['student__user__username', 'student__user__email', 'comment']
     ordering_fields = ['rating', 'created_at']
     ordering = ['-created_at']
+    
+    # Default throttling
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
+        """
+        Filter feedback based on user role and school.
+        Implements query result caching.
+        """
         user = self.request.user
+        
         if not user.is_authenticated:
             return Feedback.objects.none()
         
-        # Platform Admin (staff) sees all feedback
+        # Generate cache key
+        cache_key = get_feedback_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role
         if user.role == 'A' and user.is_staff:
-            return Feedback.objects.all().select_related(
-                'student__user', 'student__school', 'lesson__instructor', 'lesson__school'
-            )
+            # Platform Admin sees all feedback
+            queryset = Feedback.objects.all()
         
-        # School Owner sees feedback in their schools
-        if user.role == 'A' and not user.is_staff:
-            return Feedback.objects.filter(
-                lesson__school__owner=user,
-            ).select_related('student__user', 'lesson__instructor', 'lesson__school')
+        elif user.role == 'A' and not user.is_staff:
+            # School Owner sees feedback in their schools
+            queryset = Feedback.objects.filter(lesson__school__owner=user)
         
-        # Instructor sees feedback for their lessons
-        if user.role == 'I':
-            return Feedback.objects.filter(
-                lesson__instructor=user   
-            ).select_related('student__user', 'lesson', 'lesson__school')
+        elif user.role == 'I':
+            # Instructor sees feedback for their lessons
+            queryset = Feedback.objects.filter(lesson__instructor=user)
         
-        # Student sees only their own feedback
-        if user.role == 'S':
-            return Feedback.objects.filter(
-                student__user=user
-            ).select_related('student__user', 'lesson__instructor', 'lesson__school')
+        elif user.role == 'S':
+            # Student sees only their own feedback
+            queryset = Feedback.objects.filter(student__user=user)
+        else:
+            queryset = Feedback.objects.none()
         
-        return Feedback.objects.none()
+        # Optimize query
+        queryset = queryset.select_related(
+            'student__user',
+            'student__school',
+            'lesson__instructor',
+            'lesson__school'
+        )
+        
+        # Cache the queryset for 5 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+        
+        return queryset
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [FeedbackListThrottle()],
+            'create': [FeedbackCreateThrottle()],
+            'update': [FeedbackUpdateThrottle()],
+            'partial_update': [FeedbackUpdateThrottle()],
+            'lesson_feedback': [FeedbackLessonViewThrottle()],
+            'my_feedback': [FeedbackMyViewThrottle()],
+            'instructor_feedback': [FeedbackInstructorViewThrottle()],
+        }
+        
+        return throttle_map.get(self.action, super().get_throttles())
     
     def get_permissions(self):
+        """Define permissions per action"""
         if self.action == 'create':
-            return [IsAuthenticated(), IsStudent()]  # Only students create feedback
-        
+            return [IsAuthenticated(), IsStudent()]
         elif self.action in ['update', 'partial_update']:
-            return [IsAuthenticated(), IsStudent()]  # Only students update their feedback
-        
+            return [IsAuthenticated(), IsStudent()]
         elif self.action == 'destroy':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
         return [IsAuthenticated()]
     
     def perform_create(self, serializer):
-        """Create feedback with validation"""
+        """
+        Create feedback with validation and cache invalidation.
+        Students can only create feedback for lessons they attended.
+        """
         user = self.request.user
         student = serializer.validated_data.get('student')
         lesson = serializer.validated_data.get('lesson')
@@ -2439,13 +2500,20 @@ class FeedbackViewSet(viewsets.ModelViewSet):
             if rating < 1 or rating > 5:
                 raise PermissionDenied("Rating must be between 1 and 5")
             
-            serializer.save()
+            feedback = serializer.save()
+            
+            # Invalidate caches
+            self._invalidate_feedback_caches(feedback)
+            
             return
         
         raise PermissionDenied("You don't have permission to create feedback")
     
     def perform_update(self, serializer):
-        """Update feedback - only students can update their own"""
+        """
+        Update feedback - only students can update their own.
+        Includes cache invalidation.
+        """
         user = self.request.user
         instance = self.get_object()
 
@@ -2456,31 +2524,81 @@ class FeedbackViewSet(viewsets.ModelViewSet):
                 if rating and (rating < 1 or rating > 5):
                     raise PermissionDenied("Rating must be between 1 and 5")
                 
-                serializer.save()
+                feedback = serializer.save()
+                
+                # Invalidate caches
+                self._invalidate_feedback_caches(feedback)
+                
                 return
             raise PermissionDenied("You can only update your own feedback")
         
         raise PermissionDenied("You don't have permission to update feedback")
     
     def perform_destroy(self, instance):
-        """Delete feedback - platform admins and school owners only"""
+        """
+        Delete feedback - platform admins and school owners only.
+        Includes cache invalidation.
+        """
         user = self.request.user
+        feedback_id = instance.id
+        lesson_id = instance.lesson_id
+        student_id = instance.student_id
+        instructor_id = instance.lesson.instructor_id if instance.lesson else None
 
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            self._invalidate_all_related_caches(
+                feedback_id, lesson_id, student_id, instructor_id
+            )
             return
         
         if user.role == 'A' and not user.is_staff:
             if instance.lesson.school.owner == user:
                 instance.delete()
+                self._invalidate_all_related_caches(
+                    feedback_id, lesson_id, student_id, instructor_id
+                )
                 return
             raise PermissionDenied("You can only delete feedback in your own schools")
             
         raise PermissionDenied("You don't have permission to delete this feedback")
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def _invalidate_feedback_caches(self, feedback):
+        """Helper method to invalidate all caches related to a feedback record"""
+        invalidate_feedback_cache(feedback.id)
+        invalidate_feedback_queryset_caches()
+        
+        if feedback.lesson_id:
+            invalidate_lesson_feedback_caches(feedback.lesson_id)
+        
+        if feedback.student_id:
+            invalidate_student_feedback_caches(feedback.student_id)
+        
+        if feedback.lesson and feedback.lesson.instructor_id:
+            invalidate_instructor_feedback_caches(feedback.lesson.instructor_id)
+    
+    def _invalidate_all_related_caches(self, feedback_id, lesson_id, student_id, instructor_id):
+        """Helper to invalidate all related caches after deletion"""
+        invalidate_feedback_cache(feedback_id)
+        invalidate_feedback_queryset_caches()
+        
+        if lesson_id:
+            invalidate_lesson_feedback_caches(lesson_id)
+        
+        if student_id:
+            invalidate_student_feedback_caches(student_id)
+        
+        if instructor_id:
+            invalidate_instructor_feedback_caches(instructor_id)
+    
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[FeedbackLessonViewThrottle])
     def lesson_feedback(self, request):
-        """Get feedback for a specific lesson"""
+        """
+        Get feedback for a specific lesson with statistics.
+        Cached for 5 minutes.
+        """
         lesson_id = request.query_params.get('lesson_id')
         
         if not lesson_id:
@@ -2489,8 +2607,14 @@ class FeedbackViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Check cache
+        cache_key = get_lesson_feedback_cache_key(lesson_id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         try:
-            lesson = Lesson.objects.get(id=lesson_id)
+            lesson = Lesson.objects.select_related('instructor', 'school').get(id=lesson_id)
         except Lesson.DoesNotExist:
             return Response(
                 {'error': 'Lesson not found'},
@@ -2529,7 +2653,7 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         avg_rating = feedback_list.aggregate(avg=Avg('rating'))['avg'] or 0
         
         # Rating distribution
-        distribution = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        distribution = {}
         for rating in range(1, 6):
             count = feedback_list.filter(rating=rating).count()
             percentage = round((count / total * 100), 2) if total > 0 else 0
@@ -2537,7 +2661,7 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(feedback_list, many=True)
         
-        return Response({
+        response_data = {
             'lesson': {
                 'id': lesson.id,
                 'title': lesson.title,
@@ -2550,11 +2674,22 @@ class FeedbackViewSet(viewsets.ModelViewSet):
                 'rating_distribution': distribution
             },
             'feedback_list': serializer.data
-        })
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[FeedbackMyViewThrottle])
     def my_feedback(self, request):
-        """Get current student's feedback"""
+        """
+        Get current student's feedback with statistics.
+        Cached for 3 minutes.
+        Only available to students.
+        """
         user = request.user
         
         if user.role != 'S':
@@ -2562,6 +2697,12 @@ class FeedbackViewSet(viewsets.ModelViewSet):
                 {'error': 'This endpoint is only for students'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Check cache
+        cache_key = get_my_feedback_cache_key(user.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         try:
             student_profile = StudentProfile.objects.get(user=user, status='A')
@@ -2580,15 +2721,26 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(feedback_list, many=True)
         
-        return Response({
+        response_data = {
             'total_feedback': total,
             'average_rating': round(avg_rating, 2),
             'feedback_list': serializer.data
-        })
+        }
+        
+        # Cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[FeedbackInstructorViewThrottle])
     def instructor_feedback(self, request):
-        """Get feedback for current instructor"""
+        """
+        Get feedback for current instructor with detailed statistics.
+        Cached for 5 minutes.
+        Only available to instructors.
+        """
         user = request.user
         
         if user.role != 'I':
@@ -2596,6 +2748,12 @@ class FeedbackViewSet(viewsets.ModelViewSet):
                 {'error': 'This endpoint is only for instructors'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Check cache
+        cache_key = get_instructor_feedback_cache_key(user.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         # Get all feedback for instructor's lessons
         feedback_list = Feedback.objects.filter(
@@ -2612,7 +2770,7 @@ class FeedbackViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(feedback_list, many=True)
         
-        return Response({
+        response_data = {
             'statistics': {
                 'total_feedback': total,
                 'average_rating': round(avg_rating, 2),
@@ -2620,7 +2778,12 @@ class FeedbackViewSet(viewsets.ModelViewSet):
                 'rating_distribution': self._get_rating_distribution(feedback_list)
             },
             'recent_feedback': serializer.data[:10]  # Last 10 feedbacks
-        })
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
     
     def _get_rating_distribution(self, queryset):
         """Helper method to calculate rating distribution"""
@@ -2636,7 +2799,7 @@ class FeedbackViewSet(viewsets.ModelViewSet):
             }
         
         return distribution
-
+    
 #DSS-8-create-Vehicle-views
 class VehicleViewSet(viewsets.ModelViewSet):
     """

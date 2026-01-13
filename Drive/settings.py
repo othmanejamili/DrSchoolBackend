@@ -237,6 +237,14 @@ REST_FRAMEWORK = {
         'attendance_update': '60/hour',
         'attendance_bulk_create': '10/hour',  # More restrictive
         'attendance_stats': '50/min',
+
+        # Feedback management
+        'feedback_list': '200/hour',            # Feedback listing
+        'feedback_create': '10/hour',           # Feedback creation (prevent spam)
+        'feedback_update': '20/hour',           # Feedback updates
+        'feedback_lesson_view': '100/hour',     # Viewing lesson feedback
+        'feedback_my_view': '50/hour',          # Student viewing own feedback
+        'feedback_instructor_view': '60/minute', # Instructor viewing feedback
     },
     
     # Filtering
@@ -512,7 +520,16 @@ CACHE_TIMEOUTS = {
     
     # Filters and Search Results
     'attendance_filters': 60 * 2,       # 2 minutes for filtered results
-     
-     #Default
-     'default': 60 * 5,
+
+    # Feedback-related caches
+    'feedback_queryset': 60 * 5,        # 5 minutes
+    'feedback_detail': 60 * 5,          # 5 minutes
+    'lesson_feedback': 60 * 5,          # 5 minutes (with stats)
+    'my_feedback': 60 * 3,              # 3 minutes
+    'instructor_feedback': 60 * 5,      # 5 minutes (with stats)
+    'lesson_feedback_stats': 60 * 5,    # 5 minutes
+    'instructor_feedback_stats': 60 * 5, # 5 minutes 
+    
+    #Default
+    'default': 60 * 5,
 }
