@@ -12,7 +12,11 @@ from .cache_utils import (invalidate_lesson_cache,
                           invalidate_school_lesson_caches,
                           get_lesson_attendance_cache_key,
                           get_lesson_feedback_cache_key,
-                          get_lesson_schedule_cache_key)
+                          get_lesson_schedule_cache_key,invalidate_feedback_cache,
+                          invalidate_feedback_queryset_caches,
+                          invalidate_lesson_feedback_caches,
+                          invalidate_student_feedback_caches,
+                          invalidate_instructor_feedback_caches)
 
 
 
@@ -125,3 +129,32 @@ def invalidate_schedule_on_change(sender, instance, **kwargs):
                 instance.lesson.instructor_id,
                 'I'
             ))
+
+@receiver([post_save, post_delete], sender=Feedback)
+def invalidate_feedback_on_change(sender, instance, **kwargs):
+    """
+    Invalidate feedback caches when feedback is created, updated, or deleted.
+    This ensures users always see fresh feedback data.
+    """
+    # Invalidate specific feedback cache
+    invalidate_feedback_cache(instance.id)
+    
+    # Invalidate all feedback querysets
+    invalidate_feedback_queryset_caches()
+    
+    # Invalidate lesson-specific feedback caches
+    if instance.lesson_id:
+        invalidate_lesson_feedback_caches(instance.lesson_id)
+        
+        # Also invalidate the lesson's instructor feedback caches
+        if hasattr(instance.lesson, 'instructor_id') and instance.lesson.instructor_id:
+            invalidate_instructor_feedback_caches(instance.lesson.instructor_id)
+    
+    # Invalidate student-specific feedback caches
+    if instance.student_id:
+        invalidate_student_feedback_caches(instance.student_id)
+        
+        # Also invalidate "my_feedback" cache for the student user
+        if hasattr(instance.student, 'user_id'):
+            from .cache_utils import get_my_feedback_cache_key
+            cache.delete(get_my_feedback_cache_key(instance.student.user_id))
