@@ -65,6 +65,37 @@ class StudentPerformancePredictionThrottle(UserRateThrottle):
     """Limit student performance prediction queries (computationally expensive)"""
     scope = 'student_performance_prediction'  # ✅ FIXED: was 'scop' and renamed class
 
+# ============================================
+# LESSON MANAGEMENT THROTTLES
+# ============================================
+    
+class LessonListThrottle(UserRateThrottle):
+    """Limit lesson lissting"""
+    scope = 'lesson_list'
+
+class LessonCreateThrottle(UserRateThrottle):
+    """Limit lesson creation (Admin/Owners/Instructores)"""
+    scope = 'lesson_create'
+
+class LessonUpdateThrottle(UserRateThrottle):
+    """Limit lesson updates"""
+    scope = 'lesson_update'
+
+class MarkAttendanceThrottle(UserRateThrottle):
+    """Limit Attendance marking"""
+    scope = 'mark_attendance'
+
+class CompleteLessonThrottle(UserRateThrottle):
+    """Limit lesson completion marking"""
+    scope = 'complete_lesson'
+
+class LessonStatisticsThrottle(UserRateThrottle):
+    """Limit lesson statisc queries"""
+    scope = 'lesson_stats'
+
+class LessonFeedbackThrottle(UserRateThrottle):
+    """Limit feedback viewing"""
+    scope = 'lesson_feedback'
 
 # ============================================
 # GENERAL PURPOSE THROTTLES
