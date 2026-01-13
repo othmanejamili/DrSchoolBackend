@@ -41,22 +41,20 @@ from .throttles import (
         SchoolListThrottle,SchoolCreateThrottle,StudentProgressThrottle,
         StudentProgressUpdateThrottle, StudentPerformancePredictionThrottle,
         LessonListThrottle, LessonCreateThrottle,LessonUpdateThrottle, MarkAttendanceThrottle,
-        CompleteLessonThrottle, LessonStatisticsThrottle,LessonFeedbackThrottle
+        CompleteLessonThrottle, LessonStatisticsThrottle,LessonFeedbackThrottle,
+        AttendanceListThrottle, AttendanceCreateThrottle, AttendanceUpdateThrottle, AttendanceBulkCreateThrottle,
+        AttendanceStatisticsThrottle,
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
-                            get_user_queryset_cache_key, invalidate_user_caches,
-                            invalidate_school_caches, get_user_stats_cache_key,
-                            get_lesson_queryset_cache_key,
-                            get_lesson_attendance_cache_key,
-                            get_lesson_feedback_cache_key,
-                            get_lesson_schedule_cache_key,
-                            get_upcoming_lessons_cache_key,
-                            get_my_lessons_cache_key,
-                            get_lesson_statistics_cache_key,
-                            invalidate_lesson_cache,
-                            invalidate_lesson_queryset_caches,
-                            invalidate_instructor_lesson_caches,
-                            invalidate_school_lesson_caches)
+                            get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
+                            get_lesson_queryset_cache_key, get_lesson_attendance_cache_key, get_lesson_feedback_cache_key,
+                            get_lesson_schedule_cache_key, get_upcoming_lessons_cache_key, get_my_lessons_cache_key,
+                            get_lesson_statistics_cache_key, invalidate_lesson_cache, invalidate_lesson_queryset_caches,
+                            invalidate_instructor_lesson_caches, invalidate_school_lesson_caches,
+                            get_attendance_queryset_cache_key, get_attendance_detail_cache_key, get_student_attendance_cache_key,
+                            get_lesson_attendance_summary_cache_key, get_attendance_statistics_cache_key, invalidate_attendance_cache, 
+                            invalidate_attendance_queryset_caches, invalidate_student_attendance_caches, invalidate_lesson_attendance_caches,
+                            )
 
 User = get_user_model()
 
@@ -1733,58 +1731,115 @@ class LessonViewSet(viewsets.ModelViewSet):
         return Response(stats)
     
 class AttendanceViewSet(viewsets.ModelViewSet):
-
+    """
+    Manage attendance records with caching and rate limiting.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Query result caching for performance
+    - Rate limiting per action
+    - Automatic cache invalidation
+    
+    Access Control:
+    - Platform Admins: Full access to all attendance
+    - School Owners: Manage attendance in their schools
+    - Instructors: Manage attendance for their lessons
+    - Students: View their own attendance
+    """
     serializer_class = AttendanceSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
-    filterset_fields = ['presence','hours_completed','student__user__username','student__user__email']
-    search_fields = ['student__user__username','student__user__email','notes']
-    ordering_fields = ['presence','hours_completed','created_at']
+    filterset_fields = ['presence', 'hours_completed', 'student__user__username', 'student__user__email']
+    search_fields = ['student__user__username', 'student__user__email', 'notes']
+    ordering_fields = ['presence', 'hours_completed', 'created_at']
     ordering = ['-created_at']
+    
+    # Default throttling
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
+        """
+        Filter attendance based on user role and school.
+        Implements query result caching.
+        """
         user = self.request.user
+        
         if not user.is_authenticated:
             return Attendance.objects.none()
         
+        # Generate cache key
+        cache_key = get_attendance_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role
         if user.role == 'A' and user.is_staff:
-            return Attendance.objects.all().select_related('student__user','student__school','lesson__instructor')
+            # Platform Admin sees all attendance
+            queryset = Attendance.objects.all()
         
-        if user.role == 'A' and not user.is_staff:
-            return Attendance.objects.filter(
-                lesson__school__owner =user
-            ).select_related('student__user','lesson__instructor')
+        elif user.role == 'A' and not user.is_staff:
+            # School Owner sees attendance in their schools
+            queryset = Attendance.objects.filter(lesson__school__owner=user)
         
-        if user.role == 'I':
-            return Attendance.objects.filter(
-                lesson__instructor = user
-            ).select_related('student__user','lesson')
+        elif user.role == 'I':
+            # Instructor sees attendance for their lessons
+            queryset = Attendance.objects.filter(lesson__instructor=user)
         
-        if user.role == 'S':
-            return Attendance.objects.filter(
-                student__user = user
-            ).select_related('student__user','lesson__instructor')
+        elif user.role == 'S':
+            # Student sees their own attendance
+            queryset = Attendance.objects.filter(student__user=user)
+        else:
+            queryset = Attendance.objects.none()
         
-        return Attendance.objects.none()
+        # Optimize query
+        queryset = queryset.select_related(
+            'student__user',
+            'student__school',
+            'lesson__instructor'
+        )
+        
+        # Cache the queryset for 3 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 3)
+        
+        return queryset
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [AttendanceListThrottle()],
+            'create': [AttendanceCreateThrottle()],
+            'update': [AttendanceUpdateThrottle()],
+            'partial_update': [AttendanceUpdateThrottle()],
+            'bulk_create': [AttendanceBulkCreateThrottle()],
+            'my_attendance': [UserRateThrottle()],
+            'lesson_summary': [AttendanceStatisticsThrottle()],
+            'student_summary': [AttendanceStatisticsThrottle()],
+            'statistics': [AttendanceStatisticsThrottle()],
+        }
+        
+        return throttle_map.get(self.action, super().get_throttles())
     
     def get_permissions(self):
-        
+        """Define permissions per action"""
         if self.action == 'create':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-        
         elif self.action in ['update', 'partial_update']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-
         elif self.action == 'destroy':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
+        elif self.action == 'bulk_create':
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
         return [IsAuthenticated()]
-
-
-
+    
     def perform_create(self, serializer):
         """
-        Create attendance with validation.
-        Only for lessons taught by the authenticated user's school.
+        Create attendance with validation and cache invalidation.
         """
         user = self.request.user
         student = serializer.validated_data.get('student')
@@ -1794,7 +1849,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if not student:
             raise PermissionDenied("Student is required")
         
-        if student.user.role != 'S':  # FIXED: Check user's role
+        if student.user.role != 'S':
             raise PermissionDenied("Invalid student - must be a student profile")
         
         # Validate lesson exists
@@ -1803,30 +1858,28 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         
         # Platform admin can create for any school
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            attendance = serializer.save()
+            self._invalidate_attendance_caches(attendance)
             return
         
         # School owner can create for their schools
         if user.role == 'A' and not user.is_staff:
-            # Check if lesson is in owner's school
             instructor_profile = lesson.instructor.student_profiles.filter(status='A').first()
             if not instructor_profile or instructor_profile.school.owner != user:
                 raise PermissionDenied("You can only create attendance for lessons in your schools")
             
-            # Check if student is in the same school
             if student.school != instructor_profile.school:
                 raise PermissionDenied("Student must be enrolled in the same school as the lesson")
             
-            serializer.save()
+            attendance = serializer.save()
+            self._invalidate_attendance_caches(attendance)
             return
         
         # Instructor can create for their own lessons
         if user.role == 'I':
-            # Verify this is the instructor's lesson
             if lesson.instructor != user:
                 raise PermissionDenied("You can only create attendance for your own lessons")
             
-            # Verify student is in the same school as instructor
             instructor_profile = user.student_profiles.filter(status='A').first()
             if not instructor_profile:
                 raise PermissionDenied("You have no active school profile")
@@ -1834,57 +1887,86 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             if student.school != instructor_profile.school:
                 raise PermissionDenied("Student must be enrolled in your school")
             
-            serializer.save()
+            attendance = serializer.save()
+            self._invalidate_attendance_caches(attendance)
             return
         
         raise PermissionDenied("You don't have permission to create attendance")
     
-
     def perform_update(self, serializer):
-        
+        """Update attendance with permission checks and cache invalidation"""
         user = self.request.user
         instance = self.get_object()
 
+        # Platform Admin can update any attendance
         if user.role == 'A' and user.is_staff:
-            serializer.save()
-            return 
-        
+            attendance = serializer.save()
+            self._invalidate_attendance_caches(attendance)
+            return
+
+        # School Owner can update attendance in their schools
         if user.role == 'A' and not user.is_staff:
             instructor_profile = instance.lesson.instructor.student_profiles.filter(status='A').first()
             if instructor_profile and instance.lesson.school.owner == user:
-                serializer.save()
+                attendance = serializer.save()
+                self._invalidate_attendance_caches(attendance)
                 return
-            raise PermissionDenied("You can only update Attendance in your own schools")
+            raise PermissionDenied("You can only update attendance in your own schools")
         
+        # Instructor can update attendance for their lessons
         if user.role == 'I':
             if instance.lesson.instructor == user:
-                serializer.save()
+                attendance = serializer.save()
+                self._invalidate_attendance_caches(attendance)
                 return
-            raise PermissionDenied("You can only update your own Attendance")
+            raise PermissionDenied("You can only update attendance for your own lessons")
         
-        raise PermissionDenied("You don't have permission to update this Attendance")
+        raise PermissionDenied("You don't have permission to update this attendance")
     
     def perform_destroy(self, instance):
-        
+        """Delete attendance with cache invalidation"""
         user = self.request.user
+        attendance_id = instance.id
+        student_id = instance.student_id
+        lesson_id = instance.lesson_id
 
+        # Platform Admin can delete any attendance
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            invalidate_attendance_cache(attendance_id)
+            invalidate_attendance_queryset_caches()
+            invalidate_student_attendance_caches(student_id)
+            invalidate_lesson_attendance_caches(lesson_id)
             return 
         
+        # School Owner can delete attendance in their schools
         if user.role == 'A' and not user.is_staff:
             instructor_profile = instance.lesson.instructor.student_profiles.filter(status='A').first()
             if instructor_profile and instance.lesson.school.owner == user:
                 instance.delete()
+                invalidate_attendance_cache(attendance_id)
+                invalidate_attendance_queryset_caches()
+                invalidate_student_attendance_caches(student_id)
+                invalidate_lesson_attendance_caches(lesson_id)
                 return 
-            raise PermissionDenied("You can only delete Attendance in your own schools")
+            raise PermissionDenied("You can only delete attendance in your own schools")
         
-        raise PermissionDenied("You don't have permission to delete this Attendance")
+        raise PermissionDenied("You don't have permission to delete this attendance")
+    
+    def _invalidate_attendance_caches(self, attendance):
+        """Helper method to invalidate all caches related to an attendance record"""
+        invalidate_attendance_cache(attendance.id)
+        invalidate_attendance_queryset_caches()
+        invalidate_student_attendance_caches(attendance.student_id)
+        invalidate_lesson_attendance_caches(attendance.lesson_id)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[UserRateThrottle])
     def my_attendance(self, request):
         """
         Get attendance records for the current student.
+        Cached for 2 minutes.
         Only available to students.
         """
         user = request.user
@@ -1894,6 +1976,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 {'error': 'This endpoint is only for students'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Check cache
+        cache_key = get_student_attendance_cache_key(user.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         try:
             student_profile = StudentProfile.objects.get(user=user, status='A')
@@ -1918,21 +2006,29 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(attendance_records, many=True)
         
-        return Response({
+        response_data = {
             'statistics': {
                 'total_lessons': total_lessons,
                 'attended': attended,
                 'missed': total_lessons - attended,
                 'attendance_rate': attendance_rate,
-                'total_hours_completed': total_hours
+                'total_hours_completed': float(total_hours)
             },
             'attendance_records': serializer.data
-        })
+        }
+        
+        # Cache for 2 minutes
+        cache.set(cache_key, response_data, 60 * 2)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsInstructor])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[AttendanceStatisticsThrottle])
     def lesson_summary(self, request):
         """
         Get attendance summary for a specific lesson.
+        Cached for 3 minutes.
         Available to instructors and admins.
         """
         lesson_id = request.query_params.get('lesson_id')
@@ -1942,6 +2038,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 {'error': 'lesson_id query parameter is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Check cache
+        cache_key = get_lesson_attendance_summary_cache_key(lesson_id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         try:
             lesson = Lesson.objects.get(id=lesson_id)
@@ -1977,7 +2079,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(attendance_records, many=True)
         
-        return Response({
+        response_data = {
             'lesson': {
                 'id': lesson.id,
                 'title': lesson.title,
@@ -1989,15 +2091,23 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 'present': present,
                 'absent': absent,
                 'attendance_rate': round((present / total_students * 100), 2) if total_students > 0 else 0,
-                'average_hours_completed': round(avg_hours, 2)
+                'average_hours_completed': round(float(avg_hours), 2)
             },
             'attendance_records': serializer.data
-        })
+        }
+        
+        # Cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsInstructor])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[AttendanceStatisticsThrottle])
     def student_summary(self, request):
         """
         Get attendance summary for a specific student.
+        Cached for 3 minutes.
         Available to instructors and admins.
         """
         student_id = request.query_params.get('student_id')
@@ -2008,6 +2118,14 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Check cache (only for admin/instructor, not the student themselves)
+        user = request.user
+        if user.role != 'S':
+            cache_key = f'student_summary_{student_id}_{user.id}'
+            cached_data = cache.get(cache_key)
+            if cached_data is not None:
+                return Response(cached_data)
+        
         try:
             student_profile = StudentProfile.objects.get(id=student_id)
         except StudentProfile.DoesNotExist:
@@ -2015,8 +2133,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 {'error': 'Student profile not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-        
-        user = request.user
         
         # Check permissions
         if user.role == 'I':
@@ -2041,7 +2157,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(attendance_records, many=True)
         
-        return Response({
+        response_data = {
             'student': {
                 'id': student_profile.id,
                 'name': student_profile.user.get_full_name() or student_profile.user.username,
@@ -2052,11 +2168,176 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 'attended': attended,
                 'missed': total_lessons - attended,
                 'attendance_rate': round((attended / total_lessons * 100), 2) if total_lessons > 0 else 0,
-                'total_hours_completed': total_hours
+                'total_hours_completed': float(total_hours)
             },
             'attendance_records': serializer.data
-        })
+        }
+        
+        # Cache for 3 minutes (only for admin/instructor)
+        if user.role != 'S':
+            cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
     
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[AttendanceStatisticsThrottle])
+    def statistics(self, request):
+        """
+        Get attendance statistics for the current user.
+        Cached for 5 minutes.
+        """
+        user = request.user
+        
+        # Check cache
+        cache_key = get_attendance_statistics_cache_key(user.id, user.role)
+        cached_stats = cache.get(cache_key)
+        if cached_stats is not None:
+            return Response(cached_stats)
+        
+        if user.role == 'I':
+            # Instructor statistics
+            attendance_records = Attendance.objects.filter(lesson__instructor=user)
+            
+            total_records = attendance_records.count()
+            present_count = attendance_records.filter(presence=True).count()
+            total_hours = attendance_records.filter(
+                presence=True
+            ).aggregate(total=Sum('hours_completed'))['total'] or 0
+            
+            stats = {
+                'total_attendance_records': total_records,
+                'students_present': present_count,
+                'students_absent': total_records - present_count,
+                'overall_attendance_rate': round((present_count / total_records * 100), 2) if total_records > 0 else 0,
+                'total_hours_taught': float(total_hours)
+            }
+        
+        elif user.role == 'S':
+            # Student statistics (same as my_attendance but just stats)
+            student_profile = user.student_profiles.filter(status='A').first()
+            if not student_profile:
+                return Response(
+                    {'error': 'No active student profile found'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            attendance_records = Attendance.objects.filter(student=student_profile)
+            
+            total_lessons = attendance_records.count()
+            attended = attendance_records.filter(presence=True).count()
+            total_hours = attendance_records.filter(
+                presence=True
+            ).aggregate(total=Sum('hours_completed'))['total'] or 0
+            
+            stats = {
+                'total_lessons': total_lessons,
+                'attended': attended,
+                'missed': total_lessons - attended,
+                'attendance_rate': round((attended / total_lessons * 100), 2) if total_lessons > 0 else 0,
+                'total_hours_completed': float(total_hours)
+            }
+        
+        elif user.role == 'A':
+            # Admin statistics (all schools or their schools)
+            if user.is_staff:
+                attendance_records = Attendance.objects.all()
+            else:
+                attendance_records = Attendance.objects.filter(lesson__school__owner=user)
+            
+            total_records = attendance_records.count()
+            present_count = attendance_records.filter(presence=True).count()
+            total_hours = attendance_records.filter(
+                presence=True
+            ).aggregate(total=Sum('hours_completed'))['total'] or 0
+            
+            stats = {
+                'total_attendance_records': total_records,
+                'students_present': present_count,
+                'students_absent': total_records - present_count,
+                'overall_attendance_rate': round((present_count / total_records * 100), 2) if total_records > 0 else 0,
+                'total_hours_recorded': float(total_hours)
+            }
+        
+        else:
+            return Response(
+                {'error': 'Statistics not available for your role'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, stats, 60 * 5)
+        
+        return Response(stats)
+    
+    @action(detail=False, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[AttendanceBulkCreateThrottle])
+    def bulk_create(self, request):
+        """
+        Create multiple attendance records at once.
+        Rate limited to prevent excessive bulk operations.
+        Useful for marking attendance for entire classes.
+        """
+        user = request.user
+        attendance_data = request.data.get('attendance_records', [])
+        
+        if not attendance_data:
+            return Response(
+                {'error': 'No attendance records provided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if len(attendance_data) > 100:
+            return Response(
+                {'error': 'Cannot create more than 100 records at once'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        created_records = []
+        errors = []
+        
+        for idx, data in enumerate(attendance_data):
+            try:
+                serializer = self.get_serializer(data=data)
+                serializer.is_valid(raise_exception=True)
+                
+                # Reuse the permission logic from perform_create
+                student = serializer.validated_data.get('student')
+                lesson = serializer.validated_data.get('lesson')
+                
+                # Validate permissions (simplified - you may want to extract this to a helper)
+                if user.role == 'I' and lesson.instructor != user:
+                    errors.append({
+                        'index': idx,
+                        'error': 'You can only create attendance for your own lessons'
+                    })
+                    continue
+                
+                attendance = serializer.save()
+                created_records.append(attendance)
+                
+            except Exception as e:
+                errors.append({
+                    'index': idx,
+                    'error': str(e)
+                })
+        
+        # Invalidate caches for all created records
+        invalidate_attendance_queryset_caches()
+        for attendance in created_records:
+            self._invalidate_attendance_caches(attendance)
+        
+        serializer = self.get_serializer(created_records, many=True)
+        
+        return Response({
+            'message': f'Successfully created {len(created_records)} attendance records',
+            'created_count': len(created_records),
+            'error_count': len(errors),
+            'created_records': serializer.data,
+            'errors': errors
+        }, status=status.HTTP_201_CREATED if created_records else status.HTTP_400_BAD_REQUEST)
+ 
 class FeedbackViewSet(viewsets.ModelViewSet):
     serializer_class = FeedbackSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]

@@ -349,7 +349,118 @@ def invalidate_school_lesson_caches(school_id):
             pass
         
 
+# ============================================
+# ATTENDANCE CACHE KEYS
+# ============================================
 
+def get_attendance_queryset_cache_key(user_id, role):
+    """Generate cache key for attendance queryset"""
+    return f'attendance_queryset_{user_id}_{role}'
+
+
+def get_attendance_detail_cache_key(attendance_id):
+    """Generate cache key for single attendance record"""
+    return f'attendance_detail_{attendance_id}'
+
+
+def get_student_attendance_cache_key(user_id):
+    """Generate cache key for student's attendance records"""
+    return f'student_attendance_{user_id}'
+
+
+def get_lesson_attendance_summary_cache_key(lesson_id):
+    """Generate cache key for lesson attendance summary"""
+    return f'lesson_attendance_summary_{lesson_id}'
+
+
+def get_attendance_statistics_cache_key(user_id, role):
+    """Generate cache key for attendance statistics"""
+    return f'attendance_stats_{user_id}_{role}'
+
+
+# ============================================
+# ATTENDANCE CACHE INVALIDATION
+# ============================================
+
+def invalidate_attendance_cache(attendance_id):
+    """Invalidate all caches related to a specific attendance record"""
+    if not attendance_id:
+        return
+    
+    # Delete specific attendance caches
+    cache_keys = [
+        get_attendance_detail_cache_key(attendance_id)
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    # Delete patterns
+    patterns = [
+        f'attendance_{attendance_id}_*',
+        f'*_attendance_{attendance_id}_*'
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_attendance_queryset_caches():
+    """Invalidate all attendance queryset caches"""
+    patterns = [
+        'attendance_queryset_*',
+        'attendance_stats_*',
+        'student_attendance_*',
+        'lesson_attendance_summary_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_student_attendance_caches(student_id):
+    """Invalidate caches for all attendance records of a student"""
+    if not student_id:
+        return
+    
+    patterns = [
+        f'student_attendance_*_{student_id}_*',
+        f'*_student_{student_id}_attendance_*',
+        f'attendance_*_student_{student_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_lesson_attendance_caches(lesson_id):
+    """Invalidate caches for all attendance records of a lesson"""
+    if not lesson_id:
+        return
+    
+    # Delete specific lesson attendance caches
+    cache.delete(get_lesson_attendance_summary_cache_key(lesson_id))
+    
+    patterns = [
+        f'lesson_attendance_summary_{lesson_id}',
+        f'*_lesson_{lesson_id}_attendance_*',
+        f'attendance_*_lesson_{lesson_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
 
 # ============================================
 # CACHE PATTERN UTILITIES
