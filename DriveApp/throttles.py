@@ -161,6 +161,51 @@ class FeedbackMyViewThrottle(UserRateThrottle):
 class FeedbackInstructorViewThrottle(UserRateThrottle):
     """Limit instructor feedback viewing"""
     scope = 'feedback_instructor_view'
+
+
+
+# ============================================
+# VEHICLE MANAGEMENT THROTTLES
+# ============================================
+
+class VehicleListThrottle(UserRateThrottle):
+    """Limit vehicle listing"""
+    scope = 'vehicle_list'
+
+
+class VehicleCreateThrottle(UserRateThrottle):
+    """Limit vehicle creation (admins/owners)"""
+    scope = 'vehicle_create'
+
+
+class VehicleUpdateThrottle(UserRateThrottle):
+    """Limit vehicle updates"""
+    scope = 'vehicle_update'
+
+
+class VehiclePictureUploadThrottle(UserRateThrottle):
+    """Limit picture uploads (file upload operation)"""
+    scope = 'vehicle_picture_upload'
+
+
+class VehiclePictureManageThrottle(UserRateThrottle):
+    """Limit picture management (delete/set primary)"""
+    scope = 'vehicle_picture_manage'
+
+
+class VehicleMaintenanceThrottle(UserRateThrottle):
+    """Limit maintenance operations"""
+    scope = 'vehicle_maintenance'
+
+
+class VehicleStatisticsThrottle(UserRateThrottle):
+    """Limit statistics queries"""
+    scope = 'vehicle_statistics'
+
+
+class VehicleHistoryThrottle(UserRateThrottle):
+    """Limit vehicle history queries"""
+    scope = 'vehicle_history'
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================
