@@ -245,6 +245,17 @@ REST_FRAMEWORK = {
         'feedback_lesson_view': '100/hour',     # Viewing lesson feedback
         'feedback_my_view': '50/hour',          # Student viewing own feedback
         'feedback_instructor_view': '60/minute', # Instructor viewing feedback
+
+        # vehicle managment
+        'vehicle_list': '300/hour',             # Vehicle listing
+        'vehicle_create': '20/hour',            # Vehicle creation
+        'vehicle_update': '100/hour',           # Vehicle updates
+        'vehicle_picture_upload': '30/hour',    # Picture uploads (file operations)
+        'vehicle_picture_manage': '50/hour',    # Picture management
+        'vehicle_maintenance': '50/hour',       # Maintenance operations
+        'vehicle_statistics': '60/minute',      # Statistics queries
+        'vehicle_history': '100/hour',          # History queries
+
     },
     
     # Filtering
@@ -530,6 +541,16 @@ CACHE_TIMEOUTS = {
     'lesson_feedback_stats': 60 * 5,    # 5 minutes
     'instructor_feedback_stats': 60 * 5, # 5 minutes 
     
+    # Vehicle-related caches
+    'vehicles_queryset': 60 * 5,        # 5 minutes
+    'vehicle_detail': 60 * 5,           # 5 minutes
+    'vehicle_pictures': 60 * 5,         # 5 minutes
+    'vehicles_available': 60 * 3,       # 3 minutes (changes frequently)
+    'vehicles_maintenance_due': 60 * 10, # 10 minutes (changes slowly)
+    'vehicle_statistics': 60 * 10,      # 10 minutes (expensive query)
+    'vehicle_history': 60 * 5,          # 5 minutes
+    'my_school_vehicles': 60 * 3,       # 3 minutes
+
     #Default
     'default': 60 * 5,
 }

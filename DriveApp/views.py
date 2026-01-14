@@ -44,7 +44,9 @@ from .throttles import (
         CompleteLessonThrottle, LessonStatisticsThrottle,LessonFeedbackThrottle,
         AttendanceListThrottle, AttendanceCreateThrottle, AttendanceUpdateThrottle, AttendanceBulkCreateThrottle,
         AttendanceStatisticsThrottle,FeedbackListThrottle, FeedbackCreateThrottle, FeedbackUpdateThrottle, FeedbackLessonViewThrottle,
-        FeedbackMyViewThrottle, FeedbackInstructorViewThrottle
+        FeedbackMyViewThrottle, FeedbackInstructorViewThrottle, VehicleListThrottle, VehicleCreateThrottle,
+        VehicleUpdateThrottle, VehiclePictureUploadThrottle, VehiclePictureManageThrottle, VehicleMaintenanceThrottle,
+        VehicleStatisticsThrottle, VehicleHistoryThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -58,7 +60,13 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_feedback_queryset_cache_key, get_lesson_feedback_cache_key, get_my_feedback_cache_key,
                             get_instructor_feedback_cache_key, get_lesson_feedback_stats_cache_key, get_instructor_feedback_stats_cache_key,
                             invalidate_feedback_cache, invalidate_feedback_queryset_caches, invalidate_lesson_feedback_caches,
-                            invalidate_student_feedback_caches, invalidate_instructor_feedback_caches)
+                            invalidate_student_feedback_caches, invalidate_instructor_feedback_caches,get_vehicle_queryset_cache_key,
+                            get_vehicle_detail_cache_key, get_vehicle_pictures_cache_key, get_vehicle_available_cache_key,
+                            get_vehicle_maintenance_due_cache_key, get_vehicle_statistics_cache_key,
+                            get_vehicle_history_cache_key, get_my_school_vehicles_cache_key,
+                            invalidate_vehicle_cache, invalidate_vehicle_queryset_caches, invalidate_vehicle_maintenance_caches,
+                            invalidate_vehicle_statistics_caches, invalidate_school_vehicle_caches, invalidate_vehicle_pictures_cache
+                            )
 
 User = get_user_model()
 
@@ -2803,13 +2811,20 @@ class FeedbackViewSet(viewsets.ModelViewSet):
 #DSS-8-create-Vehicle-views
 class VehicleViewSet(viewsets.ModelViewSet):
     """
-    DSS-8-create-Vehicle-views
-    ViewSet for managing vehicles in driving schools.
+    ViewSet for managing vehicles in driving schools with caching and rate limiting.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Query result caching for performance
+    - Rate limiting per action
+    - Automatic cache invalidation
+    - Image upload and management
+    - Maintenance tracking
     
     Access Control:
     - Platform Admins (A + is_staff): Full access to all vehicles
     - School Owners (A): Manage vehicles in their schools
-    - Instructors (I): View vehicles in their school
+    - Instructors (I): View vehicles in their school, limited updates
     - Students (S): View vehicles in their school (read-only)
     """
     
@@ -2819,68 +2834,98 @@ class VehicleViewSet(viewsets.ModelViewSet):
     search_fields = ['school__name', 'make', 'model', 'color', 'plate_number']
     ordering_fields = ['year', 'created_at', 'next_maintenance', 'make', 'model']
     ordering = ['-created_at']
+    
+    # Default throttling
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
         """
         Filter vehicles based on user role and school association.
         Multi-tenancy: Users only see vehicles from their own school.
+        Implements query result caching.
         """
         user = self.request.user
+        
         if not user.is_authenticated:
             return Vehicle.objects.none()
         
-        # Platform Admin (staff) sees all vehicles
+        # Generate cache key
+        cache_key = get_vehicle_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role
         if user.role == 'A' and user.is_staff:
+            # Platform Admin sees all vehicles
             queryset = Vehicle.objects.all()
         
-        # School Owner sees vehicles in their schools
         elif user.role == 'A' and not user.is_staff:
+            # School Owner sees vehicles in their schools
             queryset = Vehicle.objects.filter(school__owner=user)
         
-        # Instructor sees vehicles in their school
         elif user.role == 'I':
+            # Instructor sees vehicles in their school
             instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
                 queryset = Vehicle.objects.filter(school=instructor_profile.school)
             else:
                 queryset = Vehicle.objects.none()
         
-        # Student sees vehicles in their school
         elif user.role == 'S':
+            # Student sees vehicles in their school
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
                 queryset = Vehicle.objects.filter(school=student_profile.school)
             else:
                 queryset = Vehicle.objects.none()
-        
         else:
             queryset = Vehicle.objects.none()
         
-        # Prefetch related data for performance
-        return queryset.select_related('school').prefetch_related('pictures')
+        # Optimize query
+        queryset = queryset.select_related('school').prefetch_related('pictures')
+        
+        # Cache the queryset for 5 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+        
+        return queryset
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [VehicleListThrottle()],
+            'create': [VehicleCreateThrottle()],
+            'update': [VehicleUpdateThrottle()],
+            'partial_update': [VehicleUpdateThrottle()],
+            'upload_pictures': [VehiclePictureUploadThrottle()],
+            'delete_picture': [VehiclePictureManageThrottle()],
+            'set_primary_picture': [VehiclePictureManageThrottle()],
+            'schedule_maintenance': [VehicleMaintenanceThrottle()],
+            'complete_maintenance': [VehicleMaintenanceThrottle()],
+            'statistics': [VehicleStatisticsThrottle()],
+            'history': [VehicleHistoryThrottle()],
+        }
+        
+        return throttle_map.get(self.action, super().get_throttles())
 
     def get_permissions(self):
         """Define permissions per action"""
         if self.action == 'create':
-            # Only platform admins and school owners can add vehicles
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
         elif self.action in ['update', 'partial_update']:
-            # Platform admins, school owners, and instructors can update
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-        
         elif self.action == 'destroy':
-            # Only platform admins and school owners can delete
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
         elif self.action in ['upload_pictures', 'delete_picture', 'set_primary_picture']:
-            # Image management: admins, owners, instructors
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-        
         elif self.action in ['schedule_maintenance', 'complete_maintenance']:
-            # Maintenance: admins, owners, instructors
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-        
         return [IsAuthenticated()]
 
     def get_serializer_context(self):
@@ -2896,39 +2941,43 @@ class VehicleViewSet(viewsets.ModelViewSet):
         return context
 
     def perform_create(self, serializer):
-        """Create vehicle with permission checks"""
+        """Create vehicle with permission checks and cache invalidation"""
         user = self.request.user
         school = serializer.validated_data.get('school')
         
         # Platform admin can create for any school
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            vehicle = serializer.save()
+            self._invalidate_vehicle_caches(vehicle)
             return
 
         # School owner can only create for their own schools
         if user.role == 'A' and not user.is_staff:
             if school.owner != user:
                 raise PermissionDenied("You can only add vehicles to your own schools")
-            serializer.save()
+            vehicle = serializer.save()
+            self._invalidate_vehicle_caches(vehicle)
             return
         
         raise PermissionDenied("You don't have permission to create vehicles")
 
     def perform_update(self, serializer):
-        """Update vehicle with permission checks"""
+        """Update vehicle with permission checks and cache invalidation"""
         user = self.request.user
         instance = self.get_object()
 
         # Platform admin can update any vehicle
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            vehicle = serializer.save()
+            self._invalidate_vehicle_caches(vehicle)
             return
 
         # School owner can update vehicles in their schools
         if user.role == 'A' and not user.is_staff:
             if instance.school.owner != user:
                 raise PermissionDenied("You can only update vehicles in your own schools")
-            serializer.save()
+            vehicle = serializer.save()
+            self._invalidate_vehicle_caches(vehicle)
             return
         
         # Instructor can update vehicles in their school (limited fields)
@@ -2944,18 +2993,22 @@ class VehicleViewSet(viewsets.ModelViewSet):
             if not requested_fields.issubset(allowed_fields):
                 raise PermissionDenied(f"Instructors can only update: {', '.join(allowed_fields)}")
             
-            serializer.save()
+            vehicle = serializer.save()
+            self._invalidate_vehicle_caches(vehicle)
             return
         
         raise PermissionDenied("You don't have permission to update this vehicle")
 
     def perform_destroy(self, instance):
-        """Delete vehicle with permission checks"""
+        """Delete vehicle with cache invalidation"""
         user = self.request.user
+        vehicle_id = instance.id
+        school_id = instance.school_id
 
         # Platform admin can delete any vehicle
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            self._invalidate_all_vehicle_caches(vehicle_id, school_id)
             return
 
         # School owner can delete vehicles in their schools
@@ -2963,20 +3016,52 @@ class VehicleViewSet(viewsets.ModelViewSet):
             if instance.school.owner != user:
                 raise PermissionDenied("You can only delete vehicles in your own schools")
             instance.delete()
+            self._invalidate_all_vehicle_caches(vehicle_id, school_id)
             return
         
         raise PermissionDenied("You don't have permission to delete this vehicle")
 
-    # ==================== CUSTOM ACTIONS ====================
+    def _invalidate_vehicle_caches(self, vehicle):
+        """Helper to invalidate caches related to a vehicle"""
+        invalidate_vehicle_cache(vehicle.id)
+        invalidate_vehicle_queryset_caches()
+        invalidate_vehicle_maintenance_caches()
+        invalidate_vehicle_statistics_caches()
+        
+        if vehicle.school_id:
+            invalidate_school_vehicle_caches(vehicle.school_id)
 
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def _invalidate_all_vehicle_caches(self, vehicle_id, school_id):
+        """Helper to invalidate all caches after deletion"""
+        invalidate_vehicle_cache(vehicle_id)
+        invalidate_vehicle_queryset_caches()
+        invalidate_vehicle_maintenance_caches()
+        invalidate_vehicle_statistics_caches()
+        
+        if school_id:
+            invalidate_school_vehicle_caches(school_id)
+
+    # ==================== PICTURE MANAGEMENT ====================
+
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated])
     def pictures(self, request, pk=None):
-        """Get all pictures for a vehicle"""
+        """
+        Get all pictures for a vehicle.
+        Cached for 5 minutes.
+        """
         vehicle = self.get_object()
+        
+        # Check cache
+        cache_key = get_vehicle_pictures_cache_key(vehicle.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         pictures = vehicle.pictures.all()
         serializer = VehiclePictureSerializer(pictures, many=True, context={'request': request})
         
-        return Response({
+        response_data = {
             'vehicle': {
                 'id': vehicle.id,
                 'plate_number': vehicle.plate_number,
@@ -2985,15 +3070,21 @@ class VehicleViewSet(viewsets.ModelViewSet):
             },
             'total_pictures': pictures.count(),
             'pictures': serializer.data
-        })
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[VehiclePictureUploadThrottle])
     @transaction.atomic
     def upload_pictures(self, request, pk=None):
         """
-        Upload multiple pictures for a vehicle
-        POST /api/vehicles/{id}/upload_pictures/
-        Body: multipart/form-data with 'images' field containing files
+        Upload multiple pictures for a vehicle.
+        Rate limited due to file upload overhead.
         """
         vehicle = self.get_object()
         user = request.user
@@ -3045,6 +3136,10 @@ class VehicleViewSet(viewsets.ModelViewSet):
             )
             uploaded_pictures.append(picture)
         
+        # Invalidate caches
+        invalidate_vehicle_pictures_cache(vehicle.id)
+        invalidate_vehicle_cache(vehicle.id)
+        
         # Serialize and return
         serializer = VehiclePictureSerializer(uploaded_pictures, many=True, context={'request': request})
         
@@ -3053,12 +3148,14 @@ class VehicleViewSet(viewsets.ModelViewSet):
             'pictures': serializer.data
         }, status=status.HTTP_201_CREATED)
 
-    @action(detail=True, methods=['delete'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=True, methods=['delete'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[VehiclePictureManageThrottle])
     @transaction.atomic
     def delete_picture(self, request, pk=None):
         """
-        Delete a specific picture
-        DELETE /api/vehicles/{id}/delete_picture/?picture_id=123
+        Delete a specific picture.
+        Rate limited to prevent excessive deletions.
         """
         vehicle = self.get_object()
         picture_id = request.query_params.get('picture_id')
@@ -3072,17 +3169,22 @@ class VehicleViewSet(viewsets.ModelViewSet):
         success, message = VehicleService.delete_picture(vehicle, picture_id, request.user)
         
         if success:
+            # Invalidate caches
+            invalidate_vehicle_pictures_cache(vehicle.id)
+            invalidate_vehicle_cache(vehicle.id)
+            
             return Response({'message': message}, status=status.HTTP_200_OK)
         else:
             return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[VehiclePictureManageThrottle])
     @transaction.atomic
     def set_primary_picture(self, request, pk=None):
         """
-        Set a picture as primary
-        POST /api/vehicles/{id}/set_primary_picture/
-        Body: {"picture_id": 123}
+        Set a picture as primary.
+        Rate limited for consistency.
         """
         vehicle = self.get_object()
         picture_id = request.data.get('picture_id')
@@ -3097,43 +3199,69 @@ class VehicleViewSet(viewsets.ModelViewSet):
         if not VehicleService.can_modify_vehicle(request.user, vehicle):
             raise PermissionDenied("You don't have permission to modify this vehicle")
         
-        success, message = VehicleService.set_primary_picture(vehicle, picture_id)#this line it's make a problem 
+        success, message = VehicleService.set_primary_picture(vehicle, picture_id)
         
         if success:
+            # Invalidate caches
+            invalidate_vehicle_pictures_cache(vehicle.id)
+            invalidate_vehicle_cache(vehicle.id)
+            
             return Response({'message': message}, status=status.HTTP_200_OK)
         else:
             return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    # ==================== VEHICLE AVAILABILITY ====================
+
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
     def available(self, request):
         """
-        Get all available vehicles for the user's school
-        GET /api/vehicles/available/
+        Get all available vehicles for the user's school.
+        Cached for 3 minutes.
         """
-        queryset = self.get_queryset().filter(status='available')
-        
-        # Apply additional filters if provided
-        date = request.query_params.get('date')  # Future: check schedule conflicts
+        user = request.user
         transmission = request.query_params.get('transmission')
         
+        # Check cache
+        cache_key = get_vehicle_available_cache_key(user.id, transmission)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
+        queryset = self.get_queryset().filter(status='available')
+        
+        # Apply transmission filter
         if transmission:
             queryset = queryset.filter(transmission=transmission)
         
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            response_data = self.get_paginated_response(serializer.data).data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            response_data = serializer.data
         
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        # Cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
     def maintenance_due(self, request):
         """
-        Get vehicles that need maintenance soon (within 30 days)
-        GET /api/vehicles/maintenance_due/
+        Get vehicles that need maintenance soon (within 30 days).
+        Cached for 10 minutes (changes slowly).
         """
         user = request.user
+        
+        # Check cache
+        cache_key = get_vehicle_maintenance_due_cache_key(user.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         today = timezone.now().date()
         threshold_date = today + timedelta(days=30)
         
@@ -3146,7 +3274,7 @@ class VehicleViewSet(viewsets.ModelViewSet):
         overdue = queryset.filter(next_maintenance__lt=today)
         upcoming = queryset.filter(next_maintenance__gte=today, next_maintenance__lte=threshold_date)
         
-        return Response({
+        response_data = {
             'overdue': {
                 'count': overdue.count(),
                 'vehicles': self.get_serializer(overdue, many=True).data
@@ -3155,15 +3283,23 @@ class VehicleViewSet(viewsets.ModelViewSet):
                 'count': upcoming.count(),
                 'vehicles': self.get_serializer(upcoming, many=True).data
             }
-        })
+        }
+        
+        # Cache for 10 minutes
+        cache.set(cache_key, response_data, 60 * 10)
+        
+        return Response(response_data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    # ==================== MAINTENANCE OPERATIONS ====================
+
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[VehicleMaintenanceThrottle])
     @transaction.atomic
     def schedule_maintenance(self, request, pk=None):
         """
-        Schedule maintenance for a vehicle
-        POST /api/vehicles/{id}/schedule_maintenance/
-        Body: {"next_maintenance": "2024-12-31"}
+        Schedule maintenance for a vehicle.
+        Rate limited for safety.
         """
         vehicle = self.get_object()
         user = request.user
@@ -3186,19 +3322,23 @@ class VehicleViewSet(viewsets.ModelViewSet):
         vehicle.next_maintenance = next_maintenance
         vehicle.save()
         
+        # Invalidate caches
+        self._invalidate_vehicle_caches(vehicle)
+        
         serializer = self.get_serializer(vehicle)
         return Response({
             'message': 'Maintenance scheduled successfully',
             'vehicle': serializer.data
         })
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=True, methods=['post'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[VehicleMaintenanceThrottle])
     @transaction.atomic
     def complete_maintenance(self, request, pk=None):
         """
-        Mark maintenance as completed
-        POST /api/vehicles/{id}/complete_maintenance/
-        Body: {"next_maintenance": "2025-06-30"} (optional)
+        Mark maintenance as completed.
+        Rate limited for safety.
         """
         vehicle = self.get_object()
         user = request.user
@@ -3218,18 +3358,33 @@ class VehicleViewSet(viewsets.ModelViewSet):
         
         vehicle.save()
         
+        # Invalidate caches
+        self._invalidate_vehicle_caches(vehicle)
+        
         serializer = self.get_serializer(vehicle)
         return Response({
             'message': 'Maintenance completed successfully',
             'vehicle': serializer.data
         })
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    # ==================== STATISTICS & HISTORY ====================
+
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[VehicleStatisticsThrottle])
     def statistics(self, request):
         """
-        Get vehicle statistics for the user's accessible schools
-        GET /api/vehicles/statistics/
+        Get vehicle statistics for the user's accessible schools.
+        Cached for 10 minutes (expensive calculation).
         """
+        user = request.user
+        
+        # Check cache
+        cache_key = get_vehicle_statistics_cache_key(user.id, user.role)
+        cached_stats = cache.get(cache_key)
+        if cached_stats is not None:
+            return Response(cached_stats)
+        
         queryset = self.get_queryset()
         
         total = queryset.count()
@@ -3249,7 +3404,7 @@ class VehicleViewSet(viewsets.ModelViewSet):
             next_maintenance__lte=today + timedelta(days=30)
         ).count()
         
-        return Response({
+        stats = {
             'total_vehicles': total,
             'by_status': by_status,
             'by_transmission': by_transmission,
@@ -3258,26 +3413,37 @@ class VehicleViewSet(viewsets.ModelViewSet):
                 'overdue': overdue_maintenance,
                 'upcoming_30_days': upcoming_maintenance
             }
-        })
+        }
+        
+        # Cache for 10 minutes
+        cache.set(cache_key, stats, 60 * 10)
+        
+        return Response(stats)
 
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[VehicleHistoryThrottle])
     def history(self, request, pk=None):
         """
-        Get vehicle usage history (lessons/schedules)
-        GET /api/vehicles/{id}/history/
+        Get vehicle usage history (lessons/schedules).
+        Cached for 5 minutes.
         """
         vehicle = self.get_object()
         
+        # Check cache
+        cache_key = get_vehicle_history_cache_key(vehicle.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         # Get schedules for this vehicle
-        from .models import Schedule
         schedules = Schedule.objects.filter(vehicle=vehicle).select_related(
             'lesson__instructor', 'instructor'
         ).order_by('-start_time')[:20]
         
-        from .serializers import ScheduleSerializer
         schedule_data = ScheduleSerializer(schedules, many=True, context={'request': request}).data
         
-        return Response({
+        response_data = {
             'vehicle': {
                 'id': vehicle.id,
                 'plate_number': vehicle.plate_number,
@@ -3286,24 +3452,36 @@ class VehicleViewSet(viewsets.ModelViewSet):
             },
             'total_lessons': schedules.count(),
             'recent_lessons': schedule_data
-        })
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated])
     def my_school_vehicles(self, request):
-        """Get vehicles in current user's school (shortcut endpoint)"""
+        """
+        Get vehicles in current user's school (shortcut endpoint).
+        Cached for 3 minutes.
+        """
         user = request.user
+        
+        # Check cache
+        cache_key = get_my_school_vehicles_cache_key(user.id, user.role)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         # Handle different user types
         if user.role == 'A' and user.is_staff:
-            # Platform admin sees all vehicles
             queryset = self.get_queryset()
         
         elif user.role == 'A' and not user.is_staff:
-            # School owner sees vehicles in their schools
             queryset = self.get_queryset().filter(school__owner=user)
         
         elif user.role in ['I', 'S']:
-            # Instructor/Student - get their school via profile
             profile = user.student_profiles.filter(status='A').first()
             if not profile:
                 return Response(
@@ -3321,10 +3499,16 @@ class VehicleViewSet(viewsets.ModelViewSet):
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            response_data = self.get_paginated_response(serializer.data).data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            response_data = serializer.data
         
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        # Cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        
+        return Response(response_data)
+    
 
 #DSS-8-create-schedule-views
 

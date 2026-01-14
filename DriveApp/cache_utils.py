@@ -508,7 +508,151 @@ def invalidate_instructor_feedback_caches(instructor_id):
         except AttributeError:
             pass
 
-        
+# ============================================
+# VEHICLE CACHE KEYS
+# ============================================
+
+def get_vehicle_queryset_cache_key(user_id, role):
+    """Generate cache key for vehicle queryset"""
+    return f'vehicles_queryset_{user_id}_{role}'
+
+
+def get_vehicle_detail_cache_key(vehicle_id):
+    """Generate cache key for single vehicle"""
+    return f'vehicle_detail_{vehicle_id}'
+
+
+def get_vehicle_pictures_cache_key(vehicle_id):
+    """Generate cache key for vehicle pictures"""
+    return f'vehicle_pictures_{vehicle_id}'
+
+
+def get_vehicle_available_cache_key(user_id, transmission=None):
+    """Generate cache key for available vehicles"""
+    trans_part = f'_{transmission}' if transmission else '_all'
+    return f'vehicles_available_{user_id}{trans_part}'
+
+
+def get_vehicle_maintenance_due_cache_key(user_id):
+    """Generate cache key for maintenance due vehicles"""
+    return f'vehicles_maintenance_due_{user_id}'
+
+
+def get_vehicle_statistics_cache_key(user_id, role):
+    """Generate cache key for vehicle statistics"""
+    return f'vehicle_stats_{user_id}_{role}'
+
+
+def get_vehicle_history_cache_key(vehicle_id):
+    """Generate cache key for vehicle history"""
+    return f'vehicle_history_{vehicle_id}'
+
+
+def get_my_school_vehicles_cache_key(user_id, role):
+    """Generate cache key for my school vehicles"""
+    return f'my_school_vehicles_{user_id}_{role}'
+
+
+# ============================================
+# VEHICLE CACHE INVALIDATION
+# ============================================
+
+def invalidate_vehicle_cache(vehicle_id):
+    """Invalidate all caches related to a specific vehicle"""
+    if not vehicle_id:
+        return
+    
+    cache_keys = [
+        get_vehicle_detail_cache_key(vehicle_id),
+        get_vehicle_pictures_cache_key(vehicle_id),
+        get_vehicle_history_cache_key(vehicle_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    # Delete patterns
+    patterns = [
+        f'vehicle_{vehicle_id}_*',
+        f'*_vehicle_{vehicle_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_vehicle_queryset_caches():
+    """Invalidate all vehicle queryset caches"""
+    patterns = [
+        'vehicles_queryset_*',
+        'vehicles_available_*',
+        'my_school_vehicles_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_vehicle_maintenance_caches():
+    """Invalidate all maintenance-related caches"""
+    patterns = [
+        'vehicles_maintenance_due_*',
+        'vehicle_stats_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_vehicle_statistics_caches():
+    """Invalidate all vehicle statistics caches"""
+    patterns = [
+        'vehicle_stats_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_school_vehicle_caches(school_id):
+    """Invalidate caches for all vehicles in a school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'*_school_{school_id}_vehicles_*',
+        f'vehicles_*_school_{school_id}_*',
+        'my_school_vehicles_*',
+        'vehicles_available_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_vehicle_pictures_cache(vehicle_id):
+    """Invalidate vehicle pictures cache specifically"""
+    if not vehicle_id:
+        return
+    
+    cache.delete(get_vehicle_pictures_cache_key(vehicle_id))
+    cache.delete(get_vehicle_detail_cache_key(vehicle_id))
+    
 # ============================================
 # ATTENDANCE CACHE KEYS
 # ============================================
