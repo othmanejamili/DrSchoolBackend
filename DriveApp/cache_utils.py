@@ -5,6 +5,30 @@ Cache utility functions and helpers.
 from django.core.cache import cache
 import hashlib
 import json
+from datetime import datetime, timedelta
+
+# ============================================
+# CACHE PATTERN UTILITIES (FIXED FOR TESTS)
+# ============================================
+
+def delete_pattern_with_fallback(pattern):
+    """
+    Delete pattern with fallback for cache backends without delete_pattern.
+    Returns number of keys deleted, or -1 if unknown.
+    """
+    try:
+        # Try Redis-style pattern deletion
+        return cache.delete_pattern(pattern)
+    except AttributeError:
+        # Fallback for backends without delete_pattern (like LocMemCache)
+        # In tests, we'll just clear everything
+        try:
+            if hasattr(cache, 'clear'):
+                cache.clear()
+                return -1  # Unknown count
+        except:
+            pass
+        return 0
 
 
 # ============================================
@@ -102,18 +126,14 @@ def invalidate_user_caches(user_id=None):
             cache.delete(get_user_queryset_cache_key(user_id, role))
             cache.delete(get_student_profile_cache_key(user_id, role))
         
-        # Delete user-specific patterns
+        # Delete user-specific patterns (with fallback)
         patterns = [
             f'user_{user_id}_*',
             f'student_profile_user_{user_id}',
             f'*_{user_id}_*',
         ]
         for pattern in patterns:
-            try:
-                cache.delete_pattern(pattern)
-            except AttributeError:
-                # Some cache backends don't support delete_pattern
-                pass
+            delete_pattern_with_fallback(pattern)
 
 
 # ============================================
@@ -129,16 +149,13 @@ def invalidate_school_caches(school_id):
     cache.delete(get_school_stats_cache_key(school_id))
     cache.delete(get_school_student_count_cache_key(school_id))
     
-    # Delete school patterns
+    # Delete school patterns (with fallback)
     patterns = [
         f'school_{school_id}_*',
         f'*_school_{school_id}_*',
     ]
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_schools_cache(user_id, role):
@@ -146,17 +163,14 @@ def invalidate_schools_cache(user_id, role):
     # Delete the main schools cache
     cache.delete(get_schools_cache_key(user_id, role))
     
-    # Delete user's school-related patterns
+    # Delete user's school-related patterns (with fallback)
     patterns = [
         f'schools_queryset_{user_id}_*',
         f'*schools*{user_id}*',
         f'*_{user_id}_schools*',
     ]
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 # ============================================
@@ -182,14 +196,10 @@ def invalidate_student_profile_cache(user_id):
     ]
     
     for pattern in patterns_to_delete:
-        try:
-            if '*' in pattern:
-                cache.delete_pattern(pattern)
-            else:
-                cache.delete(pattern)
-        except AttributeError:
-            # Fallback for cache backends without delete_pattern
-            cache.delete(pattern.replace('*', ''))
+        if '*' in pattern:
+            delete_pattern_with_fallback(pattern)
+        else:
+            cache.delete(pattern)
 
 
 def invalidate_student_profiles_by_school(school_id):
@@ -203,10 +213,7 @@ def invalidate_student_profiles_by_school(school_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 # ============================================
@@ -224,10 +231,7 @@ def invalidate_all_student_caches():
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_all_caches():
@@ -273,8 +277,9 @@ def get_lesson_statistics_cache_key(user_id, role):
     """Generate cache key for lesson statistics"""
     return f'lesson_stats_{user_id}_{role}'
 
+
 # ============================================
-# LESSON CACHE INVALIDATION
+# LESSON CACHE INVALIDATION (FIXED)
 # ============================================
 def invalidate_lesson_cache(lesson_id):
     """Invalidate all caches related to a specific lesson"""
@@ -282,28 +287,26 @@ def invalidate_lesson_cache(lesson_id):
         return 
     
     # Delete specific lesson caches
-    cache_key = [
+    cache_keys = [
         get_lesson_detail_cache_key(lesson_id),
         get_lesson_attendance_cache_key(lesson_id),
         get_lesson_feedback_cache_key(lesson_id),
         get_lesson_schedule_cache_key(lesson_id)
     ]
 
-    for key in cache_key:
+    for key in cache_keys:
         cache.delete(key)
 
-    #Delete patterns
+    # Delete patterns with fallback
     patterns = [
         f'lesson_{lesson_id}_*',
         f'*_lesson_{lesson_id}_*'
     ]
 
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AssertionError:
-            pass
-    
+        delete_pattern_with_fallback(pattern)
+
+
 def invalidate_lesson_queryset_caches():
     """Invalidate all lesson queryset caches"""
     patterns = [
@@ -314,13 +317,14 @@ def invalidate_lesson_queryset_caches():
     ]
 
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
+
 
 def invalidate_instructor_lesson_caches(instructor_id):
     """Invalidate caches for all lessons of an instructor"""
+    if not instructor_id:
+        return
+    
     patterns = [
         f'lessons_queryset_{instructor_id}_*',
         f'upcoming_lessons_{instructor_id}_*',
@@ -329,13 +333,13 @@ def invalidate_instructor_lesson_caches(instructor_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
-        
+        delete_pattern_with_fallback(pattern)
+
+
 def invalidate_school_lesson_caches(school_id):
     """Invalidate caches for all lessons in a school"""
+    if not school_id:
+        return
 
     patterns = [
         f'*_school_{school_id}_lessons_*',
@@ -343,11 +347,8 @@ def invalidate_school_lesson_caches(school_id):
     ]
 
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
-        
+        delete_pattern_with_fallback(pattern)
+
 
 # ============================================
 # FEEDBACK CACHE KEYS
@@ -409,17 +410,14 @@ def invalidate_feedback_cache(feedback_id):
     for key in cache_keys:
         cache.delete(key)
     
-    # Delete patterns
+    # Delete patterns with fallback
     patterns = [
         f'feedback_{feedback_id}_*',
         f'*_feedback_{feedback_id}_*',
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_feedback_queryset_caches():
@@ -430,10 +428,7 @@ def invalidate_feedback_queryset_caches():
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_lesson_feedback_caches(lesson_id):
@@ -455,10 +450,7 @@ def invalidate_lesson_feedback_caches(lesson_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_student_feedback_caches(student_id):
@@ -479,10 +471,7 @@ def invalidate_student_feedback_caches(student_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_instructor_feedback_caches(instructor_id):
@@ -503,10 +492,8 @@ def invalidate_instructor_feedback_caches(instructor_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
+
 
 # ============================================
 # VEHICLE CACHE KEYS
@@ -571,17 +558,14 @@ def invalidate_vehicle_cache(vehicle_id):
     for key in cache_keys:
         cache.delete(key)
     
-    # Delete patterns
+    # Delete patterns with fallback
     patterns = [
         f'vehicle_{vehicle_id}_*',
         f'*_vehicle_{vehicle_id}_*',
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_vehicle_queryset_caches():
@@ -593,10 +577,7 @@ def invalidate_vehicle_queryset_caches():
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_vehicle_maintenance_caches():
@@ -607,10 +588,7 @@ def invalidate_vehicle_maintenance_caches():
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_vehicle_statistics_caches():
@@ -620,10 +598,7 @@ def invalidate_vehicle_statistics_caches():
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_school_vehicle_caches(school_id):
@@ -639,10 +614,7 @@ def invalidate_school_vehicle_caches(school_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_vehicle_pictures_cache(vehicle_id):
@@ -652,7 +624,8 @@ def invalidate_vehicle_pictures_cache(vehicle_id):
     
     cache.delete(get_vehicle_pictures_cache_key(vehicle_id))
     cache.delete(get_vehicle_detail_cache_key(vehicle_id))
-    
+
+
 # ============================================
 # ATTENDANCE CACHE KEYS
 # ============================================
@@ -699,17 +672,14 @@ def invalidate_attendance_cache(attendance_id):
     for key in cache_keys:
         cache.delete(key)
     
-    # Delete patterns
+    # Delete patterns with fallback
     patterns = [
         f'attendance_{attendance_id}_*',
         f'*_attendance_{attendance_id}_*'
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_attendance_queryset_caches():
@@ -722,10 +692,7 @@ def invalidate_attendance_queryset_caches():
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_student_attendance_caches(student_id):
@@ -740,10 +707,7 @@ def invalidate_student_attendance_caches(student_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
 
 
 def invalidate_lesson_attendance_caches(lesson_id):
@@ -761,27 +725,155 @@ def invalidate_lesson_attendance_caches(lesson_id):
     ]
     
     for pattern in patterns:
-        try:
-            cache.delete_pattern(pattern)
-        except AttributeError:
-            pass
+        delete_pattern_with_fallback(pattern)
+
+
+# ============================================
+# SCHEDULE CACHE KEYS
+# ============================================
+
+def get_schedule_queryset_cache_key(user_id, role):
+    """Generate cache key for schedule queryset"""
+    return f'schedules_queryset_{user_id}_{role}'
+
+
+def get_schedule_detail_cache_key(schedule_id):
+    """Generate cache key for single schedule"""
+    return f'schedule_detail_{schedule_id}'
+
+
+def get_my_schedule_cache_key(user_id, range_filter='upcoming', status_filter=None):
+    """Generate cache key for my_schedule with filters"""
+    status_part = f'_{status_filter}' if status_filter else '_all'
+    return f'my_schedule_{user_id}_{range_filter}{status_part}'
+
+
+def get_upcoming_schedules_cache_key(user_id, role, date):
+    """Generate cache key for upcoming schedules"""
+    return f'upcoming_schedules_{user_id}_{role}_{date}'
+
+
+def get_instructor_availability_cache_key(instructor_id, date, duration):
+    """Generate cache key for instructor availability"""
+    return f'instructor_avail_{instructor_id}_{date}_{duration}'
+
+
+def get_vehicle_availability_cache_key(vehicle_id, date, duration):
+    """Generate cache key for vehicle availability"""
+    return f'vehicle_avail_{vehicle_id}_{date}_{duration}'
+
+
+def get_schedule_conflicts_cache_key(instructor_id, vehicle_id, start_time, end_time):
+    """Generate cache key for conflict check (be careful with this - very specific)"""
+    # Hash the parameters to create a shorter key
+    key_data = f'{instructor_id}_{vehicle_id}_{start_time}_{end_time}'
+    key_hash = hashlib.md5(key_data.encode()).hexdigest()[:16]
+    return f'schedule_conflicts_{key_hash}'
+
+
+def get_my_schedule_mobile_cache_key(user_id, date=None):
+    """Generate cache key for mobile schedule"""
+    date_part = f'_{date}' if date else '_all'
+    return f'my_schedule_mobile_{user_id}{date_part}'
+
+
+# ============================================
+# SCHEDULE CACHE INVALIDATION
+# ============================================
+
+def invalidate_schedule_cache(schedule_id):
+    """Invalidate all caches related to a specific schedule"""
+    if not schedule_id:
+        return
+    
+    cache_keys = [
+        get_schedule_detail_cache_key(schedule_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+    
+    # Delete patterns with fallback
+    patterns = [
+        f'schedule_{schedule_id}_*',
+        f'*_schedule_{schedule_id}_*',
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_schedule_queryset_caches():
+    """Invalidate all schedule queryset caches"""
+    patterns = [
+        'schedules_queryset_*',
+        'my_schedule_*',
+        'upcoming_schedules_*',
+        'my_schedule_mobile_*',
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_instructor_schedule_caches(instructor_id):
+    """Invalidate caches for all schedules of an instructor"""
+    if not instructor_id:
+        return
+    
+    patterns = [
+        f'instructor_avail_{instructor_id}_*',
+        f'my_schedule_{instructor_id}_*',
+        f'upcoming_schedules_{instructor_id}_*',
+        f'schedules_queryset_{instructor_id}_*',
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_vehicle_schedule_caches(vehicle_id):
+    """Invalidate caches for all schedules using a vehicle"""
+    if not vehicle_id:
+        return
+    
+    patterns = [
+        f'vehicle_avail_{vehicle_id}_*',
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_availability_caches():
+    """Invalidate all availability caches (instructor and vehicle)"""
+    patterns = [
+        'instructor_avail_*',
+        'vehicle_avail_*',
+        'schedule_conflicts_*',
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_school_schedule_caches(school_id):
+    """Invalidate caches for all schedules in a school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'*_school_{school_id}_schedules_*',
+        f'schedules_*_school_{school_id}_*',
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
 
 # ============================================
 # CACHE PATTERN UTILITIES
 # ============================================
-
-def delete_pattern_with_fallback(pattern):
-    """
-    Delete pattern with fallback for cache backends without delete_pattern.
-    Returns number of keys deleted, or -1 if unknown.
-    """
-    try:
-        return cache.delete_pattern(pattern)
-    except AttributeError:
-        # Fallback: just clear everything (not ideal but works)
-        cache.clear()
-        return -1  # Unknown count
-
 
 def cache_exists(key):
     """Check if a cache key exists"""
@@ -826,7 +918,7 @@ def warm_user_cache(user):
     Pre-populate cache for a user.
     Useful after login or significant data changes.
     """
-    from .models import User, StudentProfile
+    from .models import StudentProfile
     
     # Warm user queryset cache
     cache_key = get_user_queryset_cache_key(user.id, user.role)
