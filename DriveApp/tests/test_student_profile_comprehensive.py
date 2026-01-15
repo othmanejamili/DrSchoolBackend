@@ -19,7 +19,6 @@ User = get_user_model()
 # ============================================
 # TEST CONFIGURATION - USE ENVIRONMENT VARIABLES
 # ============================================
-from tests.constants import TEST_PASSWORD
 
 # Alternative: Generate random passwords for tests
 def generate_test_password(prefix="test"):
@@ -29,13 +28,9 @@ def generate_test_password(prefix="test"):
 # Or use this safer approach:
 USE_RANDOM_PASSWORDS = True
 
-if USE_RANDOM_PASSWORDS:
-    TEST_ADMIN_PASSWORD = generate_test_password("admin")
-    TEST_OWNER_PASSWORD = generate_test_password("owner")
-    TEST_INSTRUCTOR_PASSWORD = generate_test_password("instructor")
-    TEST_STUDENT_PASSWORD = generate_test_password("student")
+TEST_PASSWORD = "test123!@#"
 
-
+ 
 @override_settings(
     DEBUG=False,
     # Use test-friendly rate limits
