@@ -2,18 +2,40 @@
 Signal handlers for automatic cache invalidation.
 """
 
-from django.db.models.signals import post_save, post_delete
+from django.db.models.signals import post_save, post_delete, pre_save
 from django.dispatch import receiver
 from django.core.cache import cache
 from .models import User, StudentProfile, DrivingSchool, Lesson, Schedule, Feedback, Attendance, Vehicle, VehiclePicture
-from .cache_utils import (invalidate_lesson_cache,  invalidate_lesson_queryset_caches, invalidate_instructor_lesson_caches,
-                          invalidate_school_lesson_caches, get_lesson_attendance_cache_key, get_lesson_feedback_cache_key,
-                          get_lesson_schedule_cache_key,invalidate_feedback_cache, invalidate_feedback_queryset_caches,
-                          invalidate_lesson_feedback_caches, invalidate_student_feedback_caches, invalidate_instructor_feedback_caches,
-                          invalidate_vehicle_cache, invalidate_vehicle_queryset_caches, invalidate_vehicle_maintenance_caches,
-                          invalidate_vehicle_statistics_caches, invalidate_school_vehicle_caches, invalidate_vehicle_pictures_cache)
+from .cache_utils import (
+    invalidate_lesson_cache,
+    invalidate_lesson_queryset_caches,
+    invalidate_instructor_lesson_caches,
+    invalidate_school_lesson_caches,
+    get_lesson_attendance_cache_key,
+    get_lesson_feedback_cache_key,
+    get_lesson_schedule_cache_key,
+    invalidate_feedback_cache,
+    invalidate_feedback_queryset_caches,
+    invalidate_lesson_feedback_caches,
+    invalidate_student_feedback_caches,
+    invalidate_instructor_feedback_caches,
+    invalidate_vehicle_cache,
+    invalidate_vehicle_queryset_caches,
+    invalidate_vehicle_maintenance_caches,
+    invalidate_vehicle_statistics_caches,
+    invalidate_school_vehicle_caches,
+    invalidate_vehicle_pictures_cache,
+    invalidate_school_schedule_caches,
+    invalidate_schedule_queryset_caches,
+    invalidate_schedule_cache,
+    invalidate_instructor_schedule_caches,
+    invalidate_vehicle_schedule_caches,
+    invalidate_availability_caches
+)
 
-
+# ============================================
+# USER SIGNAL HANDLERS
+# ============================================
 
 @receiver([post_save, post_delete], sender=User)
 def invalidate_user_cache(sender, instance, **kwargs):
@@ -48,6 +70,7 @@ def invalidate_school_cache(sender, instance, **kwargs):
         # Clear owner-specific school caches
         cache.delete(f'schools_queryset_{instance.owner.id}_{instance.owner.role}')
 
+
 # ============================================
 # LESSON SIGNAL HANDLERS
 # ============================================
@@ -80,7 +103,7 @@ def invalidate_attendance_on_change(sender, instance, **kwargs):
         if hasattr(instance, 'lesson') and instance.lesson.instructor_id:
             from .cache_utils import get_lesson_statistics_cache_key
             cache.delete(get_lesson_statistics_cache_key(
-                instance.lesson.instructor_id, 
+                instance.lesson.instructor_id,
                 'I'
             ))
     
@@ -89,7 +112,7 @@ def invalidate_attendance_on_change(sender, instance, **kwargs):
         from .cache_utils import get_lesson_statistics_cache_key
         if hasattr(instance.student, 'user'):
             cache.delete(get_lesson_statistics_cache_key(
-                instance.student.user_id, 
+                instance.student.user_id,
                 'S'
             ))
 
@@ -125,8 +148,9 @@ def invalidate_schedule_on_change(sender, instance, **kwargs):
                 'I'
             ))
 
+
 @receiver([post_save, post_delete], sender=Feedback)
-def invalidate_feedback_on_change(sender, instance, **kwargs):
+def invalidate_feedback_caches(sender, instance, **kwargs):
     """
     Invalidate feedback caches when feedback is created, updated, or deleted.
     This ensures users always see fresh feedback data.
@@ -153,6 +177,7 @@ def invalidate_feedback_on_change(sender, instance, **kwargs):
         if hasattr(instance.student, 'user_id'):
             from .cache_utils import get_my_feedback_cache_key
             cache.delete(get_my_feedback_cache_key(instance.student.user_id))
+
 
 # ============================================
 # VEHICLE SIGNAL HANDLERS
@@ -196,3 +221,34 @@ def invalidate_vehicle_picture_on_change(sender, instance, **kwargs):
         
         # Also invalidate vehicle detail cache (includes primary picture)
         invalidate_vehicle_cache(instance.vehicle_id)
+
+
+# ============================================
+# SCHEDULE SIGNALS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Schedule)
+def invalidate_schedule_caches_on_change(sender, instance, **kwargs):
+    """
+    Invalidate schedule caches when schedule is created, updated, or deleted.
+    """
+    # Invalidate specific schedule
+    invalidate_schedule_cache(instance.id)
+    
+    # Invalidate all schedule querysets
+    invalidate_schedule_queryset_caches()
+    
+    # Invalidate availability caches (slots may have opened/closed)
+    invalidate_availability_caches()
+    
+    # Invalidate instructor-specific caches
+    if instance.instructor_id:
+        invalidate_instructor_schedule_caches(instance.instructor_id)
+    
+    # Invalidate vehicle-specific caches
+    if instance.vehicle_id:
+        invalidate_vehicle_schedule_caches(instance.vehicle_id)
+    
+    # Invalidate school-specific caches
+    if instance.lesson and instance.lesson.school_id:
+        invalidate_school_schedule_caches(instance.lesson.school_id)

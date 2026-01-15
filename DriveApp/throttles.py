@@ -206,6 +206,49 @@ class VehicleStatisticsThrottle(UserRateThrottle):
 class VehicleHistoryThrottle(UserRateThrottle):
     """Limit vehicle history queries"""
     scope = 'vehicle_history'
+
+# ============================================
+# SCHEDULE MANAGEMENT THROTTLES
+# ============================================
+
+class ScheduleListThrottle(UserRateThrottle):
+    """Limit schedule listing"""
+    scope = 'schedule_list'
+
+
+class ScheduleCreateThrottle(UserRateThrottle):
+    """Limit schedule creation"""
+    scope = 'schedule_create'
+
+
+class ScheduleUpdateThrottle(UserRateThrottle):
+    """Limit schedule updates"""
+    scope = 'schedule_update'
+
+
+class ScheduleConflictCheckThrottle(UserRateThrottle):
+    """Limit conflict checking (expensive query)"""
+    scope = 'schedule_conflict_check'
+
+
+class ScheduleMyScheduleThrottle(UserRateThrottle):
+    """Limit my_schedule queries"""
+    scope = 'schedule_my_schedule'
+
+
+class ScheduleAvailabilityThrottle(UserRateThrottle):
+    """Limit availability queries (instructor/vehicle)"""
+    scope = 'schedule_availability'
+
+
+class ScheduleCancelThrottle(UserRateThrottle):
+    """Limit schedule cancellations"""
+    scope = 'schedule_cancel'
+
+
+class ScheduleRescheduleThrottle(UserRateThrottle):
+    """Limit rescheduling operations"""
+    scope = 'schedule_reschedule'
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================

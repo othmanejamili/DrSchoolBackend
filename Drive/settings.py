@@ -216,6 +216,7 @@ REST_FRAMEWORK = {
         'school_users': '60/minute', # School user listing
         'burst': '60/minute',        # Burst traffic allowance
         'school':'200/hour',
+        'school_list':'300/hour',
         'school_create':'10/hour',
         'student_progress': '100/hour',              # View student progress ✅ FIXED
         'student_progress_update': '30/hour',        # Update progress (instructors) ✅ FIXED
@@ -246,7 +247,7 @@ REST_FRAMEWORK = {
         'feedback_my_view': '50/hour',          # Student viewing own feedback
         'feedback_instructor_view': '60/minute', # Instructor viewing feedback
 
-        # vehicle managment
+        # vehicle management
         'vehicle_list': '300/hour',             # Vehicle listing
         'vehicle_create': '20/hour',            # Vehicle creation
         'vehicle_update': '100/hour',           # Vehicle updates
@@ -255,6 +256,17 @@ REST_FRAMEWORK = {
         'vehicle_maintenance': '50/hour',       # Maintenance operations
         'vehicle_statistics': '60/minute',      # Statistics queries
         'vehicle_history': '100/hour',          # History queries
+
+        # schedule management
+        'schedule_list': '400/hour',            # Schedule listing
+        'schedule_create': '50/hour',           # Schedule creation
+        'schedule_update': '100/hour',          # Schedule updates
+        'schedule_conflict_check': '200/hour',  # Conflict checking (frequent)
+        'schedule_my_schedule': '100/hour',     # My schedule queries
+        'schedule_availability': '150/hour',    # Availability queries
+        'schedule_cancel': '20/hour',           # Cancellations (safety)
+        'schedule_reschedule': '30/hour',       # Rescheduling
+
 
     },
     
@@ -517,7 +529,7 @@ CACHE_TIMEOUTS = {
     'my_lessons': 60 * 3,               # 3 minutes
     'lesson_statistics': 60 * 5,        # 5 minutes (expensive calculation)
 
-        'attendance_queryset': 60 * 3,      # 3 minutes for attendance lists
+    'attendance_queryset': 60 * 3,      # 3 minutes for attendance lists
     'attendance_detail': 60 * 5,        # 5 minutes for single attendance record
     
     # Custom Attendance Endpoints
@@ -550,6 +562,14 @@ CACHE_TIMEOUTS = {
     'vehicle_statistics': 60 * 10,      # 10 minutes (expensive query)
     'vehicle_history': 60 * 5,          # 5 minutes
     'my_school_vehicles': 60 * 3,       # 3 minutes
+
+    # schedule-related caches
+    'schedules_queryset': 60 * 3,           # 3 minutes (changes frequently)
+    'my_schedule': 60 * 2,                  # 2 minutes
+    'upcoming_schedules': 60 * 3,           # 3 minutes
+    'instructor_availability': 60 * 5,      # 5 minutes
+    'vehicle_availability': 60 * 5,         # 5 minutes
+    'my_schedule_mobile': 60 * 2,           # 2 minutes
 
     #Default
     'default': 60 * 5,

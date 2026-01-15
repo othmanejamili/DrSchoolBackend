@@ -46,7 +46,9 @@ from .throttles import (
         AttendanceStatisticsThrottle,FeedbackListThrottle, FeedbackCreateThrottle, FeedbackUpdateThrottle, FeedbackLessonViewThrottle,
         FeedbackMyViewThrottle, FeedbackInstructorViewThrottle, VehicleListThrottle, VehicleCreateThrottle,
         VehicleUpdateThrottle, VehiclePictureUploadThrottle, VehiclePictureManageThrottle, VehicleMaintenanceThrottle,
-        VehicleStatisticsThrottle, VehicleHistoryThrottle
+        VehicleStatisticsThrottle, VehicleHistoryThrottle, ScheduleListThrottle, ScheduleCreateThrottle, ScheduleUpdateThrottle,
+         ScheduleConflictCheckThrottle, ScheduleAvailabilityThrottle,
+        ScheduleMyScheduleThrottle, ScheduleCancelThrottle, ScheduleRescheduleThrottle,
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -65,7 +67,20 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_vehicle_maintenance_due_cache_key, get_vehicle_statistics_cache_key,
                             get_vehicle_history_cache_key, get_my_school_vehicles_cache_key,
                             invalidate_vehicle_cache, invalidate_vehicle_queryset_caches, invalidate_vehicle_maintenance_caches,
-                            invalidate_vehicle_statistics_caches, invalidate_school_vehicle_caches, invalidate_vehicle_pictures_cache
+                            invalidate_vehicle_statistics_caches, invalidate_school_vehicle_caches, invalidate_vehicle_pictures_cache,
+                            get_schedule_queryset_cache_key, get_my_schedule_cache_key, get_upcoming_schedules_cache_key, get_instructor_availability_cache_key,
+                            get_schedule_conflicts_cache_key, get_schedule_queryset_cache_key,
+                            get_my_schedule_cache_key,
+                            get_upcoming_schedules_cache_key,
+                            get_instructor_availability_cache_key,
+                            get_vehicle_availability_cache_key,
+                            get_my_schedule_mobile_cache_key,
+                            invalidate_schedule_cache,
+                            invalidate_schedule_queryset_caches,
+                            invalidate_instructor_schedule_caches,
+                            invalidate_vehicle_schedule_caches,
+                            invalidate_availability_caches,
+                            invalidate_school_schedule_caches
                             )
 
 User = get_user_model()
@@ -3509,80 +3524,131 @@ class VehicleViewSet(viewsets.ModelViewSet):
         
         return Response(response_data)
     
-
 #DSS-8-create-schedule-views
-
 class ScheduleViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing schedules with caching and rate limiting.
+    
+    Features:
+    - Multi-tenancy with school-based data isolation
+    - Query result caching for performance
+    - Rate limiting per action
+    - Automatic cache invalidation
+    - Conflict detection with 15-minute buffer
+    - Availability checking for instructors and vehicles
+    - Flexible date filtering and range queries
+    
+    Access Control:
+    - Platform Admins: Full access to all schedules
+    - School Owners: Manage schedules in their schools
+    - Instructors: View/manage their own schedules
+    - Students: View schedules in their school
+    """
+    
     serializer_class = ScheduleSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
     filterset_fields = ['vehicle', 'instructor', 'lesson__school', 'lesson__status']
     search_fields = ['vehicle__plate_number', 'instructor__username', 'lesson__title', 'start_time']
     ordering_fields = ['start_time', 'end_time', 'lesson__title']
-    ordering = ['start_time']  # Changed to ascending for better UX
+    ordering = ['start_time']
+    
+    # Default throttling
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
+        """
+        Filter schedules based on user role and school.
+        Implements query result caching.
+        """
         user = self.request.user
+        
         if not user.is_authenticated:
             return Schedule.objects.none()
         
-        # Platform Admin (staff) sees all schedules
+        # Generate cache key
+        cache_key = get_schedule_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role
         if user.role == 'A' and user.is_staff:
-            return Schedule.objects.all().select_related(
-                'lesson', 'lesson__school', 'lesson__instructor',
-                'vehicle', 'instructor'
-            )
+            # Platform Admin sees all schedules
+            queryset = Schedule.objects.all()
         
-        # School Owner (admin but not staff) sees schedules in their schools
-        if user.role == 'A' and not user.is_staff:
-            return Schedule.objects.filter(
-                lesson__school__owner=user
-            ).select_related(
-                'lesson', 'lesson__school', 'lesson__instructor',
-                'vehicle', 'instructor'
-            )
+        elif user.role == 'A' and not user.is_staff:
+            # School Owner sees schedules in their schools
+            queryset = Schedule.objects.filter(lesson__school__owner=user)
         
-        # Instructor sees their own schedules
-        if user.role == 'I':
-            return Schedule.objects.filter(
-                instructor=user
-            ).select_related(
-                'lesson', 'lesson__school', 'vehicle'
-            )
+        elif user.role == 'I':
+            # Instructor sees their own schedules
+            queryset = Schedule.objects.filter(instructor=user)
         
-        # Student sees schedules in their school
-        if user.role == 'S':
+        elif user.role == 'S':
+            # Student sees schedules in their school
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
-                return Schedule.objects.filter(
-                    lesson__school=student_profile.school
-                ).select_related(
-                    'lesson', 'lesson__instructor', 'vehicle', 'instructor'
-                )
+                queryset = Schedule.objects.filter(lesson__school=student_profile.school)
+            else:
+                queryset = Schedule.objects.none()
+        else:
+            queryset = Schedule.objects.none()
         
-        return Schedule.objects.none()
-    
+        # Optimize query
+        queryset = queryset.select_related(
+            'lesson',
+            'lesson__school',
+            'lesson__instructor',
+            'vehicle',
+            'instructor'
+        )
+        
+        # Cache the queryset for 3 minutes (schedules change frequently)
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 3)
+        
+        return queryset
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [ScheduleListThrottle()],
+            'create': [ScheduleCreateThrottle()],
+            'update': [ScheduleUpdateThrottle()],
+            'partial_update': [ScheduleUpdateThrottle()],
+            'check_conflicts': [ScheduleConflictCheckThrottle()],
+            'my_schedule': [ScheduleMyScheduleThrottle()],
+            'instructor_availability': [ScheduleAvailabilityThrottle()],
+            'vehicle_availability': [ScheduleAvailabilityThrottle()],
+            'cancel_schedule': [ScheduleCancelThrottle()],
+            'reschedule': [ScheduleRescheduleThrottle()],
+        }
+        
+        return throttle_map.get(self.action, super().get_throttles())
+
     def get_permissions(self):
+        """Define permissions per action"""
         if self.action == 'create':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
         elif self.action in ['update', 'partial_update']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
         elif self.action == 'destroy':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
-        
         elif self.action in ['cancel_schedule', 'reschedule']:
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwnerOrInstructor()]
-        
-        elif self.action in ['check_conflicts', 'my_schedule', 'upcoming', 
+        elif self.action in ['check_conflicts', 'my_schedule', 'upcoming',
                             'instructor_availability', 'vehicle_availability']:
             return [IsAuthenticated()]
-        
         return [IsAuthenticated()]
     
     @transaction.atomic
     def perform_create(self, serializer):
-        """Create schedule with validation"""
+        """Create schedule with validation and cache invalidation"""
         user = self.request.user
         lesson = serializer.validated_data.get('lesson')
         instructor = serializer.validated_data.get('instructor')
@@ -3598,9 +3664,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Cannot schedule in the past")
 
         if lesson and lesson.status == 'C':
-            raise Response({
-            'lesson': 'Cannot create schedule for a completed lesson'
-        })
+            raise PermissionDenied('Cannot create schedule for a completed lesson')
 
         # Check scheduling conflicts
         conflicts = self._check_scheduling_conflicts(
@@ -3611,7 +3675,8 @@ class ScheduleViewSet(viewsets.ModelViewSet):
 
         # Platform admin can create for any school
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            schedule = serializer.save()
+            self._invalidate_schedule_caches(schedule)
             return
 
         # School owner can create for their schools
@@ -3629,14 +3694,15 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             if vehicle and vehicle.school != lesson.school:
                 raise PermissionDenied("Vehicle does not belong to this school")
             
-            serializer.save()
-            return 
+            schedule = serializer.save()
+            self._invalidate_schedule_caches(schedule)
+            return
         
         raise PermissionDenied("You don't have permission to create schedules!")
     
     @transaction.atomic
     def perform_update(self, serializer):
-        """Update schedule with permission checks"""
+        """Update schedule with permission checks and cache invalidation"""
         user = self.request.user
         instance = self.get_object()
         lesson = serializer.validated_data.get('lesson', instance.lesson)
@@ -3658,8 +3724,10 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 )
                 if conflicts:
                     raise PermissionDenied(f"Scheduling conflict: {conflicts}")
-            serializer.save()
-            return 
+            
+            schedule = serializer.save()
+            self._invalidate_schedule_caches(schedule)
+            return
         
         # School owner can update schedules in their schools
         if user.role == 'A' and not user.is_staff:
@@ -3677,16 +3745,22 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 )
                 if conflicts:
                     raise PermissionDenied(f"Scheduling conflict: {conflicts}")
-            serializer.save()
-            return 
+            
+            schedule = serializer.save()
+            self._invalidate_schedule_caches(schedule)
+            return
         
         raise PermissionDenied("You don't have permission to update this schedule!!")
         
     @transaction.atomic
     def perform_destroy(self, instance):
-        """Delete schedule with permission checks"""
+        """Delete schedule with permission checks and cache invalidation"""
         user = self.request.user
         lesson = instance.lesson
+        schedule_id = instance.id
+        instructor_id = instance.instructor_id if instance.instructor else None
+        vehicle_id = instance.vehicle_id if instance.vehicle else None
+        school_id = lesson.school_id if lesson else None
 
         # Prevent deleting schedules in the past
         if instance.start_time < timezone.now():
@@ -3695,6 +3769,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         # Platform admin can delete any schedule
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            self._invalidate_all_schedule_caches(schedule_id, instructor_id, vehicle_id, school_id)
             return
 
         # School owner can delete schedules in their schools
@@ -3702,15 +3777,16 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             if lesson.school.owner != user:
                 raise PermissionDenied("You can only delete schedules in your own school")
             instance.delete()
-            return 
+            self._invalidate_all_schedule_caches(schedule_id, instructor_id, vehicle_id, school_id)
+            return
         
         raise PermissionDenied("You don't have permission to delete this schedule!!")
-    
+
     # ==================== HELPER METHODS ====================
     
     def _check_scheduling_conflicts(self, instructor, vehicle, start_time, end_time, exclude_id=None):
-        """Check for scheduling conflicts"""
-        buffer_minutes = 15  # 15 minutes buffer between lessons
+        """Check for scheduling conflicts with 15-minute buffer"""
+        buffer_minutes = 15
         buffer_time = timedelta(minutes=buffer_minutes)
         
         conflicts = []
@@ -3746,14 +3822,45 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 conflicts.append(f"Vehicle booked from {conflict.start_time} to {conflict.end_time}")
         
         return "; ".join(conflicts) if conflicts else None
-    
+
+    def _invalidate_schedule_caches(self, schedule):
+        """Helper to invalidate caches related to a schedule"""
+        invalidate_schedule_cache(schedule.id)
+        invalidate_schedule_queryset_caches()
+        invalidate_availability_caches()
+        
+        if schedule.instructor_id:
+            invalidate_instructor_schedule_caches(schedule.instructor_id)
+        
+        if schedule.vehicle_id:
+            invalidate_vehicle_schedule_caches(schedule.vehicle_id)
+        
+        if schedule.lesson and schedule.lesson.school_id:
+            invalidate_school_schedule_caches(schedule.lesson.school_id)
+
+    def _invalidate_all_schedule_caches(self, schedule_id, instructor_id, vehicle_id, school_id):
+        """Helper to invalidate all caches after deletion"""
+        invalidate_schedule_cache(schedule_id)
+        invalidate_schedule_queryset_caches()
+        invalidate_availability_caches()
+        
+        if instructor_id:
+            invalidate_instructor_schedule_caches(instructor_id)
+        
+        if vehicle_id:
+            invalidate_vehicle_schedule_caches(vehicle_id)
+        
+        if school_id:
+            invalidate_school_schedule_caches(school_id)
+
     # ==================== CUSTOM ACTIONS ====================
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
+            throttle_classes=[ScheduleMyScheduleThrottle])
     def my_schedule(self, request):
         """Get schedules for the authenticated user"""
         user = request.user
-        queryset = self.get_queryset()
         
         # Get query parameters
         range_filter = request.query_params.get('range', 'upcoming').lower()
@@ -3764,10 +3871,19 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         limit = int(request.query_params.get('limit', 50))
         ordering = request.query_params.get('ordering', 'start_time')
         
+
+        # Check cache
+        cache_key = get_my_schedule_cache_key(user.id, range_filter, status_filter)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         # Validate ordering
         if ordering not in ['start_time', '-start_time']:
             ordering = 'start_time'
         
+
+        queryset = self.get_queryset()
         # Apply date filtering
         now = timezone.now()
         
@@ -3918,143 +4034,25 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                     'location': next_schedule.lesson.school.name if next_schedule.lesson and next_schedule.lesson.school else 'Not specified'
                 }
         
-
         # Apply limit
         if limit > 0:
             queryset = queryset[:limit]
 
+        cache.set(cache_key, response_data, 60 * 2)
         return Response(response_data)
 
-
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
-    def check_conflicts(self, request):
-        """Check for scheduling conflicts"""
-        instructor_id = request.data.get('instructor_id')
-        vehicle_id = request.data.get('vehicle_id')
-        start_time_str = request.data.get('start_time')
-        end_time_str = request.data.get('end_time')
-        exclude_schedule_id = request.data.get('exclude_schedule_id')
-        
-        # Validate required fields
-        if not start_time_str or not end_time_str:
-            return Response(
-                {'error': 'start_time and end_time are required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            start_time = parse_datetime(start_time_str)
-            end_time = parse_datetime(end_time_str)
-            if start_time is None or end_time is None:
-                return Response(
-                    {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS[±HH:MM])'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )            
-            if timezone.is_naive(start_time):
-                start_time = timezone.make_aware(start_time)
-            if timezone.is_naive(end_time):
-                end_time = timezone.make_aware(end_time)
-
-        except (ValueError, TypeError):
-            return Response(
-                {'error': 'Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Validate time slot
-        if end_time <= start_time:
-            return Response(
-                {'error': 'End time must be after start time'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Get objects
-        instructor = None
-        vehicle = None
-        
-        if instructor_id:
-            try:
-                from .models import User
-                instructor = User.objects.get(id=instructor_id, role='I')
-            except User.DoesNotExist:
-                return Response(
-                    {'error': 'Instructor not found'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        if vehicle_id:
-            try:
-                vehicle = Vehicle.objects.get(id=vehicle_id)
-            except Vehicle.DoesNotExist:
-                return Response(
-                    {'error': 'Vehicle not found'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        # Check conflicts
-        conflicts = []
-        buffer_minutes = 15
-        buffer_time = timedelta(minutes=buffer_minutes)
-        
-        # Check instructor conflicts
-        if instructor:
-            instructor_query = Schedule.objects.filter(
-                instructor=instructor,
-                start_time__lt=end_time + buffer_time,
-                end_time__gt=start_time - buffer_time
-            )
-            
-            if exclude_schedule_id:
-                instructor_query = instructor_query.exclude(id=exclude_schedule_id)
-            
-            if instructor_query.exists():
-                for conflict in instructor_query:
-                    conflicts.append({
-                        'type': 'instructor',
-                        'schedule_id': conflict.id,
-                        'start_time': conflict.start_time,
-                        'end_time': conflict.end_time,
-                        'lesson_title': conflict.lesson.title if conflict.lesson else 'No title'
-                    })
-        
-        # Check vehicle conflicts
-        if vehicle:
-            vehicle_query = Schedule.objects.filter(
-                vehicle=vehicle,
-                start_time__lt=end_time + buffer_time,
-                end_time__gt=start_time - buffer_time
-            )
-            
-            if exclude_schedule_id:
-                vehicle_query = vehicle_query.exclude(id=exclude_schedule_id)
-            
-            if vehicle_query.exists():
-                for conflict in vehicle_query:
-                    conflicts.append({
-                        'type': 'vehicle',
-                        'schedule_id': conflict.id,
-                        'start_time': conflict.start_time,
-                        'end_time': conflict.end_time,
-                        'lesson_title': conflict.lesson.title if conflict.lesson else 'No title'
-                    })
-        
-        return Response({
-            'has_conflicts': len(conflicts) > 0,
-            'conflicts': conflicts,
-            'available': len(conflicts) == 0,
-            'time_slot': {
-                'start_time': start_time,
-                'end_time': end_time,
-                'duration_minutes': (end_time - start_time).total_seconds() / 60
-            }
-        })
-
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated] ,throttle_classes=[ScheduleAvailabilityThrottle])
     def instructor_availability(self, request):
         """Get available time slots for an instructor"""
         instructor_id = request.query_params.get('instructor_id')
         date_str = request.query_params.get('date')
         duration_minutes = int(request.query_params.get('duration', 60))
+        
+        # Check cache
+        cache_key = get_instructor_availability_cache_key(instructor_id, date_str, duration_minutes)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         if not instructor_id or not date_str:
             return Response(
@@ -4121,29 +4119,47 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             
             # Move to next slot (30-minute increments)
             current_time += timedelta(minutes=30)
-        
-        return Response({
+
+
+        response_data = {
             'instructor': {
                 'id': instructor.id,
                 'name': instructor.get_full_name() or instructor.username
             },
-            'date': date_obj,
+            'date': date_obj.isoformat(),
             'working_hours': {
-                'start': working_start.time(),
-                'end': working_end.time()
+                'start': working_start.time().strftime('%H:%M'),
+                'end': working_end.time().strftime('%H:%M')
             },
             'scheduled_lessons': ScheduleSerializer(schedules, many=True).data,
-            'available_slots': available_slots,
+            'available_slots': [
+                {
+                    'start_time': slot['start_time'].isoformat(),
+                    'end_time': slot['end_time'].isoformat(),
+                    'duration_minutes': slot['duration_minutes']
+                }
+                for slot in available_slots
+            ],
             'total_available_slots': len(available_slots)
-        })
+        }
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+
+        cache.set(cache_key, response_data, 60 * 5)
+        return Response(response_data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],throttle_classes=[ScheduleAvailabilityThrottle])
     def vehicle_availability(self, request):
         """Get available time slots for a vehicle"""
         vehicle_id = request.query_params.get('vehicle_id')
         date_str = request.query_params.get('date')
         duration_minutes = int(request.query_params.get('duration', 60))
         
+
+        cache_key = get_vehicle_availability_cache_key(vehicle_id, date_str, duration_minutes)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+
         if not vehicle_id or not date_str:
             return Response(
                 {'error': 'vehicle_id and date are required'},
@@ -4217,7 +4233,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             # Move to next slot (30-minute increments)
             current_time += timedelta(minutes=30)
         
-        return Response({
+        response_data = {
             'vehicle': {
                 'id': vehicle.id,
                 'plate_number': vehicle.plate_number,
@@ -4225,15 +4241,25 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 'model': vehicle.model,
                 'status': vehicle.status
             },
-            'date': date_obj,
+            'date': date_obj.isoformat(),
             'working_hours': {
-                'start': working_start.time(),
-                'end': working_end.time()
+                'start': working_start.time().strftime('%H:%M'),
+                'end': working_end.time().strftime('%H:%M')
             },
             'scheduled_lessons': ScheduleSerializer(schedules, many=True).data,
-            'available_slots': available_slots,
+            'available_slots': [
+                {
+                    'start_time': slot['start_time'].isoformat(),
+                    'end_time': slot['end_time'].isoformat(),
+                    'duration_minutes': slot['duration_minutes']
+                }
+                for slot in available_slots
+            ],   
             'total_available_slots': len(available_slots)
-        })
+        }
+
+        cache.set(cache_key, response_data, 60 * 5)
+        return Response(response_data)
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def upcoming(self, request):
@@ -4241,6 +4267,12 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         user = request.user
         now = timezone.now()
         next_week = now + timedelta(days=7)
+        
+        # Check cache
+        cache_key = get_upcoming_schedules_cache_key(user.id, user.role, now.date().isoformat())
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         queryset = self.get_queryset().filter(
             start_time__gte=now,
@@ -4275,10 +4307,10 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             day: len(schedules) for day, schedules in schedules_by_day.items()
         }
         
-        return Response({
+        response_data = {
             'period': {
-                'start': now.date(),
-                'end': next_week.date(),
+                'start': now.date().isoformat(),
+                'end': next_week.date().isoformat(),
                 'days': 7
             },
             'total_schedules': queryset.count(),
@@ -4286,9 +4318,13 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             'schedules_by_day': schedules_by_day,
             'today': now.date().isoformat(),
             'tomorrow': (now.date() + timedelta(days=1)).isoformat()
-        })
+        }
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+        # Cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+        return Response(response_data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor], throttle_classes=[ScheduleCancelThrottle])
     @transaction.atomic
     def cancel_schedule(self, request, pk=None):
         """Cancel a schedule"""
@@ -4318,7 +4354,8 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         # Delete the schedule
         schedule_id = schedule.id
         schedule.delete()
-        
+        # Invalidate caches after cancellation
+        self._invalidate_schedule_caches(schedule)
         return Response({
             'message': 'Schedule cancelled successfully',
             'cancelled_schedule_id': schedule_id,
@@ -4327,7 +4364,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             'cancelled_at': timezone.now()
         })
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],throttle_classes=[ScheduleRescheduleThrottle])
     @transaction.atomic
     def reschedule(self, request, pk=None):
         """Reschedule a lesson to a new time"""
@@ -4413,6 +4450,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         serializer = ScheduleSerializer(schedule, context={'request': request})
         
+        self._invalidate_schedule_caches(schedule)
         return Response({
             'message': 'Schedule updated successfully',
             'schedule': serializer.data,
@@ -4423,7 +4461,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 'new_end_time': new_end_time
             }
         })
-
+    
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def my_schedule_mobile(self, request):
         """Mobile-optimized schedule endpoint"""
@@ -4436,6 +4474,12 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         # Apply date filter if provided
         date_str = request.query_params.get('date')
+
+        cache_key = get_my_schedule_mobile_cache_key(user.id, date_str)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         if date_str:
             try:
                 date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
@@ -4476,11 +4520,16 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 'schedules': serializer.data
             }
             
+                    # Cache for 2 minutes
+            cache.set(cache_key, response_data, 60 * 2)
             return paginator.get_paginated_response(response_data)
         
         serializer = ScheduleSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data)
+    
 
+
+    
 #Dss-11-create-Achievement-view     
 class AchievemtViewSet(viewsets.ModelViewSet):
     serializer_class =  AchievementSerializer
