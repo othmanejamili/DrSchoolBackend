@@ -275,6 +275,13 @@ REST_FRAMEWORK = {
         'achievement_leaderboard': '100/hour',  # Leaderboard queries
         'achievement_statistics': '60/minute',  # Statistics queries
 
+        # Communication Template
+        'communication_template_list':'100/hour',
+        'communication_template_create':'20/hour',
+        'communication_template_update':'10/hour',
+        'communication_template_duplicate':'20/hour',
+        'communication_template_preview':'50/hour',
+        'communication_template_usage_stats':'60/minute'
 
     },
     
@@ -587,6 +594,41 @@ CACHE_TIMEOUTS = {
     'student_progress': 60 * 5,             # 5 minutes
     'badges': 60 * 10,                      # 10 minutes (rarely changes)
 
-    #Default
+    # Communication-related caches
+    'communication_templates_queryset': 60 * 5,      # 5 minutes (list views)
+    'communication_template_detail': 60 * 10,        # 10 minutes (single template)
+    'templates_by_type': 60 * 5,                     # 5 minutes (grouped view)
+    'template_usage_stats': 60 * 10,                 # 10 minutes (expensive query)
+    'my_school_templates': 60 * 3,                   # 3 minutes (frequently accessed)
+    
+    # Communication variables and metadata
+    'available_variables': 60 * 60,                  # 1 hour (rarely changes)
+    'template_variables': 60 * 30,                   # 30 minutes
+    
+    # Message-related caches
+    'automated_messages_queryset': 60 * 2,           # 2 minutes (changes frequently)
+    'automated_message_detail': 60 * 5,              # 5 minutes
+    'message_statistics': 60 * 10,                   # 10 minutes (expensive query)
+    'scheduled_messages': 60 * 1,                    # 1 minute (very dynamic)
+    'sent_messages': 60 * 5,                         # 5 minutes
+    'message_history': 60 * 10,                      # 10 minutes
+    
+    # Communication preview caches
+    'template_preview': 60 * 2,                      # 2 minutes (short-lived)
+    
+    # Communication analytics
+    'communication_analytics': 60 * 15,              # 15 minutes
+    'message_delivery_stats': 60 * 10,               # 10 minutes
+    'template_effectiveness': 60 * 30,               # 30 minutes (rarely changes)
+    
+    # Bulk communication operations
+    'bulk_message_operations': 60 * 5,               # 5 minutes
+    
+    # Student communication history
+    'student_messages': 60 * 3,                      # 3 minutes
+    'my_messages': 60 * 2,                           # 2 minutes (student's own)
+    'unread_messages_count': 60 * 1,                 # 1 minute (very dynamic)    
+
+    #Default 
     'default': 60 * 5,
 }

@@ -49,7 +49,8 @@ from .throttles import (
         VehicleStatisticsThrottle, VehicleHistoryThrottle, ScheduleListThrottle, ScheduleCreateThrottle, ScheduleUpdateThrottle,
         ScheduleConflictCheckThrottle, ScheduleAvailabilityThrottle, ScheduleMyScheduleThrottle, ScheduleCancelThrottle, ScheduleRescheduleThrottle,
         AchievementListThrottle, AchievementAwardThrottle, AchievementBulkAwardThrottle, AchievementCheckMilestonesThrottle, AchievementLeaderboardThrottle,
-        AchievementStatisticsThrottle
+        AchievementStatisticsThrottle, CommunicationTemplateListThrottle, CommunicationTemplateCreateThrottle, CommunicationTemplateUpdateThrottle,
+        CommunicationTemplateDuplicateThrottle, CommunicationTemplatePreviewThrottle, CommunicationTemplateUsageStatsThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -76,7 +77,9 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             invalidate_vehicle_schedule_caches, invalidate_availability_caches, invalidate_school_schedule_caches,
                             get_achievement_queryset_cache_key, invalidate_achievement_cache, invalidate_achievement_queryset_caches, 
                             invalidate_leaderboard_caches, invalidate_achievement_statistics_caches, invalidate_student_achievement_caches,
-                            get_my_achievements_cache_key,get_leaderboard_cache_key, get_achievement_statistics_cache_key
+                            get_my_achievements_cache_key,get_leaderboard_cache_key, get_achievement_statistics_cache_key, get_communication_template_queryset_cache_key,
+                            invalidate_communication_template_cache, invalidate_communication_template_queryset_caches, get_template_by_type_cache_key,
+                            get_template_usage_stats_cache_key
                             )
 
 User = get_user_model()
@@ -5500,7 +5503,6 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             'badges': badges
         })
 
-
 # DSS-12-create-CommunicationViewSet
 class CommunicationTemplateViewSet(viewsets.ModelViewSet):
     """
@@ -5521,34 +5523,64 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
     search_fields = ['name', 'subject', 'body', 'template_type']
     ordering_fields = ['name', 'created_at', 'template_type']
     ordering = ['-created_at']
+    throttle_classes = [UserRateThrottle]
 
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        if self.action == 'list':
+            return [CommunicationTemplateListThrottle()]
+        elif self.action == 'create':
+            return [CommunicationTemplateCreateThrottle()]
+        elif self.action in ['update', 'partial_update']:
+            return [CommunicationTemplateUpdateThrottle()]
+        elif self.action == 'duplicate':
+            return [CommunicationTemplateDuplicateThrottle()]
+        elif self.action == 'preview':
+            return [CommunicationTemplatePreviewThrottle()]
+        elif self.action == 'usage_stats':
+            return [CommunicationTemplateUsageStatsThrottle()]
+        return super().get_throttles()
+    
     def get_queryset(self):
         """Filter templates based on user role and school"""
         user = self.request.user
         if not user.is_authenticated:
             return CommunicationTemplate.objects.none()
         
+        # Generate cache key
+        cache_key = get_communication_template_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+
+        
         # Platform Admin (staff) sees all templates
         if user.role == 'A' and user.is_staff:
-            return CommunicationTemplate.objects.all().select_related('school')
-        
+            queryset = CommunicationTemplate.objects.all()
         # School Owner sees templates in their schools
-        if user.role == 'A' and not user.is_staff:
-            return CommunicationTemplate.objects.filter(
-                school__owner=user
-            ).select_related('school')
-        
+        elif user.role == 'A' and not user.is_staff:
+            queryset = CommunicationTemplate.objects.filter(school__owner=user)
         # Instructor sees templates in their school
-        if user.role == 'I':
+        elif user.role == 'I':
             instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
-                return CommunicationTemplate.objects.filter(
-                    school=instructor_profile.school
-                ).select_related('school')
-        
-        
+                queryset = CommunicationTemplate.objects.filter(school=instructor_profile.school)
         # Students cannot access templates
-        return CommunicationTemplate.objects.none()
+        else:
+            queryset = CommunicationTemplate.objects.none()
+
+        # Optimize the code     
+        queryset = queryset.select_related('school')
+        #Cache for 5 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+
+        return queryset
     
     def get_permissions(self):
         """Define permissions per action"""
@@ -5576,16 +5608,26 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         
         # Platform admin can create for any school
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            template = serializer.save()
+            invalidate_communication_template_cache(
+                template.id,
+                school_id=template.school_id
+            )
+            invalidate_communication_template_queryset_caches
             return
         
         # School owner can only create for their own schools
         if user.role == 'A' and not user.is_staff:
             if school.owner != user:
                 raise PermissionDenied("You can only create templates for your own schools")
-            serializer.save()
+            template = serializer.save()
+            invalidate_communication_template_cache(
+                template.id,
+                school_id=template.school_id
+            )
+            invalidate_communication_template_queryset_caches
             return
-        
+
         raise PermissionDenied("You don't have permission to create templates")
     
     def perform_update(self, serializer):
@@ -5596,6 +5638,11 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         # Platform admin can update any template
         if user.role == 'A' and user.is_staff:
             serializer.save()
+            invalidate_communication_template_cache(
+                instance.id,
+                school_id=instance.school_id
+            )
+            invalidate_communication_template_queryset_caches()
             return
         
         # School owner can update templates in their schools
@@ -5603,6 +5650,11 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
             if instance.school.owner != user:
                 raise PermissionDenied("You can only update templates in your own schools")
             serializer.save()
+            invalidate_communication_template_cache(
+                instance.id,
+                school_id=instance.school_id
+            )
+            invalidate_communication_template_queryset_caches()
             return
         
         raise PermissionDenied("You don't have permission to update this template")
@@ -5610,7 +5662,8 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """Delete template with permission checks"""
         user = self.request.user
-        
+        template_id = instance.id
+        school_id = instance.school_id
         # Check if template is in use
         usage_count = instance.messages.filter(status='pending').count()
         if usage_count > 0:
@@ -5630,6 +5683,9 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("You can only delete templates in your own schools")
             instance.delete()
             return
+        
+        invalidate_communication_template_cache(template_id, school_id=school_id)
+        invalidate_communication_template_queryset_caches()
         
         raise PermissionDenied("You don't have permission to delete this template")
     
@@ -5827,7 +5883,15 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         queryset = self.get_queryset()
         
         # Filter by school if provided (admin only)
+        user = request.user
         school_id = request.query_params.get('school_id')
+
+        cache_key = get_template_by_type_cache_key(user.id, school_id)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+        
         if school_id:
             user = request.user
             if user.role == 'A' and user.is_staff:
@@ -5853,13 +5917,17 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
                 'templates': serializer.data
             }
         
-        return Response({
+        response_data = {
             'grouped_templates': grouped,
             'total_types': len(template_types),
             'total_templates': queryset.count()
-        })
+        }
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+        cache.set(cache_key, response_data, 60 * 5)
+        return Response(response_data)
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
+    throttle_classes=[CommunicationTemplateUsageStatsThrottle])
     def usage_stats(self, request):
         """
         Get template usage statistics.
@@ -5867,6 +5935,13 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         GET /api/communication-templates/usage_stats/
         """
         queryset = self.get_queryset()
+        
+        user = request.user
+        cache_key = get_template_usage_stats_cache_key(user.id)
+        
+        cached_stats = cache.get(cache_key)
+        if cached_stats is not None:
+            return Response(cached_stats)
         
         # Overall stats
         total_templates = queryset.count()
@@ -5893,7 +5968,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         # Templates never used
         never_used = queryset.filter(messages__isnull=True).count()
         
-        return Response({
+        stats = {
             'summary': {
                 'total_templates': total_templates,
                 'active_templates': active_templates,
@@ -5904,7 +5979,10 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
             'total_messages_created': queryset.aggregate(
                 total=Count('messages')
             )['total'] or 0
-        })
+        }
+
+        cache.set(cache_key, stats, 60 * 10)
+        return Response(stats)
     
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
     def my_school_templates(self, request):
