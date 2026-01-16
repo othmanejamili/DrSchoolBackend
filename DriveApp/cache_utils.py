@@ -870,6 +870,95 @@ def invalidate_school_schedule_caches(school_id):
     for pattern in patterns:
         delete_pattern_with_fallback(pattern)
 
+# ============================================
+#               ACHIEVEMENT
+# ============================================
+
+def get_achievement_queryset_cache_key(user_id, role):
+    """Generate cache key for achievement queryset"""
+    return f'achievements_queryset_{user_id}_{role}'
+
+
+def get_my_achievements_cache_key(user_id):
+    """Generate cache key for my_achievements"""
+    return f'my_achievements_{user_id}'
+
+
+def get_leaderboard_cache_key(scope, time_period, limit, school_id=None):
+    """Generate cache key for leaderboard"""
+    school_part = f'_school_{school_id}' if school_id else ''
+    return f'leaderboard_{scope}_{time_period}_{limit}{school_part}'
+
+
+def get_achievement_statistics_cache_key(user_id, role):
+    """Generate cache key for statistics"""
+    return f'achievement_stats_{user_id}_{role}'
+
+
+def get_student_progress_cache_key(student_id):
+    """Generate cache key for student progress"""
+    return f'student_progress_{student_id}'
+
+
+def get_badges_cache_key(student_id):
+    """Generate cache key for badges"""
+    return f'badges_{student_id}'
+
+
+def invalidate_achievement_cache(achievement_id):
+    """Invalidate specific achievement cache"""
+    if not achievement_id:
+        return
+    cache.delete(f'achievement_detail_{achievement_id}')
+
+
+def invalidate_achievement_queryset_caches():
+    """Invalidate all achievement queryset caches"""
+    patterns = [
+        'achievements_queryset_*',
+        'my_achievements_*',
+        'student_progress_*',
+        'badges_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+
+def invalidate_leaderboard_caches():
+    """Invalidate all leaderboard caches"""
+    try:
+        cache.delete_pattern('leaderboard_*')
+    except AttributeError:
+        pass
+
+
+def invalidate_achievement_statistics_caches():
+    """Invalidate all statistics caches"""
+    try:
+        cache.delete_pattern('achievement_stats_*')
+    except AttributeError:
+        pass
+
+
+def invalidate_student_achievement_caches(student_id):
+    """Invalidate caches for a specific student's achievements"""
+    if not student_id:
+        return
+    
+    cache_keys = [
+        get_my_achievements_cache_key(student_id),
+        get_student_progress_cache_key(student_id),
+        get_badges_cache_key(student_id),
+    ]
+    
+    for key in cache_keys:
+        cache.delete(key)
+
+
 
 # ============================================
 # CACHE PATTERN UTILITIES

@@ -47,8 +47,9 @@ from .throttles import (
         FeedbackMyViewThrottle, FeedbackInstructorViewThrottle, VehicleListThrottle, VehicleCreateThrottle,
         VehicleUpdateThrottle, VehiclePictureUploadThrottle, VehiclePictureManageThrottle, VehicleMaintenanceThrottle,
         VehicleStatisticsThrottle, VehicleHistoryThrottle, ScheduleListThrottle, ScheduleCreateThrottle, ScheduleUpdateThrottle,
-         ScheduleConflictCheckThrottle, ScheduleAvailabilityThrottle,
-        ScheduleMyScheduleThrottle, ScheduleCancelThrottle, ScheduleRescheduleThrottle,
+        ScheduleConflictCheckThrottle, ScheduleAvailabilityThrottle, ScheduleMyScheduleThrottle, ScheduleCancelThrottle, ScheduleRescheduleThrottle,
+        AchievementListThrottle, AchievementAwardThrottle, AchievementBulkAwardThrottle, AchievementCheckMilestonesThrottle, AchievementLeaderboardThrottle,
+        AchievementStatisticsThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -69,18 +70,13 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             invalidate_vehicle_cache, invalidate_vehicle_queryset_caches, invalidate_vehicle_maintenance_caches,
                             invalidate_vehicle_statistics_caches, invalidate_school_vehicle_caches, invalidate_vehicle_pictures_cache,
                             get_schedule_queryset_cache_key, get_my_schedule_cache_key, get_upcoming_schedules_cache_key, get_instructor_availability_cache_key,
-                            get_schedule_conflicts_cache_key, get_schedule_queryset_cache_key,
-                            get_my_schedule_cache_key,
-                            get_upcoming_schedules_cache_key,
-                            get_instructor_availability_cache_key,
-                            get_vehicle_availability_cache_key,
-                            get_my_schedule_mobile_cache_key,
-                            invalidate_schedule_cache,
-                            invalidate_schedule_queryset_caches,
-                            invalidate_instructor_schedule_caches,
-                            invalidate_vehicle_schedule_caches,
-                            invalidate_availability_caches,
-                            invalidate_school_schedule_caches
+                            get_schedule_conflicts_cache_key, get_schedule_queryset_cache_key, get_my_schedule_cache_key, get_upcoming_schedules_cache_key,
+                            get_instructor_availability_cache_key, get_vehicle_availability_cache_key, get_my_schedule_mobile_cache_key,
+                            invalidate_schedule_cache, invalidate_schedule_queryset_caches, invalidate_instructor_schedule_caches,
+                            invalidate_vehicle_schedule_caches, invalidate_availability_caches, invalidate_school_schedule_caches,
+                            get_achievement_queryset_cache_key, invalidate_achievement_cache, invalidate_achievement_queryset_caches, 
+                            invalidate_leaderboard_caches, invalidate_achievement_statistics_caches, invalidate_student_achievement_caches,
+                            get_my_achievements_cache_key,get_leaderboard_cache_key, get_achievement_statistics_cache_key
                             )
 
 User = get_user_model()
@@ -4526,10 +4522,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         
         serializer = ScheduleSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data)
-    
-
-
-    
+     
 #Dss-11-create-Achievement-view     
 class AchievemtViewSet(viewsets.ModelViewSet):
     serializer_class =  AchievementSerializer
@@ -4538,39 +4531,71 @@ class AchievemtViewSet(viewsets.ModelViewSet):
     search_fields = ['student__user__username','type','title','points','description','icon','earned_at']
     ordering_fields = ['type','earned_at','points','student__user__username']
     ordering = ['-earned_at']
+    #Default throttling
+    throttle_classes = [UserRateThrottle]
 
     def get_queryset(self):
         user = self.request.user
+        
         if not user.is_authenticated:
             return Achievement.objects.none()
         
+        # Generate cache key
+        cache_key = get_achievement_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+            
+
         # Platform Admin (staff) sees all Achievment
         if user.role == 'A' and user.is_staff:
-            return Achievement.objects.all().select_related('student__user','student__school')
-        
+            queryset = Achievement.objects.all()
         # School Owner (admin but not staff) sees Achievement in their schools
-        if user.role == 'A' and not user.is_staff:
-            return Achievement.objects.filter(
-                student__school__owner=user
-            ).select_related('student__user','student__school')
-        
+        elif user.role == 'A' and not user.is_staff:
+            queryset = Achievement.objects.filter(student__school__owner=user)
         # Instructor sees their own school Achievement
-        if user.role == 'I':
+        elif user.role == 'I':
             instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
-                return Achievement.objects.filter(
-                    student__school=instructor_profile.school
-                ).select_related('student__user','student__school')
-            return Achievement.objects.none()
-        
+                queryset = Achievement.objects.filter(student__school=instructor_profile.school)
+            queryset = Achievement.objects.none()
         # Student sees schedules in their school
-        if user.role == 'S':
-            return Achievement.objects.filter(
-                student__user = user
-            ).select_related('student__user','student__school')
-        
-        return Achievement.objects.none()
+        elif user.role == 'S':
+            queryset = Achievement.objects.filter(student__user = user)
+        else:
+            queryset = Achievement.objects.none()
+
+        # optimize query
+        queryset = queryset.select_related('student__user','student__school')
     
+        #cache for 5 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+        
+        return queryset
+    
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [AchievementListThrottle()],
+            'award_achievement': [AchievementAwardThrottle()],
+            'bulk_award': [AchievementBulkAwardThrottle()],
+            'check_milestones': [AchievementCheckMilestonesThrottle()],
+            'leaderboard': [AchievementLeaderboardThrottle()],
+            'statistics': [AchievementStatisticsThrottle()],
+        }
+        
+        return throttle_map.get(self.action, super().get_throttles())
+
     def get_permissions(self):
         if self.action == 'create':
             return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
@@ -4602,13 +4627,16 @@ class AchievemtViewSet(viewsets.ModelViewSet):
         student = serializer.validated_data.get('student')
 
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            achievement = serializer.save()
+            self._invalidate_achievement_caches(achievement)
             return 
         
         if user.role == 'A' and not user.is_staff:
             if student.school.owner != user:
                 raise PermissionDenied("You can only award achievements to students in your schools")
-            serializer.save()
+            achievement = serializer.save()
+            self._invalidate_achievement_caches(achievement)
+
             return
         
         raise PermissionDenied("You don't have permission to create achievements!")
@@ -4625,13 +4653,38 @@ class AchievemtViewSet(viewsets.ModelViewSet):
     
     @transaction.atomic
     def perform_destroy(self, instance):
+        """Delete achievement with cache invalidation"""
         user = self.request.user
+        achievement_id = instance.id
+        student_id = instance.student_id
 
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            self._invalidate_all_achievement_caches(achievement_id, student_id)
             return
         
         raise PermissionDenied("Only platform administrators can delete achievements")
+
+    def _invalidate_achievement_caches(self, achievement):
+        """Helper to invalidate caches"""
+        invalidate_achievement_cache(achievement.id)
+        invalidate_achievement_queryset_caches()
+        invalidate_leaderboard_caches()
+        invalidate_achievement_statistics_caches()
+        
+        if achievement.student_id:
+            invalidate_student_achievement_caches(achievement.student_id)
+
+    def _invalidate_all_achievement_caches(self, achievement_id, student_id):
+        """Helper for deletion"""
+        invalidate_achievement_cache(achievement_id)
+        invalidate_achievement_queryset_caches()
+        invalidate_leaderboard_caches()
+        invalidate_achievement_statistics_caches()
+        
+        if student_id:
+            invalidate_student_achievement_caches(student_id)
+
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def my_achievements(self, request):
@@ -4647,13 +4700,18 @@ class AchievemtViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Check cache
+        cache_key = get_my_achievements_cache_key(user.id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+
         try:
             student_profile = StudentProfile.objects.get(user=user, status='A')
         except StudentProfile.DoesNotExist:
-            return Response(
-                {'error': 'No active student profile found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'error': 'No active student profile found'},
+                          status=status.HTTP_404_NOT_FOUND)
+        
         
         # Get student's achievements
         achievements = Achievement.objects.filter(student=student_profile).order_by('-earned_at')
@@ -4682,7 +4740,7 @@ class AchievemtViewSet(viewsets.ModelViewSet):
         week_ago = timezone.now() - timedelta(days=7)
         recent_achievements = achievements.filter(earned_at__gte=week_ago)
         
-        return Response({
+        response_data = {
             'student': {
                 'id': student_profile.id,
                 'name': user.get_full_name() or user.username,
@@ -4699,7 +4757,12 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             'earned_achievements': serializer.data,
             'available_achievements': available,
             'recent_achievements': AchievementSerializer(recent_achievements, many=True).data
-        })
+        }
+
+        # cache for 3 minutes
+        cache.set(cache_key, response_data, 60 * 3)
+
+        return Response(response_data) 
     
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
     @transaction.atomic
@@ -4949,7 +5012,8 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             'results': results
         })
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
+    throttle_classes=[AchievementLeaderboardThrottle])
     def leaderboard(self, request):
         """
         Get achievement leaderboard.
@@ -4963,6 +5027,13 @@ class AchievemtViewSet(viewsets.ModelViewSet):
         scope = request.query_params.get('scope', 'school')
         limit = min(int(request.query_params.get('limit', 10)), 100)
         time_period = request.query_params.get('time_period', 'all_time')
+        school_id = request.query_params.get('school_id')
+        
+        # Check cache
+        cache_key = get_leaderboard_cache_key(scope, time_period, limit, school_id)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         # Determine queryset based on scope and permissions
         if scope == 'platform':
@@ -5059,7 +5130,7 @@ class AchievemtViewSet(viewsets.ModelViewSet):
                     'achievement_count': user_rank_queryset['achievement_count'] or 0
                 }
         
-        return Response({
+        response_data = {
             'leaderboard': ranked_students,
             'metadata': {
                 'scope': scope,
@@ -5068,9 +5139,15 @@ class AchievemtViewSet(viewsets.ModelViewSet):
                 'total_students': queryset.values('student').distinct().count()
             },
             'your_rank': user_rank
-        })
+        }
+
+        #Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
+                throttle_classes=[AchievementStatisticsThrottle])
     def statistics(self, request):
         """
         Get achievement statistics.
@@ -5078,6 +5155,12 @@ class AchievemtViewSet(viewsets.ModelViewSet):
         """
         user = request.user
         
+        # Check cache
+        cache_key = get_achievement_statistics_cache_key(user.id, user.role)
+        cached_stats = cache.get(cache_key)
+        if cached_stats is not None:
+            return Response(cached_stats)
+
         # Determine queryset based on role
         if user.role == 'A' and user.is_staff:
             queryset = Achievement.objects.all()
@@ -5106,8 +5189,6 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             scope = 'none'
         
         # Calculate statistics
-        from django.db.models import Sum, Count, Avg
-        
         total_achievements = queryset.count()
         total_points = queryset.aggregate(total=Sum('points'))['total'] or 0
         unique_students = queryset.values('student').distinct().count()
@@ -5131,7 +5212,7 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             total=Sum('points')
         ).aggregate(average=Avg('total'))['average'] or 0
         
-        return Response({
+        stats_data = {
             'scope': scope,
             'summary': {
                 'total_achievements': total_achievements,
@@ -5143,7 +5224,12 @@ class AchievemtViewSet(viewsets.ModelViewSet):
             'by_type': by_type,
             'most_popular': most_popular,
             'achievement_types_available': len(AchievementService.ACHIEVEMENT_RULES)
-        })
+        }
+
+        #Cache for 10 minutes
+        cache.set(cache_key, stats_data, 60 * 10)
+
+        return Response(stats_data)
     
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def student_progress(self, request):
