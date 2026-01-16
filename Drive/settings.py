@@ -267,6 +267,14 @@ REST_FRAMEWORK = {
         'schedule_cancel': '20/hour',           # Cancellations (safety)
         'schedule_reschedule': '30/hour',       # Rescheduling
 
+        # Achievement management
+        'achievement_list': '200/hour',         # Achievement listing
+        'achievement_award': '30/hour',         # Manual awarding
+        'achievement_bulk_award': '10/hour',    # Bulk operations (low for safety)
+        'achievement_check_milestones': '50/hour', # Milestone checking
+        'achievement_leaderboard': '100/hour',  # Leaderboard queries
+        'achievement_statistics': '60/minute',  # Statistics queries
+
 
     },
     
@@ -570,6 +578,14 @@ CACHE_TIMEOUTS = {
     'instructor_availability': 60 * 5,      # 5 minutes
     'vehicle_availability': 60 * 5,         # 5 minutes
     'my_schedule_mobile': 60 * 2,           # 2 minutes
+
+    # Achievement-related caches
+    'achievements_queryset': 60 * 5,        # 5 minutes
+    'my_achievements': 60 * 3,              # 3 minutes
+    'leaderboard': 60 * 5,                  # 5 minutes (competitive)
+    'achievement_stats': 60 * 10,           # 10 minutes
+    'student_progress': 60 * 5,             # 5 minutes
+    'badges': 60 * 10,                      # 10 minutes (rarely changes)
 
     #Default
     'default': 60 * 5,

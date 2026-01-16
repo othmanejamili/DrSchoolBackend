@@ -5,7 +5,8 @@ Signal handlers for automatic cache invalidation.
 from django.db.models.signals import post_save, post_delete, pre_save
 from django.dispatch import receiver
 from django.core.cache import cache
-from .models import User, StudentProfile, DrivingSchool, Lesson, Schedule, Feedback, Attendance, Vehicle, VehiclePicture
+from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
+                      Feedback, Attendance, Vehicle, VehiclePicture, Achievement)
 from .cache_utils import (
     invalidate_lesson_cache,
     invalidate_lesson_queryset_caches,
@@ -252,3 +253,33 @@ def invalidate_schedule_caches_on_change(sender, instance, **kwargs):
     # Invalidate school-specific caches
     if instance.lesson and instance.lesson.school_id:
         invalidate_school_schedule_caches(instance.lesson.school_id)
+
+
+# ============================================
+# ACHIEVEMENT SIGNALS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Achievement)
+def invalidate_achievement_on_change(sender, instance, **kwargs):
+    """Invalidate achievement caches when achievement is created/deleted"""
+    from .cache_utils import (invalidate_achievement_cache,
+                              invalidate_achievement_queryset_caches,
+                              invalidate_leaderboard_caches,
+                              invalidate_achievement_statistics_caches,
+                              invalidate_student_achievement_caches)
+    
+    # Invalidate specific achievement
+    invalidate_achievement_cache(instance.id)
+    
+    # Invalidate all querysets
+    invalidate_achievement_queryset_caches()
+    
+    # Invalidate leaderboards (points changed)
+    invalidate_leaderboard_caches()
+    
+    # Invalidate statistics
+    invalidate_achievement_statistics_caches()
+    
+    # Invalidate student-specific caches
+    if instance.student_id:
+        invalidate_student_achievement_caches(instance.student_id)

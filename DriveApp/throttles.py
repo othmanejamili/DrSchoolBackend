@@ -249,6 +249,40 @@ class ScheduleCancelThrottle(UserRateThrottle):
 class ScheduleRescheduleThrottle(UserRateThrottle):
     """Limit rescheduling operations"""
     scope = 'schedule_reschedule'
+
+# ============================================
+#               ACHIEVEMENT
+# ============================================
+    
+class AchievementListThrottle(UserRateThrottle):
+    """Limit achievement listing"""
+    scope = 'achievement_list'
+
+
+class AchievementAwardThrottle(UserRateThrottle):
+    """Limit manual achievement awarding"""
+    scope = 'achievement_award'
+
+
+class AchievementBulkAwardThrottle(UserRateThrottle):
+    """Limit bulk awarding (prevents abuse)"""
+    scope = 'achievement_bulk_award'
+
+
+class AchievementCheckMilestonesThrottle(UserRateThrottle):
+    """Limit milestone checking (expensive operation)"""
+    scope = 'achievement_check_milestones'
+
+
+class AchievementLeaderboardThrottle(UserRateThrottle):
+    """Limit leaderboard queries"""
+    scope = 'achievement_leaderboard'
+
+
+class AchievementStatisticsThrottle(UserRateThrottle):
+    """Limit statistics queries"""
+    scope = 'achievement_statistics'
+
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================
