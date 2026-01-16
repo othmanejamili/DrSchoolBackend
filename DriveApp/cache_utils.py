@@ -958,6 +958,92 @@ def invalidate_student_achievement_caches(student_id):
     for key in cache_keys:
         cache.delete(key)
 
+# ============================================
+# COMMUNICATION TEMPLATE CACHE KEYS
+# ============================================
+
+def get_communication_template_queryset_cache_key(user_id, role):
+    """Generate cache key for communication template queryset"""
+    return f'communication_templates_queryset_{user_id}_{role}'
+
+def get_communication_template_detail_cache_key(template_id):
+    """Generate cache key for single template"""
+    return f'communication_template_detail_{template_id}'
+
+def get_template_by_type_cache_key(user_id, school_id=None):
+    """Generate cache key for templates grouped by type"""
+    school_suffix = f'_school_{school_id}' if school_id else ''
+    return f'templates_by_type_{user_id}{school_suffix}'
+
+def get_template_usage_stats_cache_key(user_id):
+    """Generate cache key for template usage statistics"""
+    return f'template_usage_stats_{user_id}'
+
+def get_template_available_variables_cache_key():
+    """Generate cache key for available template variables"""
+    return 'template_available_variables'
+
+def get_my_school_templates_cache_key(user_id, template_type=None, active_only=False):
+    """Generate cache key for user's school templates"""
+    type_suffix = f'_type_{template_type}' if template_type else ''
+    active_suffix = '_active' if active_only else ''
+    return f'my_school_templates_{user_id}{type_suffix}{active_suffix}'
+
+# ============================================
+# COMMUNICATION TEMPLATE CACHE INVALIDATION
+# ============================================
+
+def invalidate_communication_template_cache(template_id, user_id=None, school_id=None):
+    """Invalidate all caches related to a communication template"""
+    if not template_id:
+        return
+    
+    # Delete specific template cache
+    cache.delete(get_communication_template_detail_cache_key(template_id))
+    
+    # Delete related patterns
+    patterns_to_delete = [
+        f'communication_template_{template_id}_*',
+        f'*template*{template_id}*',
+        'template_by_type_*',
+        'template_usage_stats_*',
+        'my_school_templates_*'
+    ]
+    
+    for pattern in patterns_to_delete:
+        delete_pattern_with_fallback(pattern)
+    
+    # Invalidate school-specific caches if school_id provided
+    if school_id:
+        invalidate_school_template_caches(school_id)
+
+
+def invalidate_communication_template_queryset_caches():
+    """Invalidate all template queryset caches"""
+    patterns = [
+        'communication_templates_queryset_*',
+        'template_by_type_*',
+        'my_school_templates_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_school_template_caches(school_id):
+    """Invalidate template caches for a specific school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'*school_{school_id}*template*',
+        f'my_school_templates_*',
+        f'template_by_type_*_school_{school_id}'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
 
 
 # ============================================

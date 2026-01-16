@@ -6,7 +6,8 @@ from django.db.models.signals import post_save, post_delete, pre_save
 from django.dispatch import receiver
 from django.core.cache import cache
 from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
-                      Feedback, Attendance, Vehicle, VehiclePicture, Achievement)
+                      Feedback, Attendance, Vehicle, VehiclePicture, Achievement,
+                      CommunicationTemplate)
 from .cache_utils import (
     invalidate_lesson_cache,
     invalidate_lesson_queryset_caches,
@@ -283,3 +284,19 @@ def invalidate_achievement_on_change(sender, instance, **kwargs):
     # Invalidate student-specific caches
     if instance.student_id:
         invalidate_student_achievement_caches(instance.student_id)
+
+@receiver([post_save, post_delete], sender=CommunicationTemplate)
+def invalidate_communication_template_signal(sender, instance, **kwargs):
+    """Invalidate template cache when template is saved or deleted"""
+    from .cache_utils import (
+        invalidate_communication_template_cache,
+        invalidate_communication_template_queryset_caches,
+        invalidate_school_template_caches
+    )
+    
+    invalidate_communication_template_cache(
+        instance.id,
+        school_id=instance.school_id
+    )
+    invalidate_communication_template_queryset_caches()
+    invalidate_school_template_caches(instance.school_id)

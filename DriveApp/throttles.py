@@ -282,7 +282,38 @@ class AchievementLeaderboardThrottle(UserRateThrottle):
 class AchievementStatisticsThrottle(UserRateThrottle):
     """Limit statistics queries"""
     scope = 'achievement_statistics'
+# ============================================
+# COMMUNICATION TEMPLATE THROTTLES
+# ============================================
 
+class CommunicationTemplateListThrottle(UserRateThrottle):
+    """Rate limit for communication template listing"""
+    scope = 'communication_template_list'
+
+
+class CommunicationTemplateCreateThrottle(UserRateThrottle):
+    """Rate limit for communication template creation"""
+    scope = 'communication_template_create'
+
+
+class CommunicationTemplateUpdateThrottle(UserRateThrottle):
+    """Rate limit for communication template updates"""
+    scope = 'communication_template_update'
+
+
+class CommunicationTemplateDuplicateThrottle(UserRateThrottle):
+    """Rate limit for template duplication"""
+    scope = 'communication_template_duplicate'
+
+
+class CommunicationTemplatePreviewThrottle(UserRateThrottle):
+    """Rate limit for template preview"""
+    scope = 'communication_template_preview'
+
+
+class CommunicationTemplateUsageStatsThrottle(UserRateThrottle):
+    """Rate limit for template usage statistics"""
+    scope = 'communication_template_usage_stats'
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================
