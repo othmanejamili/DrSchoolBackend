@@ -1044,6 +1044,129 @@ def invalidate_school_template_caches(school_id):
     for pattern in patterns:
         delete_pattern_with_fallback(pattern)
 
+# ============================================
+# AUTOMATED MESSAGE CACHE KEYS
+# ============================================
+
+def get_automated_message_queryset_cache_key(user_id, role):
+    """Generate cache key for automated message queryset"""
+    return f'automated_messages_queryset_{user_id}_{role}'
+
+def get_automated_message_detail_cache_key(message_id):
+    """Generate cache key for single message"""
+    return f'automated_message_detail_{message_id}'
+
+def get_my_messages_cache_key(student_id, status_filter=None):
+    """Generate cache key for student's messages"""
+    status_suffix = f'_status_{status_filter}' if status_filter else ''
+    return f'my_messages_{student_id}{status_suffix}'
+
+def get_pending_messages_cache_key(user_id):
+    """Generate cache key for pending messages"""
+    return f'pending_messages_{user_id}'
+
+def get_sent_messages_cache_key(user_id, days=7):
+    """Generate cache key for sent messages"""
+    return f'sent_messages_{user_id}_days_{days}'
+
+def get_failed_messages_cache_key(user_id):
+    """Generate cache key for failed messages"""
+    return f'failed_messages_{user_id}'
+
+def get_message_statistics_cache_key(user_id, school_id=None, days=30):
+    """Generate cache key for message statistics"""
+    school_suffix = f'_school_{school_id}' if school_id else ''
+    return f'message_statistics_{user_id}{school_suffix}_days_{days}'
+
+def get_upcoming_schedule_cache_key(user_id, days=7, student_id=None, template_type=None):
+    """Generate cache key for upcoming message schedule"""
+    student_suffix = f'_student_{student_id}' if student_id else ''
+    type_suffix = f'_type_{template_type}' if template_type else ''
+    return f'upcoming_schedule_{user_id}_days_{days}{student_suffix}{type_suffix}'
+
+def get_message_summary_cache_key(user_id, role):
+    """Generate cache key for message summary"""
+    return f'message_summary_{user_id}_{role}'
+
+# ============================================
+# AUTOMATED MESSAGE CACHE INVALIDATION
+# ============================================
+
+def invalidate_automated_message_cache(message_id, student_id=None, template_id=None):
+    """Invalidate all caches related to an automated message"""
+    if not message_id:
+        return
+    
+    # Delete specific message cache
+    cache.delete(get_automated_message_detail_cache_key(message_id))
+    
+    # Delete related patterns
+    patterns_to_delete = [
+        f'automated_message_{message_id}_*',
+        f'*message*{message_id}*',
+        'pending_messages_*',
+        'sent_messages_*',
+        'failed_messages_*',
+        'message_statistics_*',
+        'upcoming_schedule_*',
+        'message_summary_*'
+    ]
+    
+    for pattern in patterns_to_delete:
+        delete_pattern_with_fallback(pattern)
+    
+    # Invalidate student-specific caches if student_id provided
+    if student_id:
+        invalidate_student_message_caches(student_id)
+    
+    # Invalidate template-specific caches if template_id provided
+    if template_id:
+        cache.delete(get_template_usage_stats_cache_key('*'))
+
+
+def invalidate_automated_message_queryset_caches():
+    """Invalidate all message queryset caches"""
+    patterns = [
+        'automated_messages_queryset_*',
+        'my_messages_*',
+        'pending_messages_*',
+        'sent_messages_*',
+        'failed_messages_*',
+        'upcoming_schedule_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_student_message_caches(student_id):
+    """Invalidate message caches for a specific student"""
+    if not student_id:
+        return
+    
+    patterns = [
+        f'my_messages_{student_id}*',
+        f'*student_{student_id}*message*',
+        'message_summary_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_template_message_caches(template_id):
+    """Invalidate message caches related to a template"""
+    if not template_id:
+        return
+    
+    patterns = [
+        f'*template_{template_id}*message*',
+        'template_usage_stats_*',
+        'message_statistics_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
 
 
 # ============================================

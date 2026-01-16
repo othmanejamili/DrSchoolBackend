@@ -281,8 +281,16 @@ REST_FRAMEWORK = {
         'communication_template_update':'10/hour',
         'communication_template_duplicate':'20/hour',
         'communication_template_preview':'50/hour',
-        'communication_template_usage_stats':'60/minute'
-
+        'communication_template_usage_stats':'60/minute',
+        # Communication Template
+        'automated_message_list':'100/hour',
+        'automated_message_create':'20/hour',
+        'automated_message_update':'20/hour',
+        'automated_message_bulk_create':'20/hour',
+        'automated_message_bulk_cancel':'20/hour',
+        'automated_message_send_now':'20/hour',
+        'automated_message_statistics':'20/hour',
+        'automated_message_schedule':'20/hour',
     },
     
     # Filtering
