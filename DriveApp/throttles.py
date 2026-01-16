@@ -314,6 +314,50 @@ class CommunicationTemplatePreviewThrottle(UserRateThrottle):
 class CommunicationTemplateUsageStatsThrottle(UserRateThrottle):
     """Rate limit for template usage statistics"""
     scope = 'communication_template_usage_stats'
+
+# ============================================
+# AUTOMATED MESSAGE THROTTLES
+# ============================================
+
+class AutomatedMessageListThrottle(UserRateThrottle):
+    """Rate limit for automated message listing"""
+    scope = 'automated_message_list'
+
+
+class AutomatedMessageCreateThrottle(UserRateThrottle):
+    """Rate limit for automated message creation"""
+    scope = 'automated_message_create'
+
+
+class AutomatedMessageUpdateThrottle(UserRateThrottle):
+    """Rate limit for automated message updates"""
+    scope = 'automated_message_update'
+
+
+class AutomatedMessageBulkCreateThrottle(UserRateThrottle):
+    """Rate limit for bulk message creation"""
+    scope = 'automated_message_bulk_create'
+
+
+class AutomatedMessageBulkCancelThrottle(UserRateThrottle):
+    """Rate limit for bulk message cancellation"""
+    scope = 'automated_message_bulk_cancel'
+
+
+class AutomatedMessageSendNowThrottle(UserRateThrottle):
+    """Rate limit for sending messages immediately"""
+    scope = 'automated_message_send_now'
+
+
+class AutomatedMessageStatisticsThrottle(UserRateThrottle):
+    """Rate limit for message statistics"""
+    scope = 'automated_message_statistics'
+
+
+class AutomatedMessageScheduleThrottle(UserRateThrottle):
+    """Rate limit for message schedule queries"""
+    scope = 'automated_message_schedule'
+    
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================

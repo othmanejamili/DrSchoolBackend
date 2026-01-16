@@ -7,7 +7,7 @@ from django.dispatch import receiver
 from django.core.cache import cache
 from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
                       Feedback, Attendance, Vehicle, VehiclePicture, Achievement,
-                      CommunicationTemplate)
+                      CommunicationTemplate, AutomatedMessage)
 from .cache_utils import (
     invalidate_lesson_cache,
     invalidate_lesson_queryset_caches,
@@ -300,3 +300,22 @@ def invalidate_communication_template_signal(sender, instance, **kwargs):
     )
     invalidate_communication_template_queryset_caches()
     invalidate_school_template_caches(instance.school_id)
+
+@receiver([post_save, post_delete], sender=AutomatedMessage)
+def invalidate_automated_message_signal(sender, instance, **kwargs):
+    """Invalidate message cache when message is saved or deleted"""
+    from .cache_utils import (
+        invalidate_automated_message_cache,
+        invalidate_automated_message_queryset_caches,
+        invalidate_student_message_caches,
+        invalidate_template_message_caches
+    )
+    
+    invalidate_automated_message_cache(
+        instance.id,
+        student_id=instance.student_id,
+        template_id=instance.template_id
+    )
+    invalidate_automated_message_queryset_caches()
+    invalidate_student_message_caches(instance.student_id)
+    invalidate_template_message_caches(instance.template_id)

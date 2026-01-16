@@ -50,7 +50,10 @@ from .throttles import (
         ScheduleConflictCheckThrottle, ScheduleAvailabilityThrottle, ScheduleMyScheduleThrottle, ScheduleCancelThrottle, ScheduleRescheduleThrottle,
         AchievementListThrottle, AchievementAwardThrottle, AchievementBulkAwardThrottle, AchievementCheckMilestonesThrottle, AchievementLeaderboardThrottle,
         AchievementStatisticsThrottle, CommunicationTemplateListThrottle, CommunicationTemplateCreateThrottle, CommunicationTemplateUpdateThrottle,
-        CommunicationTemplateDuplicateThrottle, CommunicationTemplatePreviewThrottle, CommunicationTemplateUsageStatsThrottle
+        CommunicationTemplateDuplicateThrottle, CommunicationTemplatePreviewThrottle, CommunicationTemplateUsageStatsThrottle,
+        AutomatedMessageListThrottle,AutomatedMessageCreateThrottle,AutomatedMessageUpdateThrottle,
+        AutomatedMessageBulkCreateThrottle,AutomatedMessageBulkCancelThrottle,AutomatedMessageSendNowThrottle,
+        AutomatedMessageStatisticsThrottle,AutomatedMessageScheduleThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -79,7 +82,8 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             invalidate_leaderboard_caches, invalidate_achievement_statistics_caches, invalidate_student_achievement_caches,
                             get_my_achievements_cache_key,get_leaderboard_cache_key, get_achievement_statistics_cache_key, get_communication_template_queryset_cache_key,
                             invalidate_communication_template_cache, invalidate_communication_template_queryset_caches, get_template_by_type_cache_key,
-                            get_template_usage_stats_cache_key
+                            get_template_usage_stats_cache_key,get_automated_message_queryset_cache_key,invalidate_automated_message_cache,invalidate_automated_message_queryset_caches,
+                            get_message_statistics_cache_key, get_my_messages_cache_key
                             )
 
 User = get_user_model()
@@ -6054,6 +6058,27 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
     search_fields = ['student__user__username', 'student__user__email', 'template__name']
     ordering_fields = ['scheduled_for', 'sent_at', 'created_at', 'status']
     ordering = ['-scheduled_for']
+    throttle_classes = [UserRateThrottle]  # Add default throttle
+    
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        if self.action == 'list':
+            return [AutomatedMessageListThrottle()]
+        elif self.action == 'create':
+            return [AutomatedMessageCreateThrottle()]
+        elif self.action in ['update', 'partial_update']:
+            return [AutomatedMessageUpdateThrottle()]
+        elif self.action == 'bulk_create':
+            return [AutomatedMessageBulkCreateThrottle()]
+        elif self.action == 'bulk_cancel':
+            return [AutomatedMessageBulkCancelThrottle()]
+        elif self.action == 'send_now':
+            return [AutomatedMessageSendNowThrottle()]
+        elif self.action == 'statistics':
+            return [AutomatedMessageStatisticsThrottle()]
+        elif self.action == 'upcoming_schedule':
+            return [AutomatedMessageScheduleThrottle()]
+        return super().get_throttles()
 
     def get_queryset(self):
         """Filter messages based on user role and school"""
@@ -6061,35 +6086,45 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return AutomatedMessage.objects.none()
         
+        # Generate cache key
+        cache_key = get_automated_message_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+            
         # Platform Admin (staff) sees all messages
         if user.role == 'A' and user.is_staff:
-            return AutomatedMessage.objects.all().select_related(
-                'student__user', 'student__school', 'template'
-            )
-        
+            queryset = AutomatedMessage.objects.all()
         # School Owner sees messages in their schools
-        if user.role == 'A' and not user.is_staff:
-            return AutomatedMessage.objects.filter(
-                template__school__owner=user
-            ).select_related('student__user', 'student__school', 'template')
-        
+        elif user.role == 'A' and not user.is_staff:
+            queryset = AutomatedMessage.objects.filter(template__school__owner=user)
         # Instructor sees messages for students in their school
-        if user.role == 'I':
+        elif user.role == 'I':
             instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
-                return AutomatedMessage.objects.filter(
-                    student__school=instructor_profile.school
-                ).select_related('student__user', 'template')
-        
+                queryset = AutomatedMessage.objects.filter(student__school=instructor_profile.school)
         # Student sees only their own messages
-        if user.role == 'S':
+        elif user.role == 'S':
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
-                return AutomatedMessage.objects.filter(
+                queryset = AutomatedMessage.objects.filter(
                     student=student_profile
-                ).select_related('template')
+                )
+        else:
+            queryset = AutomatedMessage.objects.none()
+    
+        queryset = queryset.select_related('student__user', 'student__school', 'template')
         
-        return AutomatedMessage.objects.none()
+        # Cache for 3 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 3)
+        
+        return queryset
     
     def get_permissions(self):
         """Define permissions per action"""
@@ -6118,14 +6153,26 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         
         # Platform admin can create for any student
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            message = serializer.save()
+            invalidate_automated_message_cache(
+                message.id,
+                student_id=message.student_id,
+                template_id=message.template_id
+            )
+            invalidate_automated_message_queryset_caches()
             return
         
         # School owner can create for students in their schools
         if user.role == 'A' and not user.is_staff:
             if student.school.owner != user or template.school.owner != user:
                 raise PermissionDenied("Student and template must be from your schools")
-            serializer.save()
+            message = serializer.save()
+            invalidate_automated_message_cache(
+                message.id,
+                student_id=message.student_id,
+                template_id=message.template_id
+            )
+            invalidate_automated_message_queryset_caches()            
             return
         
         # Instructor can create for students in their school
@@ -6140,7 +6187,13 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             if template.school != instructor_profile.school:
                 raise PermissionDenied("Template must be from your school")
             
-            serializer.save()
+            message = serializer.save()
+            invalidate_automated_message_cache(
+                message.id,
+                student_id=message.student_id,
+                template_id=message.template_id
+            )
+            invalidate_automated_message_queryset_caches()
             return
         
         raise PermissionDenied("You don't have permission to create messages")
@@ -6157,6 +6210,11 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         # Platform admin can update any message
         if user.role == 'A' and user.is_staff:
             serializer.save()
+            invalidate_automated_message_cache(
+                instance.id,
+                student_id=instance.student_id,
+                template_id=instance.template_id
+            )
             return
         
         # School owner can update messages in their schools
@@ -6164,6 +6222,11 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             if instance.template.school.owner != user:
                 raise PermissionDenied("You can only update messages in your schools")
             serializer.save()
+            invalidate_automated_message_cache(
+                instance.id,
+                student_id=instance.student_id,
+                template_id=instance.template_id
+            )
             return
         
         # Instructor can update messages in their school
@@ -6172,6 +6235,11 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             if not instructor_profile or instructor_profile.school != instance.student.school:
                 raise PermissionDenied("You can only update messages in your school")
             serializer.save()
+            invalidate_automated_message_cache(
+                instance.id,
+                student_id=instance.student_id,
+                template_id=instance.template_id
+            )
             return
         
         raise PermissionDenied("You don't have permission to update this message")
@@ -6179,7 +6247,9 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """Delete message with permission checks"""
         user = self.request.user
-        
+        message_id = instance.id
+        student_id = instance.student_id
+        template_id = instance.template_id
         # Cannot delete sent messages
         if instance.status in ['sent', 'delivered', 'read']:
             raise PermissionDenied(f"Cannot delete {instance.status} messages")
@@ -6187,6 +6257,8 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         # Platform admin can delete any message
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            invalidate_automated_message_cache(message_id, student_id, template_id)
+            invalidate_automated_message_queryset_caches()
             return
         
         # School owner can delete messages in their schools
@@ -6194,6 +6266,8 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             if instance.template.school.owner != user:
                 raise PermissionDenied("You can only delete messages in your schools")
             instance.delete()
+            invalidate_automated_message_cache(message_id, student_id, template_id)
+            invalidate_automated_message_queryset_caches()
             return
         
         raise PermissionDenied("You don't have permission to delete this message")
@@ -6233,6 +6307,12 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         
         # Apply filters
         status_filter = request.query_params.get('status')
+        cache_key = get_my_messages_cache_key(student_profile.id, status_filter)
+        
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         if status_filter:
             queryset = queryset.filter(status=status_filter)
         
@@ -6247,14 +6327,17 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(queryset, many=True)
         
-        return Response({
+        response_data = {
             'statistics': {
                 'total_messages': total_messages,
                 'pending': pending_count,
                 'sent': sent_count
             },
             'messages': serializer.data
-        })
+        }
+
+        cache.set(cache_key, response_data, 60 * 2)
+        return Response(response_data)
     
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
     def pending(self, request):
@@ -6729,7 +6812,7 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             'cancellation_reason': reason
         })
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], throttle_classes=[AutomatedMessageStatisticsThrottle])
     def statistics(self, request):
         """
         Get messaging statistics.
@@ -6740,9 +6823,17 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
         - days: Number of days to analyze (default: 30, max: 90)
         """
         queryset = self.get_queryset()
-        
+        user = request.user
         # Filter by school if provided (admin only)
         school_id = request.query_params.get('school_id')
+        days = min(int(request.query_params.get('days', 30)), 90)
+        
+        cache_key = get_message_statistics_cache_key(user.id, school_id, days)
+        cached_stats = cache.get(cache_key)
+        
+        if cached_stats is not None:
+            return Response(cached_stats)
+        
         if school_id:
             user = request.user
             if user.role == 'A' and user.is_staff:
@@ -6810,7 +6901,7 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             message_count=Count('id')
         ).order_by('-message_count')[:5]
         
-        return Response({
+        stats = {
             'period': {
                 'days': days,
                 'since': since.date(),
@@ -6828,8 +6919,10 @@ class AutomatedMessageViewSet(viewsets.ModelViewSet):
             'top_templates': list(top_templates),
             'successful_messages': successful,
             'total_analyzed': total_with_status
-        })
+        }
     
+        cache.set(cache_key, stats, 60 * 10)
+        return Response(stats)
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
     def upcoming_schedule(self, request):
         """
