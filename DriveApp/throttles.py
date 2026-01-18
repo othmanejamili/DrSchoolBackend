@@ -357,7 +357,62 @@ class AutomatedMessageStatisticsThrottle(UserRateThrottle):
 class AutomatedMessageScheduleThrottle(UserRateThrottle):
     """Rate limit for message schedule queries"""
     scope = 'automated_message_schedule'
+
+# ============================================
+# School Analytic THROTTLES 
+# ============================================
+class SchoolAnalyticsListThrottle(UserRateThrottle):
+    """Rate limit for school analytic listing"""
+    scope = 'school_analytic_list'
+
+class SchoolAnalyticsCreateThrottle(UserRateThrottle):
+    """Rate limit for school creation (Admin/Owner)"""
+    scope = 'school_analytic_create'
+
+class SchoolAnalyticsUpdateThrottle(UserRateThrottle):
+    """Rate limit for school update (Admin/owner)"""
+    scope = 'school_analytic_update'
+
+class SchoolAnalyticsDashboardThrottle(UserRateThrottle):
+    """Rate limiting for dashboard """
+    scope = 'school_analytic_dashboard'
+
+class SchoolAnalyticsGenerateDailyThrottle(UserRateThrottle):
+    """Rate limiting for school generate daily"""
+    scope = 'school_analytic_daily'
+
+class SchoolAnalyticsBulkGenerateThrottle(UserRateThrottle):
+    """Rate limiting for bulk generate"""
+    scope = 'school_analytic_bulk_generate'
     
+class SchoolAnalyticsComparisonThrottle(UserRateThrottle):
+    """Rate limiting for school comparison"""
+    scope = 'school_analytic_comparison'
+
+class SchoolAnalyticsTrendsThrottle(UserRateThrottle):
+    """Rate limiting for school trends"""
+    scope = 'school_analytic_trends'
+
+class SchoolAnalyticsAlertsThrottle(UserRateThrottle):
+    """Rate limiting for school alerts"""
+    scope = 'school_analytic_alerts'
+
+class SchoolAnalyticsPredictionsThrottle(UserRateThrottle):
+    """Rate limiting for school predictions"""
+    scope = 'school_analytic_predictions'
+
+class SchoolAnalyticsExportThrottle(UserRateThrottle):
+    """Rate limiting for data export"""
+    scope = 'school_analytic_export'
+
+class SchoolAnalyticsSummaryThrottle(UserRateThrottle):
+    """Rate limiting for school summary"""
+    scope = 'school_analytic_summary'
+
+class SchoolAnalyticsSystemHealthThrottle(UserRateThrottle):
+    """Rate limiting for school System health"""
+    scope = 'school_analytic_system_health'
+
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================

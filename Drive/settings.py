@@ -291,6 +291,21 @@ REST_FRAMEWORK = {
         'automated_message_send_now':'20/hour',
         'automated_message_statistics':'20/hour',
         'automated_message_schedule':'20/hour',
+
+        # School Analytics 
+        'school_analytic_list':'100/hour',
+        'school_analytic_create':'20/hour',
+        'school_analytic_update':'30/hour',
+        'school_analytic_dashboard':'60/hour',
+        'school_analytic_daily':'10/hour',
+        'school_analytic_bulk_generate':'5/hour',
+        'school_analytic_comparison':'50/hour',
+        'school_analytic_trends':'30/hour',
+        'school_analytic_alerts':'20/hour',
+        'school_analytic_predictions':'40/hour',
+        'school_analytic_export':'30/hour',
+        'school_analytic_summary':'15/hour',
+        'school_analytic_system_health':'60/hour'
     },
     
     # Filtering
