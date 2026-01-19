@@ -7,7 +7,9 @@ from django.dispatch import receiver
 from django.core.cache import cache
 from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
                       Feedback, Attendance, Vehicle, VehiclePicture, Achievement,
-                      CommunicationTemplate, AutomatedMessage, SchoolAnalytics)
+                      CommunicationTemplate, AutomatedMessage, SchoolAnalytics,
+                          User, StudentProfile, DrivingSchool, Lesson, Schedule,
+                      )
 from .cache_utils import (
     invalidate_lesson_cache,
     invalidate_lesson_queryset_caches,
@@ -33,7 +35,14 @@ from .cache_utils import (
     invalidate_instructor_schedule_caches,
     invalidate_vehicle_schedule_caches,
     invalidate_availability_caches,
-    invalidate_school_caches
+    invalidate_school_caches,
+    get_dashboard_cache_key,
+    get_quick_stats_cache_key,
+    get_notifications_cache_key,
+    invalidate_dashboard_caches,
+    # Other cache utilities you might have
+    invalidate_report_cache,
+    
 )
 
 # ============================================
@@ -389,3 +398,526 @@ def invalidate_report_caches_on_attendance_change(sender, instance, **kwargs):
     from .cache_utils import invalidate_report_cache
     school_id = instance.lesson.school_id
     invalidate_report_cache(school_id)
+
+# ============================================
+# DashBoard CACHE INVALIDATION SIGNALS
+# ============================================
+    
+
+
+def invalidate_user_dashboards(user_id):
+    """
+    Enhanced version that invalidates all dashboard caches for a user.
+    Uses your provided invalidate_dashboard_caches function.
+    """
+    if not user_id:
+        return
+    
+    # Use the provided function
+    invalidate_dashboard_caches(user_id)
+    
+    # Also clear specific notification caches
+    user = User.objects.filter(id=user_id).first()
+    if user:
+        for role in ['A', 'I', 'S']:
+            for limit in [10, 20, 50]:
+                cache_key = get_notifications_cache_key(user_id, role, limit)
+                cache.delete(cache_key)
+
+
+def invalidate_school_dashboards(school_id):
+    """
+    Invalidate all dashboard caches for users in a school.
+    """
+    if not school_id:
+        return
+    
+    # Get all users in this school
+    student_profiles = StudentProfile.objects.filter(school_id=school_id).select_related('user')
+    
+    for profile in student_profiles:
+        user = profile.user
+        if user:
+            invalidate_dashboard_caches(user.id)
+    
+    # Also invalidate school owner dashboard
+    school = DrivingSchool.objects.filter(id=school_id).first()
+    if school and school.owner:
+        invalidate_dashboard_caches(school.owner_id)
+
+
+def invalidate_all_dashboards():
+    """
+    Invalidate all dashboard caches in the system.
+    Use sparingly (e.g., system maintenance).
+    """
+    patterns = [
+        'dashboard_*',
+        'dashboard_quick_stats_*',
+        'dashboard_notifications_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            # Fallback for cache backends without delete_pattern
+            pass
+
+
+def invalidate_dashboard_cache(user_id, role, dashboard_type):
+    """
+    Invalidate specific dashboard cache.
+    """
+    cache_key = get_dashboard_cache_key(user_id, role, dashboard_type)
+    cache.delete(cache_key)
+
+
+# ============================================
+# USER SIGNAL HANDLERS (DASHBOARD IMPACT)
+# ============================================
+
+@receiver([post_save, post_delete], sender=User)
+def invalidate_user_dashboard_on_user_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when user is saved or deleted.
+    This affects all dashboards that might include this user.
+    """
+    # Invalidate user's own dashboard
+    invalidate_dashboard_caches(instance.id)
+    
+    # If user is a school owner, invalidate school owner dashboards
+    if instance.role == 'A' and not instance.is_staff:
+        # Find all schools owned by this user
+        schools = DrivingSchool.objects.filter(owner=instance)
+        for school in schools:
+            invalidate_school_dashboards(school.id)
+    
+    # If user is an instructor or student, invalidate their specific dashboards
+    elif instance.role in ['I', 'S']:
+        # Clear specific dashboard cache
+        invalidate_dashboard_cache(instance.id, instance.role, instance.role)
+        invalidate_dashboard_cache(instance.id, instance.role, 'overview')
+        
+        # Clear quick stats
+        cache.delete(get_quick_stats_cache_key(instance.id, instance.role))
+
+
+# ============================================
+# STUDENT PROFILE SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=StudentProfile)
+def invalidate_dashboard_on_profile_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when student profile changes.
+    This affects student dashboards, school dashboards, and instructor dashboards.
+    """
+    user = instance.user
+    school_id = instance.school_id
+    
+    # Invalidate user's dashboard
+    invalidate_dashboard_caches(user.id)
+    
+    # Invalidate school dashboards
+    invalidate_school_dashboards(school_id)
+    
+    # Invalidate specific caches
+    invalidate_dashboard_cache(user.id, user.role, 'overview')
+    cache.delete(get_quick_stats_cache_key(user.id, user.role))
+
+
+# ============================================
+# DRIVING SCHOOL SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=DrivingSchool)
+def invalidate_dashboard_on_school_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when school changes.
+    This affects school owner dashboards, platform admin dashboards,
+    and dashboards of all users in the school.
+    """
+    school_id = instance.id
+    owner_id = instance.owner_id
+    
+    # Invalidate school owner's dashboard
+    invalidate_dashboard_caches(owner_id)
+    
+    # Invalidate all school-specific dashboards
+    invalidate_school_dashboards(school_id)
+    
+    # Invalidate platform admin dashboards (they see all schools)
+    platform_admins = User.objects.filter(role='A', is_staff=True)
+    for admin in platform_admins:
+        invalidate_dashboard_caches(admin.id)
+    
+    # Invalidate report caches for this school
+    if hasattr(invalidate_report_cache, '__call__'):
+        invalidate_report_cache(school_id)
+
+
+# ============================================
+# LESSON SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Lesson)
+def invalidate_dashboard_on_lesson_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when lesson changes.
+    This affects instructor dashboards, student dashboards, and school dashboards.
+    """
+    school_id = instance.school_id
+    instructor_id = instance.instructor_id
+    
+    # Invalidate instructor dashboard
+    if instructor_id:
+        invalidate_dashboard_caches(instructor_id)
+        invalidate_dashboard_cache(instructor_id, 'I', 'instructor')
+        invalidate_dashboard_cache(instructor_id, 'I', 'overview')
+        cache.delete(get_quick_stats_cache_key(instructor_id, 'I'))
+    
+    # Invalidate school dashboards
+    invalidate_school_dashboards(school_id)
+    
+    # Invalidate report caches
+    if hasattr(invalidate_report_cache, '__call__'):
+        invalidate_report_cache(school_id)
+
+
+# ============================================
+# ATTENDANCE SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Attendance)
+def invalidate_dashboard_on_attendance_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when attendance changes.
+    This affects student dashboards and instructor dashboards.
+    """
+    student_id = instance.student_id
+    lesson = instance.lesson
+    school_id = lesson.school_id if lesson else None
+    instructor_id = lesson.instructor_id if lesson else None
+    
+    # Invalidate student dashboard
+    if student_id:
+        student_profile = StudentProfile.objects.filter(id=student_id).first()
+        if student_profile and student_profile.user:
+            user_id = student_profile.user_id
+            invalidate_dashboard_caches(user_id)
+    
+    # Invalidate instructor dashboard
+    if instructor_id:
+        invalidate_dashboard_caches(instructor_id)
+        invalidate_dashboard_cache(instructor_id, 'I', 'instructor')
+        invalidate_dashboard_cache(instructor_id, 'I', 'overview')
+        cache.delete(get_quick_stats_cache_key(instructor_id, 'I'))
+    
+    # Invalidate school dashboards
+    if school_id:
+        invalidate_school_dashboards(school_id)
+    
+    # Invalidate report caches
+    if school_id and hasattr(invalidate_report_cache, '__call__'):
+        invalidate_report_cache(school_id)
+
+
+# ============================================
+# FEEDBACK SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Feedback)
+def invalidate_dashboard_on_feedback_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when feedback changes.
+    This affects student dashboards, instructor dashboards, and school dashboards.
+    """
+    student_id = instance.student_id
+    lesson = instance.lesson
+    school_id = lesson.school_id if lesson else None
+    instructor_id = lesson.instructor_id if lesson else None
+    
+    # Invalidate student dashboard
+    if student_id:
+        student_profile = StudentProfile.objects.filter(id=student_id).first()
+        if student_profile and student_profile.user:
+            user_id = student_profile.user_id
+            invalidate_dashboard_caches(user_id)
+    
+    # Invalidate instructor dashboard
+    if instructor_id:
+        invalidate_dashboard_caches(instructor_id)
+        invalidate_dashboard_cache(instructor_id, 'I', 'instructor')
+        invalidate_dashboard_cache(instructor_id, 'I', 'overview')
+        cache.delete(get_quick_stats_cache_key(instructor_id, 'I'))
+    
+    # Invalidate school dashboards
+    if school_id:
+        invalidate_school_dashboards(school_id)
+    
+    # Invalidate report caches
+    if school_id and hasattr(invalidate_report_cache, '__call__'):
+        invalidate_report_cache(school_id)
+
+
+# ============================================
+# ACHIEVEMENT SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Achievement)
+def invalidate_dashboard_on_achievement_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when achievement changes.
+    This affects student dashboards and school dashboards.
+    """
+    student_id = instance.student_id
+    
+    # Invalidate student dashboard
+    if student_id:
+        student_profile = StudentProfile.objects.filter(id=student_id).first()
+        if student_profile and student_profile.user:
+            user_id = student_profile.user_id
+            school_id = student_profile.school_id
+            
+            invalidate_dashboard_caches(user_id)
+            
+            # Invalidate school dashboards
+            invalidate_school_dashboards(school_id)
+
+
+# ============================================
+# SCHOOL ANALYTICS SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=SchoolAnalytics)
+def invalidate_dashboard_on_analytics_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when analytics data changes.
+    This affects platform admin dashboards, school owner dashboards,
+    and all dashboards that use analytics data.
+    """
+    school_id = instance.school_id
+    
+    # Invalidate school dashboards
+    invalidate_school_dashboards(school_id)
+    
+    # Invalidate platform admin dashboards
+    platform_admins = User.objects.filter(role='A', is_staff=True)
+    for admin in platform_admins:
+        invalidate_dashboard_caches(admin.id)
+    
+    # Invalidate school owner dashboard
+    school = DrivingSchool.objects.filter(id=school_id).first()
+    if school and school.owner:
+        invalidate_dashboard_caches(school.owner_id)
+        invalidate_dashboard_cache(school.owner_id, 'A', 'school_owner')
+        invalidate_dashboard_cache(school.owner_id, 'A', 'overview')
+        cache.delete(get_quick_stats_cache_key(school.owner_id, 'A'))
+    
+    # Invalidate report caches
+    if hasattr(invalidate_report_cache, '__call__'):
+        invalidate_report_cache(school_id)
+
+
+# ============================================
+# AUTOMATED MESSAGE SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=AutomatedMessage)
+def invalidate_dashboard_on_message_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when automated message changes.
+    This affects student dashboards (notifications) and platform admin dashboards.
+    """
+    student_id = instance.student_id
+    
+    # Invalidate student notifications cache
+    if student_id:
+        student_profile = StudentProfile.objects.filter(id=student_id).first()
+        if student_profile and student_profile.user:
+            user_id = student_profile.user_id
+            # Clear notification caches
+            for limit in [10, 20, 50]:
+                cache.delete(get_notifications_cache_key(user_id, 'S', limit))
+    
+    # Invalidate platform admin dashboards (they see message stats)
+    platform_admins = User.objects.filter(role='A', is_staff=True)
+    for admin in platform_admins:
+        invalidate_dashboard_cache(admin.id, 'A', 'platform_admin')
+        invalidate_dashboard_cache(admin.id, 'A', 'overview')
+        cache.delete(get_notifications_cache_key(admin.id, 'A', 10))
+
+
+# ============================================
+# VEHICLE SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=Vehicle)
+def invalidate_dashboard_on_vehicle_change(sender, instance, **kwargs):
+    """
+    Invalidate dashboard cache when vehicle changes.
+    This affects school owner dashboards (vehicle management).
+    """
+    school_id = instance.school_id
+    
+    # Invalidate school dashboards
+    invalidate_school_dashboards(school_id)
+    
+    # Invalidate school owner dashboard
+    school = DrivingSchool.objects.filter(id=school_id).first()
+    if school and school.owner:
+        invalidate_dashboard_caches(school.owner_id)
+        invalidate_dashboard_cache(school.owner_id, 'A', 'school_owner')
+        invalidate_dashboard_cache(school.owner_id, 'A', 'overview')
+
+
+# ============================================
+# SIMPLIFIED SIGNAL HANDLER FOR ALL MODELS
+# ============================================
+
+def create_generic_dashboard_invalidation_signal(model_class):
+    """
+    Create a generic signal handler for any model that might affect dashboards.
+    This is a simplified approach for models not covered by specific handlers.
+    """
+    @receiver([post_save, post_delete], sender=model_class)
+    def invalidate_related_dashboards(sender, instance, **kwargs):
+        """
+        Generic handler to invalidate dashboards when any model changes.
+        This is a fallback for models without specific handlers.
+        """
+        # Try to determine which dashboards might be affected
+        # This is a simplified approach - you might want to customize per model
+        
+        # Check if instance has a school_id attribute
+        if hasattr(instance, 'school_id') and instance.school_id:
+            invalidate_school_dashboards(instance.school_id)
+        
+        # Check if instance has a user attribute
+        elif hasattr(instance, 'user_id') and instance.user_id:
+            invalidate_dashboard_caches(instance.user_id)
+        
+        # Check if instance has an owner attribute
+        elif hasattr(instance, 'owner_id') and instance.owner_id:
+            invalidate_dashboard_caches(instance.owner_id)
+        
+        # For other cases, invalidate all dashboards as a safety measure
+        else:
+            # Don't invalidate all - too heavy
+            # Instead, log that we couldn't determine affected dashboards
+            pass
+
+
+# ============================================
+# BULK OPERATION HANDLERS
+# ============================================
+
+def bulk_invalidate_dashboards_for_school(school_id):
+    """
+    Bulk invalidate all dashboards for a school.
+    More efficient than individual invalidations for bulk operations.
+    """
+    if not school_id:
+        return
+    
+    # Get all users in this school
+    user_ids = StudentProfile.objects.filter(
+        school_id=school_id
+    ).values_list('user_id', flat=True).distinct()
+    
+    # Also get school owner
+    school = DrivingSchool.objects.filter(id=school_id).first()
+    if school and school.owner_id:
+        user_ids = list(user_ids) + [school.owner_id]
+    
+    # Invalidate dashboards for all users
+    for user_id in user_ids:
+        invalidate_dashboard_caches(user_id)
+    
+    # Invalidate platform admin dashboards
+    platform_admins = User.objects.filter(role='A', is_staff=True)
+    for admin in platform_admins:
+        invalidate_dashboard_caches(admin.id)
+
+
+def bulk_invalidate_dashboards_for_users(user_ids):
+    """
+    Bulk invalidate dashboards for multiple users.
+    """
+    if not user_ids:
+        return
+    
+    for user_id in user_ids:
+        invalidate_dashboard_caches(user_id)
+
+
+# ============================================
+# CACHE MONITORING AND DEBUGGING
+# ============================================
+
+def get_dashboard_cache_status(user_id, role):
+    """
+    Check which dashboard caches are currently set for a user.
+    Useful for debugging.
+    """
+    status = {
+        'overview': cache.get(get_dashboard_cache_key(user_id, role, 'overview')) is not None,
+        'quick_stats': cache.get(get_quick_stats_cache_key(user_id, role)) is not None,
+        'notifications_10': cache.get(get_notifications_cache_key(user_id, role, 10)) is not None,
+        'notifications_20': cache.get(get_notifications_cache_key(user_id, role, 20)) is not None,
+        'notifications_50': cache.get(get_notifications_cache_key(user_id, role, 50)) is not None,
+    }
+    
+    # Add role-specific dashboards
+    if role == 'A':
+        status['platform_admin'] = cache.get(get_dashboard_cache_key(user_id, role, 'platform_admin')) is not None
+        status['school_owner'] = cache.get(get_dashboard_cache_key(user_id, role, 'school_owner')) is not None
+    elif role == 'I':
+        status['instructor'] = cache.get(get_dashboard_cache_key(user_id, role, 'instructor')) is not None
+    elif role == 'S':
+        status['student'] = cache.get(get_dashboard_cache_key(user_id, role, 'student')) is not None
+    
+    return status
+
+
+def clear_all_dashboard_caches():
+    """
+    Clear all dashboard-related caches.
+    Use during maintenance or when cache consistency is compromised.
+    """
+    # Clear using patterns if available
+    patterns = [
+        'dashboard_*',
+        'dashboard_quick_stats_*',
+        'dashboard_notifications_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            # Fallback for cache backends without delete_pattern
+            pass
+    
+    # Also try to clear by iterating through known user patterns
+    # This is less efficient but works for all cache backends
+    from django.core.cache import caches
+    default_cache = caches['default']
+    
+    # If using Redis or similar with scan, we could be more efficient
+    # For now, we rely on pattern deletion or the invalidate_dashboard_caches approach
+
+
+# ============================================
+# SIGNAL CONNECTION HELPER
+# ============================================
+
+def connect_all_dashboard_signals():
+    """
+    Connect all dashboard signal handlers.
+    Call this from your AppConfig.ready() method.
+    """
+    # All @receiver decorators have already connected the signals
+    # This function is for clarity and future extensibility
+    print("Dashboard signals connected")

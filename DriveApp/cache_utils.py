@@ -1321,7 +1321,44 @@ def get_report_export_cache_key(school_id, report_type, export_format):
     """Generate cache key for report export"""
     return f'report_export_school_{school_id}_type_{report_type}_format_{export_format}'
 
+# ============================================
+# DASHBOARD CACHE KEYS
+# ============================================
 
+def get_dashboard_cache_key(user_id, role, dashboard_type):
+    """Generate cache key for dashboard data"""
+    return f'dashboard_{dashboard_type}_{user_id}_{role}'
+
+def get_quick_stats_cache_key(user_id, role):
+    """Generate cache key for quick stats"""
+    return f'dashboard_quick_stats_{user_id}_{role}'
+
+def get_notifications_cache_key(user_id, role, limit):
+    """Generate cache key for notifications"""
+    return f'dashboard_notifications_{user_id}_{role}_{limit}'
+
+# ============================================
+# DASHBOARD CACHE INVALIDATION
+# ============================================
+
+def invalidate_dashboard_caches(user_id):
+    """Invalidate all dashboard caches for a user"""
+    if not user_id:
+        return
+    
+    patterns = [
+        f'dashboard_*_{user_id}_*',
+    ]
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            # Fallback: delete specific keys
+            for role in ['A', 'I', 'S']:
+                cache.delete(get_dashboard_cache_key(user_id, role, 'overview'))
+                cache.delete(get_quick_stats_cache_key(user_id, role))
+                
 # ============================================
 # REPORT CACHE INVALIDATION
 # ============================================

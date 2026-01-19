@@ -449,6 +449,26 @@ class ReportCustomThrottle(UserRateThrottle):
     rate = '15/hour'
     
 # ============================================
+# DASHBOARD THROTTLES
+# ============================================
+
+class DashboardOverviewThrottle(UserRateThrottle):
+    """Limit dashboard overview requests"""
+    scope = 'dashboard_overview'
+
+class DashboardDetailedThrottle(UserRateThrottle):
+    """Limit detailed dashboard requests (more data-intensive)"""
+    scope = 'dashboard_detailed'
+
+class DashboardQuickStatsThrottle(UserRateThrottle):
+    """Limit quick stats requests"""
+    scope = 'dashboard_quick_stats'
+
+class DashboardNotificationsThrottle(UserRateThrottle):
+    """Limit notifications requests"""
+    scope = 'dashboard_notifications'
+    
+# ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================
 
