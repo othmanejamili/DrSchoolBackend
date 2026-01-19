@@ -1430,7 +1430,7 @@ def invalidate_student_report_caches(school_id):
 # SUBSCRIPTION PLAN CACHE KEYS
 # ============================================
 
-def get_subscription_plan_list_cache_key(user_id, role):
+def get_subscriptions_plan_list_cache_key(user_id, role):
     """Cache key for subscription plan list"""
     return f'subscription_plans_list_{user_id}_{role}'
 

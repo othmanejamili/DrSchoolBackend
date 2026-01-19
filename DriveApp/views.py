@@ -95,10 +95,9 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_analytics_system_health_cache_key, get_analytics_summary_cache_key, get_analytics_predictions_cache_key, get_analytics_alerts_cache_key, get_analytics_comparison_cache_key,
                             get_analytics_trends_cache_key,get_report_weekly_cache_key, get_report_monthly_cache_key, get_report_instructor_performance_cache_key, get_report_student_progress_cache_key,
                             get_report_financial_summary_cache_key, get_report_export_cache_key, invalidate_report_cache, get_dashboard_cache_key, get_quick_stats_cache_key, get_notifications_cache_key,
-                            get_subscription_plan_list_cache_key, get_popular_plans_cache_key, get_plan_comparison_cache_key, get_pricing_tiers_cache_key, get_plan_statistics_cache_key, 
+                            get_subscriptions_plan_list_cache_key, get_popular_plans_cache_key, get_plan_comparison_cache_key, get_pricing_tiers_cache_key, get_plan_statistics_cache_key, 
                             invalidate_subscription_plan_caches, invalidate_plan_cache, get_school_subscription_list_cache_key, get_school_subscription_usage_cache_key, get_school_subscription_limits_cache_key,
                             invalidate_school_subscription_caches, invalidate_subscription_cache,
-
                             )
 
 User = get_user_model()
@@ -11765,7 +11764,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
                 
                 
         # Generate cache key
-        cache_key = get_subscription_plan_list_cache_key(user.id, user.role)
+        cache_key = get_subscriptions_plan_list_cache_key(user.id, user.role)
         
         # Only cache if no query parameters
         use_cache = not bool(self.request.query_params)
