@@ -412,7 +412,42 @@ class SchoolAnalyticsSummaryThrottle(UserRateThrottle):
 class SchoolAnalyticsSystemHealthThrottle(UserRateThrottle):
     """Rate limiting for school System health"""
     scope = 'school_analytic_system_health'
+# ============================================
+# REPORT THROTTLES
+# ============================================
 
+class ReportWeeklyThrottle(UserRateThrottle):
+    """Rate limit for weekly report generation"""
+    rate = '20/hour'
+
+class ReportMonthlyThrottle(UserRateThrottle):
+    """Rate limit for monthly report generation"""
+    rate = '15/hour'
+
+class ReportSendWeeklyThrottle(UserRateThrottle):
+    """Rate limit for sending weekly reports (email intensive)"""
+    rate = '5/hour'
+
+class ReportInstructorPerformanceThrottle(UserRateThrottle):
+    """Rate limit for instructor performance reports"""
+    rate = '25/hour'
+
+class ReportStudentProgressThrottle(UserRateThrottle):
+    """Rate limit for student progress reports"""
+    rate = '25/hour'
+
+class ReportFinancialSummaryThrottle(UserRateThrottle):
+    """Rate limit for financial summary reports"""
+    rate = '20/hour'
+
+class ReportExportThrottle(UserRateThrottle):
+    """Rate limit for report exports"""
+    rate = '10/hour'
+
+class ReportCustomThrottle(UserRateThrottle):
+    """Rate limit for custom reports"""
+    rate = '15/hour'
+    
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================

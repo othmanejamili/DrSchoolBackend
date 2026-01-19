@@ -340,3 +340,52 @@ def invalidate_school_analytics_signal(sender, instance, **kwargs):
     
     # Also invalidate school caches since analytics affects school stats
     invalidate_school_caches(instance.school_id)
+
+# ============================================
+# REPORT CACHE INVALIDATION SIGNALS
+# ============================================
+
+# When SchoolAnalytics changes, invalidate report caches
+@receiver([post_save, post_delete], sender=SchoolAnalytics)
+def invalidate_report_caches_on_analytics_change(sender, instance, **kwargs):
+    """Invalidate report caches when analytics data changes"""
+    from .cache_utils import invalidate_report_cache
+    invalidate_report_cache(instance.school_id)
+
+
+# When Lesson changes, invalidate report caches
+@receiver([post_save, post_delete], sender=Lesson)
+def invalidate_report_caches_on_lesson_change(sender, instance, **kwargs):
+    """Invalidate report caches when lesson data changes"""
+    from .cache_utils import invalidate_report_cache, invalidate_instructor_report_caches
+    invalidate_report_cache(instance.school_id)
+    if instance.instructor_id:
+        invalidate_instructor_report_caches(instance.school_id, instance.instructor_id)
+
+
+# When Feedback changes, invalidate report caches
+@receiver([post_save, post_delete], sender=Feedback)
+def invalidate_report_caches_on_feedback_change(sender, instance, **kwargs):
+    """Invalidate report caches when feedback changes"""
+    from .cache_utils import invalidate_report_cache, invalidate_instructor_report_caches
+    school_id = instance.lesson.school_id
+    invalidate_report_cache(school_id)
+    if instance.lesson.instructor_id:
+        invalidate_instructor_report_caches(school_id, instance.lesson.instructor_id)
+
+
+# When StudentProfile changes, invalidate student report caches
+@receiver([post_save, post_delete], sender=StudentProfile)
+def invalidate_report_caches_on_student_change(sender, instance, **kwargs):
+    """Invalidate report caches when student profile changes"""
+    from .cache_utils import invalidate_student_report_caches
+    invalidate_student_report_caches(instance.school_id)
+
+
+# When Attendance changes, invalidate report caches
+@receiver([post_save, post_delete], sender=Attendance)
+def invalidate_report_caches_on_attendance_change(sender, instance, **kwargs):
+    """Invalidate report caches when attendance changes"""
+    from .cache_utils import invalidate_report_cache
+    school_id = instance.lesson.school_id
+    invalidate_report_cache(school_id)
