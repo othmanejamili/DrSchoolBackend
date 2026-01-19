@@ -1475,7 +1475,109 @@ def get_school_subscription_limits_cache_key(subscription_id):
     """Cache key for limit checks"""
     return f'school_subscription_limits_{subscription_id}'
 
+# ============================================
+# STUDENT DOCUMENT CACHE KEYS
+# ============================================
 
+def get_student_document_queryset_cache_key(user_id, role):
+    """Generate cache key for student document queryset"""
+    return f'student_documents_queryset_{user_id}_{role}'
+
+def get_student_document_detail_cache_key(document_id):
+    """Generate cache key for single document"""
+    return f'student_document_detail_{document_id}'
+
+def get_my_documents_cache_key(student_id):
+    """Generate cache key for student's own documents"""
+    return f'my_documents_student_{student_id}'
+
+def get_student_documents_cache_key(student_id, requesting_user_id):
+    """Generate cache key for viewing a specific student's documents"""
+    return f'student_documents_{student_id}_viewer_{requesting_user_id}'
+
+def get_document_statistics_cache_key(user_id, school_id=None):
+    """Generate cache key for document statistics"""
+    school_suffix = f'_school_{school_id}' if school_id else ''
+    return f'document_statistics_{user_id}{school_suffix}'
+
+def get_documents_by_type_cache_key(student_id):
+    """Generate cache key for documents grouped by type"""
+    return f'documents_by_type_student_{student_id}'
+
+
+# ============================================
+# STUDENT DOCUMENT CACHE INVALIDATION
+# ============================================
+
+def invalidate_student_document_cache(document_id, student_id=None):
+    """Invalidate all caches related to a student document"""
+    if not document_id:
+        return
+    
+    # Delete specific document cache
+    cache.delete(get_student_document_detail_cache_key(document_id))
+    
+    # Delete related patterns
+    patterns_to_delete = [
+        f'student_document_{document_id}_*',
+        f'*document*{document_id}*',
+    ]
+    
+    for pattern in patterns_to_delete:
+        delete_pattern_with_fallback(pattern)
+    
+    # Invalidate student-specific caches if student_id provided
+    if student_id:
+        invalidate_student_documents_caches(student_id)
+
+
+def invalidate_student_document_queryset_caches():
+    """Invalidate all document queryset caches"""
+    patterns = [
+        'student_documents_queryset_*',
+        'my_documents_*',
+        'student_documents_*',
+        'documents_by_type_*',
+        'document_statistics_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_student_documents_caches(student_id):
+    """Invalidate document caches for a specific student"""
+    if not student_id:
+        return
+    
+    # Delete student-specific caches
+    cache.delete(get_my_documents_cache_key(student_id))
+    cache.delete(get_documents_by_type_cache_key(student_id))
+    
+    patterns = [
+        f'my_documents_student_{student_id}',
+        f'student_documents_{student_id}_*',
+        f'documents_by_type_student_{student_id}',
+        f'*student_{student_id}*document*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_school_documents_caches(school_id):
+    """Invalidate document caches for a specific school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'*school_{school_id}*document*',
+        'document_statistics_*',
+        'student_documents_queryset_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
 # ============================================
 # CACHE INVALIDATION FUNCTIONS
 # ============================================

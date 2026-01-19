@@ -8,7 +8,8 @@ from django.core.cache import cache
 from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
                       Feedback, Attendance, Vehicle, VehiclePicture, Achievement,
                       CommunicationTemplate, AutomatedMessage, SchoolAnalytics,
-                          User, StudentProfile, DrivingSchool, Lesson, Schedule, SubscriptionPlan, SchoolSubscription
+                        User, StudentProfile, DrivingSchool, Lesson, Schedule, SubscriptionPlan, 
+                        SchoolSubscription, StudentDocument
                       )
 from .cache_utils import (
     invalidate_lesson_cache,
@@ -955,3 +956,26 @@ def school_subscription_post_save(sender, instance, created, **kwargs):
 def school_subscription_post_delete(sender, instance, **kwargs):
     """Invalidate subscription caches after delete"""
     invalidate_school_subscription_caches(instance.school_id)
+
+
+# ============================================
+# STUDENT DOCUMENT SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=StudentDocument)
+def invalidate_student_document_signal(sender, instance, **kwargs):
+    """Invalidate document cache when document is saved or deleted"""
+    from .cache_utils import (
+        invalidate_student_document_cache,
+        invalidate_student_document_queryset_caches,
+        invalidate_student_documents_caches,
+        invalidate_school_documents_caches
+    )
+    
+    invalidate_student_document_cache(instance.id, student_id=instance.student_id)
+    invalidate_student_document_queryset_caches()
+    invalidate_student_documents_caches(instance.student_id)
+    
+    # Also invalidate school caches
+    if hasattr(instance.student, 'school'):
+        invalidate_school_documents_caches(instance.student.school_id)

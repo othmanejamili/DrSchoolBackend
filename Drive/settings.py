@@ -325,6 +325,17 @@ REST_FRAMEWORK = {
         'school_subscription_update': '20/hour',
         'school_subscription_action': '15/hour',  # cancel, renew, upgrade
         'school_subscription_usage': '100/hour',  # usage stats, limits
+
+        # Student Document ViewSet rates
+        'student_document_list': '100/hour',
+        'student_document_create': '20/hour',
+        'student_document_update': '30/hour',
+        'student_document_bulk_upload': '5/hour',
+        'student_document_download': '50/hour',
+        'student_document_my_documents': '60/hour',
+        'student_document_student_docs': '40/hour',
+        'student_document_statistics': '30/hour',
+        
     },
     
     # Filtering
@@ -670,6 +681,34 @@ CACHE_TIMEOUTS = {
     'student_messages': 60 * 3,                      # 3 minutes
     'my_messages': 60 * 2,                           # 2 minutes (student's own)
     'unread_messages_count': 60 * 1,                 # 1 minute (very dynamic)    
+
+    # Analytics
+    'analytics_queryset': 60 * 5,
+    'analytics_dashboard': 60 * 5,
+    'analytics_trends': 60 * 10,
+    'analytics_comparison': 60 * 15,
+    'analytics_alerts': 60 * 5,
+    'analytics_predictions': 60 * 30,
+    'analytics_summary': 60 * 5,
+    'analytics_system_health': 60 * 2,
+    
+    # Reports
+    'report_weekly': 60 * 120,  # 2 hours
+    'report_monthly': 60 * 360,  # 6 hours
+    'report_instructor_performance': 60 * 60,  # 1 hour
+    'report_student_progress': 60 * 30,  # 30 minutes
+    'report_financial_summary': 60 * 120,  # 2 hours
+    'report_export': 60 * 60,  # 1 hour
+    
+
+    # Student Documents
+    'student_document_queryset': 60 * 5,
+    'student_document_detail': 60 * 10,
+    'my_documents': 60 * 5,
+    'student_documents_view': 60 * 5,
+    'document_download': 60 * 10,
+    'document_statistics': 60 * 15,
+
 
     #Default 
     'default': 60 * 5,

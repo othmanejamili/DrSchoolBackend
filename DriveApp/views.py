@@ -61,6 +61,8 @@ from .throttles import (
         ReportFinancialSummaryThrottle, ReportExportThrottle,DashboardOverviewThrottle, DashboardDetailedThrottle, DashboardQuickStatsThrottle,
         DashboardNotificationsThrottle, SubscriptionPlanListThrottle, SubscriptionPlanCreateThrottle, SubscriptionPlanUpdateThrottle, SubscriptionPlanStatisticsThrottle,
         SchoolSubscriptionListThrottle, SchoolSubscriptionCreateThrottle, SchoolSubscriptionUpdateThrottle, SchoolSubscriptionActionThrottle, SchoolSubscriptionUsageThrottle,
+        StudentDocumentListThrottle, StudentDocumentCreateThrottle, StudentDocumentUpdateThrottle, StudentDocumentBulkUploadThrottle, StudentDocumentDownloadThrottle, 
+        StudentDocumentMyDocumentsThrottle, StudentDocumentStudentDocsThrottle, StudentDocumentStatisticsThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -97,7 +99,9 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_report_financial_summary_cache_key, get_report_export_cache_key, invalidate_report_cache, get_dashboard_cache_key, get_quick_stats_cache_key, get_notifications_cache_key,
                             get_subscriptions_plan_list_cache_key, get_popular_plans_cache_key, get_plan_comparison_cache_key, get_pricing_tiers_cache_key, get_plan_statistics_cache_key, 
                             invalidate_subscription_plan_caches, invalidate_plan_cache, get_school_subscription_list_cache_key, get_school_subscription_usage_cache_key, get_school_subscription_limits_cache_key,
-                            invalidate_school_subscription_caches, invalidate_subscription_cache,
+                            invalidate_school_subscription_caches, invalidate_subscription_cache, get_student_document_queryset_cache_key, get_student_document_detail_cache_key, get_my_documents_cache_key, 
+                            get_student_documents_cache_key, get_document_statistics_cache_key, get_documents_by_type_cache_key, invalidate_student_document_cache, invalidate_student_document_queryset_caches, 
+                            invalidate_student_documents_caches
                             )
 
 User = get_user_model()
@@ -12527,43 +12531,81 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
     ordering_fields = ['uploaded_at', 'document_type']
     ordering = ['-uploaded_at']
     
+    # Default throttle
+    throttle_classes = [UserRateThrottle]
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': StudentDocumentListThrottle,
+            'create': StudentDocumentCreateThrottle,
+            'update': StudentDocumentUpdateThrottle,
+            'partial_update': StudentDocumentUpdateThrottle,
+            'bulk_upload': StudentDocumentBulkUploadThrottle,
+            'download': StudentDocumentDownloadThrottle,
+            'my_documents': StudentDocumentMyDocumentsThrottle,
+            'student_documents': StudentDocumentStudentDocsThrottle,
+            'statistics': StudentDocumentStatisticsThrottle,
+        }
+        
+        throttle_class = throttle_map.get(self.action)
+        if throttle_class:
+            return [throttle_class()]
+        return super().get_throttles()
+
     def get_queryset(self):
-        """Filter documents based on user role"""
+        """Filter documents based on user role with caching"""
         user = self.request.user
         if not user.is_authenticated:
             return StudentDocument.objects.none()
         
-        # Platform Admin (staff) sees all documents
+        # Generate cache key
+        cache_key = get_student_document_queryset_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters (filtering disabled caching)
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+        
+        # Build queryset based on role (existing logic)
         if user.role == 'A' and user.is_staff:
-            return StudentDocument.objects.all().select_related(
+            queryset = StudentDocument.objects.all().select_related(
                 'student__user', 'student__school'
             )
         
-        # School Owner sees documents in their schools
-        if user.role == 'A' and not user.is_staff:
-            return StudentDocument.objects.filter(
+        elif user.role == 'A' and not user.is_staff:
+            queryset = StudentDocument.objects.filter(
                 student__school__owner=user
             ).select_related('student__user', 'student__school')
         
-        # Instructor sees documents of students in their school
-        if user.role == 'I':
+        elif user.role == 'I':
             instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
-                return StudentDocument.objects.filter(
+                queryset = StudentDocument.objects.filter(
                     student__school=instructor_profile.school
                 ).select_related('student__user', 'student__school')
-            return StudentDocument.objects.none()
+            else:
+                queryset = StudentDocument.objects.none()
         
-        # Student sees only their own documents
-        if user.role == 'S':
+        elif user.role == 'S':
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
-                return StudentDocument.objects.filter(
+                queryset = StudentDocument.objects.filter(
                     student=student_profile
                 ).select_related('student__user', 'student__school')
-            return StudentDocument.objects.none()
+            else:
+                queryset = StudentDocument.objects.none()
+        else:
+            queryset = StudentDocument.objects.none()
         
-        return StudentDocument.objects.none()
+        # Cache for 5 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+        
+        return queryset
     
     def get_permissions(self):
         """Define permissions per action"""
@@ -12595,20 +12637,23 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
     
     @transaction.atomic
     def perform_create(self, serializer):
-        """Create document with validation"""
+        """Create document with cache invalidation"""
         user = self.request.user
-        student = serializer.validated_data.get('student')
-        file = serializer.validated_data.get('file')
         
         # Use service to create document
-        StudentDocumentService.create_document(
+        document = StudentDocumentService.create_document(
             serializer.validated_data,
             user
         )
+        
+        # Invalidate caches
+        invalidate_student_documents_caches(document.student_id)
+        invalidate_student_document_queryset_caches()
+
     
     @transaction.atomic
     def perform_update(self, serializer):
-        """Update document with validation"""
+        """Update document with cache invalidation"""
         user = self.request.user
         instance = self.get_object()
         
@@ -12616,29 +12661,43 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
         if not StudentDocumentService.can_modify_document(user, instance):
             raise PermissionDenied("You don't have permission to update this document")
         
-        # Save using serializer (this will call the serializer's update method)
+        # Save using serializer
         serializer.save()
-
+        
+        # Invalidate caches
+        invalidate_student_document_cache(instance.id, student_id=instance.student_id)
+        invalidate_student_document_queryset_caches()
+    
     @transaction.atomic
     def perform_destroy(self, instance):
-        """Delete document with permission checks"""
+        """Delete document with cache invalidation"""
         user = self.request.user
         
         # Check permissions
         if not StudentDocumentService.can_modify_document(user, instance):
             raise PermissionDenied("You don't have permission to delete this document")
         
+        # Store IDs before deletion
+        document_id = instance.id
+        student_id = instance.student_id
+        
         # Delete the file and database record
         instance.delete()
+        
+        # Invalidate caches
+        invalidate_student_document_cache(document_id, student_id=student_id)
+        invalidate_student_document_queryset_caches()
     
     # ==================== CUSTOM ACTIONS ====================
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[StudentDocumentMyDocumentsThrottle])
     def my_documents(self, request):
         """
-        Get documents for the current student.
+        Get documents for the current student with caching.
         
-        GET /api/student-documents/my_documents/
+        Cache duration: 5 minutes (documents don't change frequently)
         """
         user = request.user
         
@@ -12656,6 +12715,14 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # Generate cache key
+        cache_key = get_my_documents_cache_key(student_profile.id)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            cached_data['cache_hit'] = True
+            return Response(cached_data)
+        
         # Get student's documents
         documents = StudentDocument.objects.filter(
             student=student_profile
@@ -12671,7 +12738,7 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(documents, many=True)
         
-        return Response({
+        response_data = {
             'student': {
                 'id': student_profile.id,
                 'name': user.get_full_name() or user.username,
@@ -12681,15 +12748,23 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
             'documents_by_type': {
                 doc_type: len(docs) for doc_type, docs in documents_by_type.items()
             },
-            'documents': serializer.data
-        })
+            'documents': serializer.data,
+            'cache_hit': False
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[StudentDocumentStudentDocsThrottle])
     def student_documents(self, request):
         """
-        Get documents for a specific student.
+        Get documents for a specific student with caching.
         
-        GET /api/student-documents/student_documents/?student_id=123
+        Cache duration: 5 minutes
         """
         student_id = request.query_params.get('student_id')
         
@@ -12719,6 +12794,14 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
             if student_profile.school.owner != user:
                 raise PermissionDenied("You can only view documents in your schools")
         
+        # Generate cache key
+        cache_key = get_student_documents_cache_key(student_id, user.id)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            cached_data['cache_hit'] = True
+            return Response(cached_data)
+        
         # Get student's documents
         documents = StudentDocument.objects.filter(
             student=student_profile
@@ -12726,7 +12809,7 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(documents, many=True)
         
-        return Response({
+        response_data = {
             'student': {
                 'id': student_profile.id,
                 'name': student_profile.user.get_full_name() or student_profile.user.username,
@@ -12734,20 +12817,25 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
                 'school': student_profile.school.name
             },
             'total_documents': documents.count(),
-            'documents': serializer.data
-        })
+            'documents': serializer.data,
+            'cache_hit': False
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['post'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[StudentDocumentBulkUploadThrottle])
     @transaction.atomic
     def bulk_upload(self, request):
         """
         Upload multiple documents at once.
         
-        POST /api/student-documents/bulk_upload/
-        Body: multipart/form-data
-        - student_id: int (optional for students)
-        - document_type: string
-        - files[]: array of files
+        No caching - always processes fresh uploads
+        Heavy rate limiting due to file upload intensity
         """
         serializer = StudentDocumentUploadSerializer(data=request.data, context={'request': request})
         
@@ -12759,9 +12847,8 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
         document_type = serializer.validated_data['document_type']
         student_id = serializer.validated_data.get('student_id')
         
-        # Determine student
+        # Determine student (existing logic)
         if user.role == 'S':
-            # Student uploads their own documents
             student_profile = user.student_profiles.filter(status='A').first()
             if not student_profile:
                 return Response(
@@ -12769,7 +12856,6 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
         else:
-            # Admin/Owner/Instructor uploads for a specific student
             if not student_id:
                 return Response(
                     {'error': 'student_id is required for non-students'},
@@ -12823,6 +12909,11 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
                     'error': str(e)
                 })
         
+        # Invalidate caches after bulk upload
+        if uploaded_documents:
+            invalidate_student_documents_caches(student_profile.id)
+            invalidate_student_document_queryset_caches()
+        
         return Response({
             'message': f'Uploaded {len(uploaded_documents)} documents',
             'summary': {
@@ -12838,12 +12929,14 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
             }
         }, status=status.HTTP_201_CREATED if uploaded_documents else status.HTTP_400_BAD_REQUEST)
     
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[StudentDocumentDownloadThrottle])
     def download(self, request, pk=None):
         """
         Download a document file.
         
-        GET /api/student-documents/{id}/download/
+        Cache duration: 10 minutes (file URLs are relatively stable)
         """
         document = self.get_object()
         user = request.user
@@ -12862,6 +12955,14 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
             if document.student.school.owner != user:
                 raise PermissionDenied("You can only download documents from your schools")
         
+        # Generate cache key for download info
+        cache_key = f'document_download_{document.id}_user_{user.id}'
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            cached_data['cache_hit'] = True
+            return Response(cached_data)
+        
         # Get file URL
         file_url = StudentDocumentService.get_file_url(document, request)
         
@@ -12872,24 +12973,30 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
             )
         
         # Return file info for download
-        return Response({
+        response_data = {
             'document_id': document.id,
             'filename': document.file.name.split('/')[-1],
             'document_type': document.document_type,
             'file_url': file_url,
             'file_size': StudentDocumentService.get_file_size(document.file),
             'uploaded_at': document.uploaded_at,
-            'student': document.student.user.get_full_name() or document.student.user.username
-        })
+            'student': document.student.user.get_full_name() or document.student.user.username,
+            'cache_hit': False
+        }
+        
+        # Cache for 10 minutes
+        cache.set(cache_key, response_data, 60 * 10)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], 
+            permission_classes=[IsAuthenticated],
+            throttle_classes=[StudentDocumentStatisticsThrottle])
     def statistics(self, request):
         """
-        Get document statistics.
+        Get document statistics with caching.
         
-        GET /api/student-documents/statistics/
-        Query params:
-        - school_id: Optional (admins only)
+        Cache duration: 15 minutes (statistics don't change frequently)
         """
         user = request.user
         queryset = self.get_queryset()
@@ -12904,6 +13011,14 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
                     {'error': 'Only platform admins can filter by school_id'},
                     status=status.HTTP_403_FORBIDDEN
                 )
+        
+        # Generate cache key
+        cache_key = get_document_statistics_cache_key(user.id, school_id)
+        cached_stats = cache.get(cache_key)
+        
+        if cached_stats is not None:
+            cached_stats['cache_hit'] = True
+            return Response(cached_stats)
         
         # Calculate statistics
         total_documents = queryset.count()
@@ -12924,10 +13039,18 @@ class StudentDocumentViewSet(viewsets.ModelViewSet):
         # Students with documents
         students_with_docs = queryset.values('student').distinct().count()
         
-        return Response({
+        stats = {
             'total_documents': total_documents,
             'documents_by_type': by_type,
             'recent_uploads_30days': recent_uploads,
             'students_with_documents': students_with_docs,
-            'scope': 'school' if school_id else 'all_accessible'
-        })  
+            'scope': 'school' if school_id else 'all_accessible',
+            'cache_hit': False
+        }
+        
+        # Cache for 15 minutes
+        cache.set(cache_key, stats, 60 * 15)
+        
+        return Response(stats)
+    
+    
