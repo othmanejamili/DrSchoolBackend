@@ -7,7 +7,7 @@ from django.dispatch import receiver
 from django.core.cache import cache
 from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
                       Feedback, Attendance, Vehicle, VehiclePicture, Achievement,
-                      CommunicationTemplate, AutomatedMessage)
+                      CommunicationTemplate, AutomatedMessage, SchoolAnalytics)
 from .cache_utils import (
     invalidate_lesson_cache,
     invalidate_lesson_queryset_caches,
@@ -32,7 +32,8 @@ from .cache_utils import (
     invalidate_schedule_cache,
     invalidate_instructor_schedule_caches,
     invalidate_vehicle_schedule_caches,
-    invalidate_availability_caches
+    invalidate_availability_caches,
+    invalidate_school_caches
 )
 
 # ============================================
@@ -319,3 +320,23 @@ def invalidate_automated_message_signal(sender, instance, **kwargs):
     invalidate_automated_message_queryset_caches()
     invalidate_student_message_caches(instance.student_id)
     invalidate_template_message_caches(instance.template_id)
+
+# ============================================
+# SCHOOL ANALYTICS SIGNAL HANDLERS
+# ============================================
+
+@receiver([post_save, post_delete], sender=SchoolAnalytics)
+def invalidate_school_analytics_signal(sender, instance, **kwargs):
+    """Invalidate analytics cache when analytics record is saved or deleted"""
+    from .cache_utils import (
+        invalidate_school_analytics_cache,
+        invalidate_school_analytics_queryset_caches,
+        invalidate_school_specific_analytics_caches
+    )
+    
+    invalidate_school_analytics_cache(instance.id, school_id=instance.school_id)
+    invalidate_school_analytics_queryset_caches()
+    invalidate_school_specific_analytics_caches(instance.school_id)
+    
+    # Also invalidate school caches since analytics affects school stats
+    invalidate_school_caches(instance.school_id)

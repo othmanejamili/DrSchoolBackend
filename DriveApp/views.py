@@ -53,7 +53,10 @@ from .throttles import (
         CommunicationTemplateDuplicateThrottle, CommunicationTemplatePreviewThrottle, CommunicationTemplateUsageStatsThrottle,
         AutomatedMessageListThrottle,AutomatedMessageCreateThrottle,AutomatedMessageUpdateThrottle,
         AutomatedMessageBulkCreateThrottle,AutomatedMessageBulkCancelThrottle,AutomatedMessageSendNowThrottle,
-        AutomatedMessageStatisticsThrottle,AutomatedMessageScheduleThrottle
+        AutomatedMessageStatisticsThrottle,AutomatedMessageScheduleThrottle,SchoolAnalyticsListThrottle, SchoolAnalyticsCreateThrottle,
+        SchoolAnalyticsUpdateThrottle, SchoolAnalyticsUpdateThrottle, SchoolAnalyticsDashboardThrottle, SchoolAnalyticsGenerateDailyThrottle,
+        SchoolAnalyticsBulkGenerateThrottle, SchoolAnalyticsTrendsThrottle, SchoolAnalyticsComparisonThrottle, SchoolAnalyticsExportThrottle,
+        SchoolAnalyticsAlertsThrottle, SchoolAnalyticsPredictionsThrottle, SchoolAnalyticsSummaryThrottle, SchoolAnalyticsSystemHealthThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -83,7 +86,11 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_my_achievements_cache_key,get_leaderboard_cache_key, get_achievement_statistics_cache_key, get_communication_template_queryset_cache_key,
                             invalidate_communication_template_cache, invalidate_communication_template_queryset_caches, get_template_by_type_cache_key,
                             get_template_usage_stats_cache_key,get_automated_message_queryset_cache_key,invalidate_automated_message_cache,invalidate_automated_message_queryset_caches,
-                            get_message_statistics_cache_key, get_my_messages_cache_key
+                            get_message_statistics_cache_key, get_my_messages_cache_key, get_school_analytics_queryset_cache_key, invalidate_school_analytics_cache, 
+                            invalidate_school_analytics_queryset_caches, get_analytics_dashboard_cache_key, invalidate_school_analytics_cache,invalidate_school_specific_analytics_caches,
+                            get_analytics_system_health_cache_key, get_analytics_summary_cache_key, get_analytics_predictions_cache_key, get_analytics_alerts_cache_key, get_analytics_comparison_cache_key,
+                            get_analytics_trends_cache_key,
+
                             )
 
 User = get_user_model()
@@ -7170,38 +7177,75 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
     ordering_fields = ['date', 'total_students', 'active_students', 'completion_rate', 'revenue']
     ordering = ['-date']
 
+    throttle_classes = [UserRateThrottle]
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': SchoolAnalyticsListThrottle,
+            'create': SchoolAnalyticsCreateThrottle,
+            'update': SchoolAnalyticsUpdateThrottle,
+            'partial_update': SchoolAnalyticsUpdateThrottle,
+            'dashboard': SchoolAnalyticsDashboardThrottle,
+            'generate_daily': SchoolAnalyticsGenerateDailyThrottle,
+            'bulk_generate': SchoolAnalyticsBulkGenerateThrottle,
+            'trends': SchoolAnalyticsTrendsThrottle,
+            'comparison': SchoolAnalyticsComparisonThrottle,
+            'export': SchoolAnalyticsExportThrottle,
+            'alerts': SchoolAnalyticsAlertsThrottle,
+            'predictions': SchoolAnalyticsPredictionsThrottle,
+            'summary': SchoolAnalyticsSummaryThrottle,
+            'system_health': SchoolAnalyticsSystemHealthThrottle
+        }
+        
+        throttle_class = throttle_map.get(self.action)
+        if throttle_class:
+            return [throttle_class()]
+        return super().get_throttles()
+    
     def get_queryset(self):
         """Filter analytics based on user role and school"""
         user = self.request.user
         if not user.is_authenticated:
             return SchoolAnalytics.objects.none()
         
+        cache_key = get_school_analytics_queryset_cache_key(user.id, user.role)
+
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+
+        if use_cache:
+            cached_queryset = cache.get(use_cache)
+            if cached_queryset is not None:
+                return cached_queryset
+
         # Platform Admin (staff) sees all analytics
         if user.role == 'A' and user.is_staff:
-            return SchoolAnalytics.objects.all().select_related('school')
-        
+            queryset =  SchoolAnalytics.objects.all()
         # School Owner sees analytics for their schools
-        if user.role == 'A' and not user.is_staff:
-            return SchoolAnalytics.objects.filter(
-                school__owner=user
-            ).select_related('school')
-        
+        elif user.role == 'A' and not user.is_staff:
+            queryset =  SchoolAnalytics.objects.filter(school__owner=user)
         # Instructor sees analytics for their school
-        if user.role == 'I':
+        elif user.role == 'I':
             instructor_profile = user.student_profiles.filter(status='A').first()
             if instructor_profile:
-                return SchoolAnalytics.objects.filter(
-                    school=instructor_profile.school
-                ).select_related('school')
-        
-
-        # Students cannot access analytics
-        if user.role == 'S':
+                queryset = SchoolAnalytics.objects.filter(school=instructor_profile.school)
+            else:
+                queryset = SchoolAnalytics.objects.none()
+         # Students cannot access analytics
+        elif user.role == 'S':
             return Response("Students cannot access analytics")
+        else:
+            queryset = SchoolAnalytics.objects.none()
         
-    
-        return SchoolAnalytics.objects.none()
-    
+        queryset = queryset.select_related('school')
+
+        #Cache for 6 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+
+        return queryset
+
     def get_permissions(self):
         """Define permissions per action"""
         if self.action == 'create':
@@ -7231,14 +7275,18 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         # Platform admin can create for any school
         if user.role == 'A' and user.is_staff:
-            serializer.save()
+            analytics = serializer.save()
+            invalidate_school_analytics_cache(analytics.id, school_id=analytics.school_id)
+            invalidate_school_analytics_queryset_caches()
             return
         
         # School owner can only create for their own schools
         if user.role == 'A' and not user.is_staff:
             if school.owner != user:
                 raise PermissionDenied("You can only create analytics for your own schools")
-            serializer.save()
+            analytics = serializer.save()
+            invalidate_school_analytics_cache(analytics.id, school_id=analytics.school_id)
+            invalidate_school_analytics_queryset_caches()
             return
         
         raise PermissionDenied("You don't have permission to create analytics")
@@ -7251,6 +7299,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         # Platform admin can update any analytics
         if user.role == 'A' and user.is_staff:
             serializer.save()
+            invalidate_school_analytics_cache(instance.id, school_id=instance.school_id)
+            invalidate_school_analytics_queryset_caches()
             return
         
         # School owner can update analytics for their schools
@@ -7258,6 +7308,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             if instance.school.owner != user:
                 raise PermissionDenied("You can only update analytics for your own schools")
             serializer.save()
+            invalidate_school_analytics_cache(instance.id, school_id=instance.school_id)
+            invalidate_school_analytics_queryset_caches()
             return
         
         raise PermissionDenied("You don't have permission to update this analytics record")
@@ -7265,17 +7317,22 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """Delete analytics with permission checks"""
         user = self.request.user
-        
+        analytics_id = instance.id
+        school_id = instance.school_id
+
         # Only platform admin can delete analytics
         if user.role == 'A' and user.is_staff:
             instance.delete()
+            invalidate_school_analytics_cache(analytics_id, school_id=school_id)
+            invalidate_school_analytics_queryset_caches()
             return
         
         raise PermissionDenied("Only platform administrators can delete analytics records")
     
     # ==================== CUSTOM ACTIONS ====================
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[SchoolAnalyticsDashboardThrottle])
     def dashboard(self, request):
         """
         Get comprehensive dashboard data for a school.
@@ -7338,6 +7395,14 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 {'error': 'Invalid user role for this endpoint'},
                 status=status.HTTP_403_FORBIDDEN
             )
+        
+        # Generate Cache Key
+        cache_key = get_analytics_dashboard_cache_key(user.id, school.id, date_range)
+        cached_data = cache.get(cache_key)
+
+        if cached_data is not None:
+            return Response(cached_data)
+
         
         # Calculate date range
         today = timezone.now().date()
@@ -7527,9 +7592,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             'recent_feedback': recent_feedback_data
         }
         
+        #Cache For 5 minutes
+        cache.set(cache_key, dashboard_data, 60 * 5)
         return Response(dashboard_data)
     
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner],
+    throttle_classes=[SchoolAnalyticsGenerateDailyThrottle])
     @transaction.atomic
     def generate_daily(self, request):
         """
@@ -7581,6 +7649,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         # Generate analytics
         analytics = AnalyticsService.generate_daily_analytics(school, target_date, force_refresh=True)
         
+        invalidate_school_analytics_cache(user.id, school_id=school.id)
+        invalidate_school_specific_analytics_caches(school.id)
         serializer = self.get_serializer(analytics)
         
         return Response({
@@ -7611,6 +7681,9 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             force_refresh=True
         )
         
+        invalidate_school_analytics_cache(refreshed_analytics.id, school_id=refreshed_analytics.school_id)
+        invalidate_school_specific_analytics_caches(refreshed_analytics.school_id)
+
         serializer = self.get_serializer(refreshed_analytics)
         
         return Response({
@@ -7618,7 +7691,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             'analytics': serializer.data
         })
     
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner],
+            throttle_classes=[SchoolAnalyticsBulkGenerateThrottle])
     @transaction.atomic
     def bulk_generate(self, request):
         """
@@ -7696,6 +7770,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         skipped_count = 0
         
         for school in schools:
+            invalidate_school_specific_analytics_caches(school.id)
             current_date = start_date
             while current_date <= end_date:
                 # Check if analytics already exists
@@ -7712,6 +7787,10 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 
                 current_date += timedelta(days=1)
         
+        
+        invalidate_school_analytics_queryset_caches()
+
+        
         return Response({
             'message': f'Bulk analytics generation completed',
             'summary': {
@@ -7723,7 +7802,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             }
         }, status=status.HTTP_201_CREATED)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes = [SchoolAnalyticsTrendsThrottle])
     def trends(self, request):
         """
         Get trend analysis for a school.
@@ -7765,6 +7845,13 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             if not instructor_profile or instructor_profile.school != school:
                 raise PermissionDenied("You can only view trends for your school")
         
+        #Generate Cache
+        cache_key = get_analytics_trends_cache_key(school_id, metric, days)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+
         # Get analytics data
         end_date = timezone.now().date()
         start_date = end_date - timedelta(days=days-1)
@@ -7838,7 +7925,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         else:
             summary = {'message': 'No data available for this period'}
         
-        return Response({
+        response_data = {
             'school': {
                 'id': school.id,
                 'name': school.name
@@ -7852,9 +7939,15 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             'summary': summary,
             'trend_data': trend_data,
             'data_points': len(trend_data)
-        })
+        }
+
+        #Generate cache for 10 minutes
+        cache.set(cache_key, response_data, 60 * 10)
+
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwnerOrInstructor],
+            throttle_classes=[SchoolAnalyticsComparisonThrottle])
     def comparison(self, request):
         """
         Compare multiple schools or time periods.
@@ -7891,6 +7984,17 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 {'error': 'Cannot compare more than 5 schools at once'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Generate cache key
+        cache_key = get_analytics_comparison_cache_key(
+            school_ids_str, 
+            start_date.isoformat(), 
+            end_date.isoformat()
+        )
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         
         # Parse dates
         # Check if only one date is provided (missing the other)
@@ -8094,7 +8198,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             }
         }
         
-        return Response({
+        response_data = {
             'period': {
                 'start_date': start_date,
                 'end_date': end_date,
@@ -8103,9 +8207,14 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             'overall_statistics': overall_stats,
             'school_comparison': comparison_data,
             'performance_ranking': comparison_data[:3] if len(comparison_data) >= 3 else comparison_data
-        })
+        }
+
+        # Cache for 15 minutes
+        cache.set(cache_key, response_data, 60 * 15)
+
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], throttle_classes=[SchoolAnalyticsExportThrottle]  )
     def export(self, request):
         """
         Export analytics data in CSV or JSON format.
@@ -8116,8 +8225,6 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         - end_date: YYYY-MM-DD (optional, defaults to today)
         - format: 'csv' or 'json' (default: 'csv')
         """
-
-
         
         school_id = request.query_params.get('school_id')
         start_date_str = request.query_params.get('start_date')
@@ -8271,7 +8378,8 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 'exported_at': timezone.now().isoformat()
             })
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner],
+    throttle_classes=[SchoolAnalyticsAlertsThrottle])
     def alerts(self, request):
         """
         Get performance alerts for a school.
@@ -8306,6 +8414,13 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             if school.owner != user:
                 raise PermissionDenied("You can only view alerts for your own schools")
         
+        cache_key = get_analytics_alerts_cache_key(school_id, days)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+        
+
         end_date = timezone.now().date()
         start_date = end_date - timedelta(days=days)
         
@@ -8446,7 +8561,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         health_status = 'healthy' if health_score >= 80 else 'needs_attention' if health_score >= 60 else 'critical'
         
-        return Response({
+        response_data = {
             'school': {
                 'id': school.id,
                 'name': school.name
@@ -8474,9 +8589,15 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 'for_information': len(low_severity)
             },
             'timestamp': timezone.now().isoformat()
-        })
+        }
+
+        #Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner],
+    throttle_classes=[SchoolAnalyticsPredictionsThrottle])
     def predictions(self, request):
         """
         Get predictive insights and forecasts.
@@ -8509,6 +8630,13 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         if user.role == 'A' and not user.is_staff:
             if school.owner != user:
                 raise PermissionDenied("You can only view predictions for your own schools")
+        
+
+        cache_key = get_analytics_predictions_cache_key(school_id, horizon)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         
         # Get historical data (last 90 days)
         end_date = timezone.now().date()
@@ -8617,7 +8745,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 'impact': 'Medium'
             })
         
-        return Response({
+        response_data = {
             'school': {
                 'id': school.id,
                 'name': school.name
@@ -8658,9 +8786,14 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 f'Confidence level is {confidence}% based on data quality.',
                 'Actual results may vary based on external factors.'
             ]
-        })
+        }
+
+        cache.set(cache_key, response_data, 60 * 30)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated],
+            throttle_classes=[SchoolAnalyticsSummaryThrottle])
     def summary(self, request):
         """
         Get a summary of all accessible schools' analytics.
@@ -8669,6 +8802,13 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         GET /api/school-analytics/summary/
         """
         user = request.user
+        
+        # Generate cache key
+        cache_key = get_analytics_summary_cache_key(user.id, user.role)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         
         if user.role == 'A' and user.is_staff:
             # Platform admin - summary of all schools
@@ -8814,7 +8954,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                 presence=True
             ).values('student').distinct().count()
             
-            return Response({
+            response_data = {
                 'user_role': 'instructor',
                 'school_summary': {
                     'school_id': school.id,
@@ -8838,15 +8978,20 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
                         float(avg_rating) - float(latest_analytics.average_rating), 2
                     )
                 }
-            })
-        
+            }
         else:
-            return Response(
+            response_data = Response(
                 {'error': 'Students cannot access analytics summaries'},
                 status=status.HTTP_403_FORBIDDEN
             )
+
+        # Cache for 5 minutes
+        cache.set(cache_key, response_data, 60 * 5)
+        
+        return Response(response_data)
     
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdmin])
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated, IsPlatformAdmin],
+        throttle_classes=[SchoolAnalyticsSystemHealthThrottle])
     def system_health(self, request):
         """
         System health check for analytics module.
@@ -8854,7 +8999,11 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         
         GET /api/school-analytics/system_health/
         """
-
+        cache_key = get_analytics_system_health_cache_key()
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         
         health_checks = {}
         
@@ -8979,7 +9128,7 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
         else:
             overall_status = 'healthy'
         
-        return Response({
+        response_data = {
             'system_health': {
                 'status': overall_status,
                 'timestamp': timezone.now().isoformat(),
@@ -8990,7 +9139,12 @@ class SchoolAnalyticsViewSet(viewsets.ModelViewSet):
             'detailed_checks': health_checks,
             'recommendations': self._get_health_recommendations(health_checks),
             'next_scheduled_maintenance': 'Daily at 02:00 AM UTC'
-        })
+        }
+
+        # Cache for 2 minutes (health status should be relatively fresh)
+        cache.set(cache_key, response_data, 60 * 2)
+        
+        return Response(response_data)
     
     def _get_health_recommendations(self, health_checks):
         """Generate recommendations based on health check results"""

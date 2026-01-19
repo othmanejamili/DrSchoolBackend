@@ -1167,8 +1167,128 @@ def invalidate_template_message_caches(template_id):
     
     for pattern in patterns:
         delete_pattern_with_fallback(pattern)
+# ============================================
+# SCHOOL ANALYTICS CACHE KEYS
+# ============================================
+
+def get_school_analytics_queryset_cache_key(user_id, role):
+    """Generate cache key for school analytics queryset"""
+    return f'school_analytics_queryset_{user_id}_{role}'
+
+def get_school_analytics_detail_cache_key(analytics_id):
+    """Generate cache key for single analytics record"""
+    return f'school_analytics_detail_{analytics_id}'
+
+def get_analytics_dashboard_cache_key(user_id, school_id, date_range):
+    """Generate cache key for analytics dashboard"""
+    return f'analytics_dashboard_{user_id}_school_{school_id}_range_{date_range}'
+
+def get_analytics_trends_cache_key(school_id, metric, days):
+    """Generate cache key for trends analysis"""
+    return f'analytics_trends_school_{school_id}_metric_{metric}_days_{days}'
+
+def get_analytics_comparison_cache_key(school_ids_str, start_date, end_date):
+    """Generate cache key for school comparison"""
+    # Hash the school_ids to keep key reasonable length
+    import hashlib
+    schools_hash = hashlib.md5(school_ids_str.encode()).hexdigest()[:8]
+    return f'analytics_comparison_{schools_hash}_{start_date}_{end_date}'
+
+def get_analytics_alerts_cache_key(school_id, days):
+    """Generate cache key for alerts"""
+    return f'analytics_alerts_school_{school_id}_days_{days}'
+
+def get_analytics_predictions_cache_key(school_id, horizon):
+    """Generate cache key for predictions"""
+    return f'analytics_predictions_school_{school_id}_horizon_{horizon}'
+
+def get_analytics_summary_cache_key(user_id, role):
+    """Generate cache key for analytics summary"""
+    return f'analytics_summary_{user_id}_{role}'
+
+def get_analytics_system_health_cache_key():
+    """Generate cache key for system health check"""
+    return 'analytics_system_health'
+
+def get_school_daily_analytics_cache_key(school_id, date):
+    """Generate cache key for daily analytics"""
+    return f'school_analytics_daily_{school_id}_{date}'
 
 
+# ============================================
+# SCHOOL ANALYTICS CACHE INVALIDATION
+# ============================================
+
+def invalidate_school_analytics_cache(analytics_id, school_id=None):
+    """Invalidate all caches related to a school analytics record"""
+    if not analytics_id:
+        return
+    
+    # Delete specific analytics cache
+    cache.delete(get_school_analytics_detail_cache_key(analytics_id))
+    
+    # Delete related patterns
+    patterns_to_delete = [
+        f'school_analytics_{analytics_id}_*',
+        f'*analytics*{analytics_id}*',
+        'analytics_dashboard_*',
+        'analytics_trends_*',
+        'analytics_comparison_*',
+        'analytics_alerts_*',
+        'analytics_predictions_*',
+        'analytics_summary_*',
+        'analytics_system_health'
+    ]
+    
+    for pattern in patterns_to_delete:
+        delete_pattern_with_fallback(pattern)
+    
+    # Invalidate school-specific analytics caches
+    if school_id:
+        invalidate_school_specific_analytics_caches(school_id)
+
+
+def invalidate_school_analytics_queryset_caches():
+    """Invalidate all analytics queryset caches"""
+    patterns = [
+        'school_analytics_queryset_*',
+        'analytics_dashboard_*',
+        'analytics_summary_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_school_specific_analytics_caches(school_id):
+    """Invalidate analytics caches for a specific school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'*school_{school_id}*analytics*',
+        f'analytics_dashboard_*_school_{school_id}_*',
+        f'analytics_trends_school_{school_id}_*',
+        f'analytics_alerts_school_{school_id}_*',
+        f'analytics_predictions_school_{school_id}_*',
+        f'school_analytics_daily_{school_id}_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_all_analytics_caches():
+    """Clear all analytics-related caches (use sparingly)"""
+    patterns = [
+        'school_analytics_*',
+        'analytics_*',
+        '*_analytics_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+        
 # ============================================
 # CACHE PATTERN UTILITIES
 # ============================================
