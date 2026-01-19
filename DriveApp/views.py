@@ -59,7 +59,8 @@ from .throttles import (
         SchoolAnalyticsAlertsThrottle, SchoolAnalyticsPredictionsThrottle, SchoolAnalyticsSummaryThrottle, SchoolAnalyticsSystemHealthThrottle,
         ReportWeeklyThrottle, ReportMonthlyThrottle, ReportSendWeeklyThrottle, ReportInstructorPerformanceThrottle, ReportStudentProgressThrottle, 
         ReportFinancialSummaryThrottle, ReportExportThrottle,DashboardOverviewThrottle, DashboardDetailedThrottle, DashboardQuickStatsThrottle,
-          DashboardNotificationsThrottle,
+        DashboardNotificationsThrottle, SubscriptionPlanListThrottle, SubscriptionPlanCreateThrottle, SubscriptionPlanUpdateThrottle, SubscriptionPlanStatisticsThrottle,
+        SchoolSubscriptionListThrottle, SchoolSubscriptionCreateThrottle, SchoolSubscriptionUpdateThrottle, SchoolSubscriptionActionThrottle, SchoolSubscriptionUsageThrottle,
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -94,6 +95,9 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_analytics_system_health_cache_key, get_analytics_summary_cache_key, get_analytics_predictions_cache_key, get_analytics_alerts_cache_key, get_analytics_comparison_cache_key,
                             get_analytics_trends_cache_key,get_report_weekly_cache_key, get_report_monthly_cache_key, get_report_instructor_performance_cache_key, get_report_student_progress_cache_key,
                             get_report_financial_summary_cache_key, get_report_export_cache_key, invalidate_report_cache, get_dashboard_cache_key, get_quick_stats_cache_key, get_notifications_cache_key,
+                            get_subscription_plan_list_cache_key, get_popular_plans_cache_key, get_plan_comparison_cache_key, get_pricing_tiers_cache_key, get_plan_statistics_cache_key, 
+                            invalidate_subscription_plan_caches, invalidate_plan_cache, get_school_subscription_list_cache_key, get_school_subscription_usage_cache_key, get_school_subscription_limits_cache_key,
+                            invalidate_school_subscription_caches, invalidate_subscription_cache,
 
                             )
 
@@ -11732,6 +11736,21 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
     ordering = ['price']  # Default: cheapest first
     filterset_fields = ['is_active', 'duration_days']
     
+    throttle_classes = [UserRateThrottle]
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [SubscriptionPlanListThrottle()],
+            'create': [SubscriptionPlanCreateThrottle()],
+            'update': [SubscriptionPlanUpdateThrottle()],
+            'partial_update': [SubscriptionPlanUpdateThrottle()],
+            'statistics': [SubscriptionPlanStatisticsThrottle()],
+            'popular_plans': [SubscriptionPlanListThrottle()],
+            'compare_plans': [SubscriptionPlanListThrottle()],
+        }
+        return throttle_map.get(self.action, super().get_throttles())
+    
     def get_queryset(self):
         """
         Filter subscription plans based on user role.
@@ -11743,14 +11762,32 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         
         if not user.is_authenticated:
             return SubscriptionPlan.objects.none()
+                
+                
+        # Generate cache key
+        cache_key = get_subscription_plan_list_cache_key(user.id, user.role)
         
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+            
         # Platform Admins can see all plans (including inactive)
         if user.role == 'A' and user.is_staff:
-            return SubscriptionPlan.objects.all()
+            queryset = SubscriptionPlan.objects.all()
+        else:
+            # School Owners and others only see active plans
+            queryset = SubscriptionPlan.objects.filter(is_active=True)
         
-        # School Owners and others only see active plans
-        return SubscriptionPlan.objects.filter(is_active=True)
-    
+        # Cache for 10 minutes
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 10)
+        
+        return queryset
+        
     def get_permissions(self):
         """
         Define permissions per action.
@@ -11771,28 +11808,38 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         Only platform admins can create plans.
         """
         # All validations are handled in the serializer
-        serializer.save()
-    
+        plan = serializer.save()
+        invalidate_subscription_plan_caches()
+
     def perform_update(self, serializer):
         """
         Update subscription plan with validation.
         """
         instance = self.get_object()
         
-        # Check if plan can be updated (no active subscriptions for deactivation)
         if 'is_active' in serializer.validated_data:
             if not serializer.validated_data['is_active'] and not SubscriptionPlanService.can_deactivate_plan(instance):
                 raise PermissionDenied("Cannot deactivate plan with active subscriptions")
         
-        serializer.save()
-    
+        plan = serializer.save()
+        invalidate_plan_cache(plan.id)
+        
     @action(detail=False, methods=['get'])
     def popular_plans(self, request):
         """
         Get most popular subscription plans.
         """
+        cache_key = get_popular_plans_cache_key()
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+        
         popular_plans = SubscriptionPlanService.get_popular_plans()
         serializer = self.get_serializer(popular_plans, many=True)
+    
+        # Cache for 30 minutes
+        cache.set(cache_key, serializer.data, 60 * 30)
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
@@ -11801,6 +11848,12 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         Get comparison data for all active plans.
         """
         comparison_data = SubscriptionPlanService.get_plan_comparison()
+
+        cache_key = get_plan_comparison_cache_key()
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         
         # Custom serializer for comparison view
         response_data = []
@@ -11813,8 +11866,9 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
                 'is_popular': item['is_popular']
             })
         
-        return Response(response_data)
-    
+        # Cache for 30 minutes
+        cache.set(cache_key, response_data, 60 * 30)
+        return Response(response_data)    
     @action(detail=False, methods=['get'])
     def recommended_plan(self, request):
         """
@@ -11972,6 +12026,9 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         
         plan.is_active = False
         plan.save()
+
+        # Invalidate caches
+        invalidate_plan_cache(plan.id)
         
         return Response({
             'message': f'Plan "{plan.name}" deactivated successfully',
@@ -11986,6 +12043,9 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         plan.is_active = True
         plan.save()
         
+         # Invalidate caches
+        invalidate_plan_cache(plan.id)
+
         return Response({
             'message': f'Plan "{plan.name}" activated successfully',
             'plan_id': plan.id,
@@ -11997,6 +12057,12 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         """
         Get plans grouped by pricing tiers.
         """
+        cache_key = get_pricing_tiers_cache_key()
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+
         plans = SubscriptionPlan.objects.filter(is_active=True).order_by('price')
         
         tiers = {
@@ -12007,7 +12073,6 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         
         for plan in plans:
             price = float(plan.price)
-            max_students = plan.max_students
             
             # Classification logic (adjust as needed)
             if price < 50:
@@ -12017,21 +12082,32 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
             else:
                 tiers['premium'].append(self.get_serializer(plan).data)
         
+        # Cache for 30 minutes
+        cache.set(cache_key, tiers, 60 * 30)
         return Response(tiers)
-
     @action(detail=True, methods=['get'])
     def statistics(self, request, pk=None):
         """
         Get detailed statistics for a subscription plan.
         """
         plan = self.get_object()
+
+        cache_key = get_plan_statistics_cache_key(plan.id)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         stats = SubscriptionPlanService.get_plan_statistics(plan)
         
-        return Response({
+        response_data = {
             'plan': self.get_serializer(plan).data,
             'statistics': stats
-        })
+        }
 
+        # Cache for 15 minutes
+        cache.set(cache_key, response_data, 60 * 15)
+        return Response(response_data)
+    
 # DSS-17-create-SubscriptionPlanViewSet
 class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
     """
@@ -12047,6 +12123,24 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
     ordering = ['-created_at']
     filterset_fields = ['status', 'plan']
     
+    throttle_classes = [UserRateThrottle]
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'list': [SchoolSubscriptionListThrottle()],
+            'create': [SchoolSubscriptionCreateThrottle()],
+            'update': [SchoolSubscriptionUpdateThrottle()],
+            'partial_update': [SchoolSubscriptionUpdateThrottle()],
+            'cancel': [SchoolSubscriptionActionThrottle()],
+            'renew': [SchoolSubscriptionActionThrottle()],
+            'upgrade': [SchoolSubscriptionActionThrottle()],
+            'check_limits': [SchoolSubscriptionUsageThrottle()],
+            'usage_stats': [SchoolSubscriptionUsageThrottle()],
+        }
+        return throttle_map.get(self.action, super().get_throttles())
+    
+
     def get_queryset(self):
         """
         Filter subscriptions based on user role.
@@ -12056,21 +12150,40 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return SchoolSubscription.objects.none()
         
+        # Generate cache key
+        cache_key = get_school_subscription_list_cache_key(user.id, user.role)
+        
+        # Only cache if no query parameters
+        use_cache = not bool(self.request.query_params)
+        
+        if use_cache:
+            cached_queryset = cache.get(cache_key)
+            if cached_queryset is not None:
+                return cached_queryset
+            
         # Platform Admins can see all subscriptions
         if user.role == 'A' and user.is_staff:
-            return SchoolSubscription.objects.all().select_related('school', 'plan')
+            queryset = SchoolSubscription.objects.all()
         
         # School Owners can see only their own subscription
-        if user.role == 'A':  # School owner (admin but not staff)
-            return SchoolSubscription.objects.filter(school__owner=user).select_related('school', 'plan')
+        elif user.role == 'A':  # School owner (admin but not staff)
+            queryset = SchoolSubscription.objects.filter(school__owner=user)
         
-        if user.role == 'I':
-            return SchoolSubscription.objects.none()
+        elif user.role == 'I':
+            queryset = SchoolSubscription.objects.none()
 
-        if user.role == 'S':
-            return SchoolSubscription.objects.none()
+        elif user.role == 'S':
+            queryset = SchoolSubscription.objects.none()
         # Instructors and Students cannot see subscriptions
-        return SchoolSubscription.objects.none()
+        else:
+            queryset = SchoolSubscription.objects.none()
+
+        queryset = queryset.select_related('school', 'plan')
+
+        if use_cache:
+            cache.set(cache_key, queryset, 60 * 5)
+        
+        return queryset
     
     def get_permissions(self):
         """
@@ -12104,21 +12217,21 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
                 'school': 'This school already has an active subscription'
             })
         
-        serializer.save()
+        subscription = serializer.save()
+        invalidate_school_subscription_caches(school.id)
     
     def perform_update(self, serializer):
-        """
-        Update subscription with permission checks.
-        """
         user = self.request.user
         instance = self.get_object()
         
-        # School owners can only update their own subscription
-        if user.role == 'A' and not user.is_staff:  # School owner
+        if user.role == 'A' and not user.is_staff:
             if instance.school.owner != user:
                 raise PermissionDenied("You can only update your own school's subscription")
         
-        serializer.save()
+        subscription = serializer.save()
+        invalidate_subscription_cache(subscription.id)
+        invalidate_school_subscription_caches(subscription.school_id)
+        
     
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -12142,6 +12255,10 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         
         subscription.status = 'canceled'
         subscription.save()
+        
+        # Invalidate caches
+        invalidate_subscription_cache(subscription.id)
+        invalidate_school_subscription_caches(subscription.school_id)
         
         return Response({
             'message': 'Subscription canceled successfully',
@@ -12180,6 +12297,10 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         
         subscription.save()
         
+        # Invalidate caches
+        invalidate_subscription_cache(subscription.id)
+        invalidate_school_subscription_caches(subscription.school_id)
+
         return Response({
             'message': 'Subscription renewed successfully',
             'subscription_id': subscription.id,
@@ -12245,6 +12366,10 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         subscription.plan = new_plan
         subscription.save()
         
+        # At the end, before return, add:
+        invalidate_subscription_cache(subscription.id)
+        invalidate_school_subscription_caches(subscription.school_id)
+
         return Response({
             'message': 'Subscription upgraded successfully',
             'from_plan': old_plan.name,
@@ -12262,6 +12387,12 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         subscription = self.get_object()
         user = request.user
         
+        cache_key = get_school_subscription_limits_cache_key(subscription.id)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+        
         # Permission check
         if user.role == 'A' and not user.is_staff:  # School owner
             if subscription.school.owner != user:
@@ -12269,8 +12400,10 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         
         limits_info = SchoolSubscriptionService.check_usage_limits(subscription)
         
+        # Cache for 5 minutes
+        cache.set(cache_key, limits_info, 60 * 5)
         return Response(limits_info)
-    
+        
     @action(detail=True, methods=['get'])
     def usage_stats(self, request, pk=None):
         """
@@ -12278,11 +12411,17 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
         """
         subscription = self.get_object()
         user = request.user
-        
+    
         # Permission check
         if user.role == 'A' and not user.is_staff:  # School owner
             if subscription.school.owner != user:
                 raise PermissionDenied("You can only view usage stats for your own school")
+        
+        cache_key = get_school_subscription_usage_cache_key(subscription.id)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
         
         stats = SchoolSubscriptionService.get_usage_stats(subscription)
         
@@ -12299,8 +12438,10 @@ class SchoolSubscriptionViewSet(viewsets.ModelViewSet):
             'available_instructor_slots': subscription.plan.max_instructors - stats['instructors']['current']
         }
         
+        # Cache for 3 minutes
+        cache.set(cache_key, stats, 60 * 3)
         return Response(stats)
-    
+        
     @action(detail=False, methods=['get'])
     def expired_subscriptions(self, request):
         """

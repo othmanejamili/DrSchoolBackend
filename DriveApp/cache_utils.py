@@ -1425,6 +1425,98 @@ def invalidate_student_report_caches(school_id):
     
     for pattern in patterns:
         delete_pattern_with_fallback(pattern) 
+
+# ============================================
+# SUBSCRIPTION PLAN CACHE KEYS
+# ============================================
+
+def get_subscription_plan_list_cache_key(user_id, role):
+    """Cache key for subscription plan list"""
+    return f'subscription_plans_list_{user_id}_{role}'
+
+def get_subscription_plan_detail_cache_key(plan_id):
+    """Cache key for single subscription plan"""
+    return f'subscription_plan_detail_{plan_id}'
+
+def get_popular_plans_cache_key():
+    """Cache key for popular plans"""
+    return 'subscription_plans_popular'
+
+def get_plan_comparison_cache_key():
+    """Cache key for plan comparison"""
+    return 'subscription_plans_comparison'
+
+def get_plan_statistics_cache_key(plan_id):
+    """Cache key for plan statistics"""
+    return f'subscription_plan_stats_{plan_id}'
+
+def get_pricing_tiers_cache_key():
+    """Cache key for pricing tiers"""
+    return 'subscription_plans_pricing_tiers'
+
+
+# ============================================
+# SCHOOL SUBSCRIPTION CACHE KEYS
+# ============================================
+
+def get_school_subscription_list_cache_key(user_id, role):
+    """Cache key for subscription list"""
+    return f'school_subscriptions_list_{user_id}_{role}'
+
+def get_school_subscription_detail_cache_key(subscription_id):
+    """Cache key for single subscription"""
+    return f'school_subscription_detail_{subscription_id}'
+
+def get_school_subscription_usage_cache_key(subscription_id):
+    """Cache key for usage stats"""
+    return f'school_subscription_usage_{subscription_id}'
+
+def get_school_subscription_limits_cache_key(subscription_id):
+    """Cache key for limit checks"""
+    return f'school_subscription_limits_{subscription_id}'
+
+
+# ============================================
+# CACHE INVALIDATION FUNCTIONS
+# ============================================
+
+def invalidate_subscription_plan_caches():
+    """Invalidate all subscription plan caches"""
+    patterns = [
+        'subscription_plans_*',
+        'subscription_plan_*',
+    ]
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+def invalidate_plan_cache(plan_id):
+    """Invalidate specific plan cache"""
+    cache.delete(get_subscription_plan_detail_cache_key(plan_id))
+    cache.delete(get_plan_statistics_cache_key(plan_id))
+    invalidate_subscription_plan_caches()
+
+def invalidate_school_subscription_caches(school_id=None):
+    """Invalidate school subscription caches"""
+    if school_id:
+        patterns = [f'school_subscription_*_{school_id}_*']
+    else:
+        patterns = ['school_subscriptions_*', 'school_subscription_*']
+    
+    for pattern in patterns:
+        try:
+            cache.delete_pattern(pattern)
+        except AttributeError:
+            pass
+
+def invalidate_subscription_cache(subscription_id):
+    """Invalidate specific subscription cache"""
+    cache.delete(get_school_subscription_detail_cache_key(subscription_id))
+    cache.delete(get_school_subscription_usage_cache_key(subscription_id))
+    cache.delete(get_school_subscription_limits_cache_key(subscription_id))
+    
 # ============================================
 # CACHE PATTERN UTILITIES
 # ============================================

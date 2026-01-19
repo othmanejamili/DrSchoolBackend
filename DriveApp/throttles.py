@@ -468,6 +468,44 @@ class DashboardNotificationsThrottle(UserRateThrottle):
     """Limit notifications requests"""
     scope = 'dashboard_notifications'
     
+
+# ============================================
+# SUBSCRIPTION PLAN THROTTLES
+# ============================================
+
+class SubscriptionPlanListThrottle(UserRateThrottle):
+    scope = 'subscription_plan_list'
+
+class SubscriptionPlanCreateThrottle(UserRateThrottle):
+    scope = 'subscription_plan_create'
+
+class SubscriptionPlanUpdateThrottle(UserRateThrottle):
+    scope = 'subscription_plan_update'
+
+class SubscriptionPlanStatisticsThrottle(UserRateThrottle):
+    scope = 'subscription_plan_statistics'
+
+
+# ============================================
+# SCHOOL SUBSCRIPTION THROTTLES
+# ============================================
+
+class SchoolSubscriptionListThrottle(UserRateThrottle):
+    scope = 'school_subscription_list'
+
+class SchoolSubscriptionCreateThrottle(UserRateThrottle):
+    scope = 'school_subscription_create'
+
+class SchoolSubscriptionUpdateThrottle(UserRateThrottle):
+    scope = 'school_subscription_update'
+
+class SchoolSubscriptionActionThrottle(UserRateThrottle):
+    """For cancel, renew, upgrade actions"""
+    scope = 'school_subscription_action'
+
+class SchoolSubscriptionUsageThrottle(UserRateThrottle):
+    """For check_limits and usage_stats"""
+    scope = 'school_subscription_usage'
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================
