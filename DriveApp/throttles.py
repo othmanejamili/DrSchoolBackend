@@ -506,6 +506,42 @@ class SchoolSubscriptionActionThrottle(UserRateThrottle):
 class SchoolSubscriptionUsageThrottle(UserRateThrottle):
     """For check_limits and usage_stats"""
     scope = 'school_subscription_usage'
+
+# ============================================
+# STUDENT DOCUMENT THROTTLES
+# ============================================
+
+class StudentDocumentListThrottle(UserRateThrottle):
+    """Rate limit for document listing"""
+    rate = '100/hour'
+
+class StudentDocumentCreateThrottle(UserRateThrottle):
+    """Rate limit for document creation (file upload intensive)"""
+    rate = '20/hour'
+
+class StudentDocumentUpdateThrottle(UserRateThrottle):
+    """Rate limit for document updates"""
+    rate = '30/hour'
+
+class StudentDocumentBulkUploadThrottle(UserRateThrottle):
+    """Rate limit for bulk uploads (very intensive)"""
+    rate = '5/hour'
+
+class StudentDocumentDownloadThrottle(UserRateThrottle):
+    """Rate limit for document downloads"""
+    rate = '50/hour'
+
+class StudentDocumentMyDocumentsThrottle(UserRateThrottle):
+    """Rate limit for my documents endpoint"""
+    rate = '60/hour'
+
+class StudentDocumentStudentDocsThrottle(UserRateThrottle):
+    """Rate limit for viewing student documents"""
+    rate = '40/hour'
+
+class StudentDocumentStatisticsThrottle(UserRateThrottle):
+    """Rate limit for statistics endpoint"""
+    rate = '30/hour'
 # ============================================
 # ADVANCED THROTTLES (Optional)
 # ============================================
