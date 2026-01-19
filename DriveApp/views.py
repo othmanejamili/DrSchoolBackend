@@ -58,7 +58,8 @@ from .throttles import (
         SchoolAnalyticsBulkGenerateThrottle, SchoolAnalyticsTrendsThrottle, SchoolAnalyticsComparisonThrottle, SchoolAnalyticsExportThrottle,
         SchoolAnalyticsAlertsThrottle, SchoolAnalyticsPredictionsThrottle, SchoolAnalyticsSummaryThrottle, SchoolAnalyticsSystemHealthThrottle,
         ReportWeeklyThrottle, ReportMonthlyThrottle, ReportSendWeeklyThrottle, ReportInstructorPerformanceThrottle, ReportStudentProgressThrottle, 
-        ReportFinancialSummaryThrottle, ReportExportThrottle
+        ReportFinancialSummaryThrottle, ReportExportThrottle,DashboardOverviewThrottle, DashboardDetailedThrottle, DashboardQuickStatsThrottle,
+          DashboardNotificationsThrottle,
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -92,7 +93,7 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             invalidate_school_analytics_queryset_caches, get_analytics_dashboard_cache_key, invalidate_school_analytics_cache,invalidate_school_specific_analytics_caches,
                             get_analytics_system_health_cache_key, get_analytics_summary_cache_key, get_analytics_predictions_cache_key, get_analytics_alerts_cache_key, get_analytics_comparison_cache_key,
                             get_analytics_trends_cache_key,get_report_weekly_cache_key, get_report_monthly_cache_key, get_report_instructor_performance_cache_key, get_report_student_progress_cache_key,
-                            get_report_financial_summary_cache_key, get_report_export_cache_key, invalidate_report_cache
+                            get_report_financial_summary_cache_key, get_report_export_cache_key, invalidate_report_cache, get_dashboard_cache_key, get_quick_stats_cache_key, get_notifications_cache_key,
 
                             )
 
@@ -10643,7 +10644,22 @@ class DashboardViewSet(viewsets.ViewSet):
     """
     
     permission_classes = [IsAuthenticated]
-    
+    throttle_classes = [UserRateThrottle]
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'overview': [DashboardOverviewThrottle()],
+            'platform_admin_dashboard': [DashboardDetailedThrottle()],
+            'school_owner_dashboard': [DashboardDetailedThrottle()],
+            'instructor_dashboard': [DashboardDetailedThrottle()],
+            'student_dashboard': [DashboardDetailedThrottle()],
+            'quick_stats': [DashboardQuickStatsThrottle()],
+            'notifications': [DashboardNotificationsThrottle()],
+        }
+        
+        return throttle_map.get(self.action, [UserRateThrottle()])
+
     @action(detail=False, methods=['get'], url_path='overview', url_name='overview')
     def overview(self, request):
         """
@@ -10653,7 +10669,11 @@ class DashboardViewSet(viewsets.ViewSet):
         GET /api/dashboard/overview/
         """
         user = request.user
-        
+        # Check cache
+        cache_key = get_dashboard_cache_key(user.id, user.role, 'overview')
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         if user.role == 'A' and user.is_staff:
             return self._platform_admin_dashboard(user)
         elif user.role == 'A' and not user.is_staff:
@@ -10752,6 +10772,12 @@ class DashboardViewSet(viewsets.ViewSet):
         """
         user = request.user
         
+        # Check cache
+        cache_key = get_quick_stats_cache_key(user.id, user.role)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         if user.role == 'A' and user.is_staff:
             stats = {
                 'total_schools': DrivingSchool.objects.count(),
@@ -10821,11 +10847,15 @@ class DashboardViewSet(viewsets.ViewSet):
         else:
             stats = {}
         
-        return Response({
+        response_data = {
             'user_role': user.role,
             'stats': stats,
             'timestamp': timezone.now().isoformat()
-        })
+        }
+
+        cache.set(cache_key, response_data, 60)
+        
+        return Response(response_data)
     
     @action(detail=False, methods=['get'], url_path='notifications', url_name='notifications')
     def notifications(self, request):
@@ -10838,6 +10868,12 @@ class DashboardViewSet(viewsets.ViewSet):
         """
         user = request.user
         limit = min(int(request.query_params.get('limit', 10)), 50)
+
+        # Check cache (shorter cache time for notifications)
+        cache_key = get_notifications_cache_key(user.id, user.role, limit)
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
         
         notifications = []
         
@@ -10983,17 +11019,26 @@ class DashboardViewSet(viewsets.ViewSet):
         priority_order = {'high': 0, 'medium': 1, 'low': 2}
         notifications.sort(key=lambda x: (priority_order.get(x['priority'], 3), x['timestamp']), reverse=True)
         
-        return Response({
+        response_data = {
             'total_notifications': len(notifications),
             'notifications': notifications[:limit],
             'user_role': user.role,
             'timestamp': timezone.now().isoformat()
-        })
+        }
+
+        # Cache for 30 seconds (notifications need to be fresh)
+        cache.set(cache_key, response_data, 30)
+        return Response(response_data)
     
     # ==================== PRIVATE HELPER METHODS ====================
     
     def _platform_admin_dashboard(self, user):
         """Generate platform admin dashboard"""
+        cache_key = get_dashboard_cache_key(user.id, user.role, 'overview')
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         today = timezone.now().date()
         week_ago = today - timedelta(days=7)
         month_ago = today - timedelta(days=30)
@@ -11043,7 +11088,7 @@ class DashboardViewSet(viewsets.ViewSet):
         recent_feedback = Feedback.objects.order_by('-created_at')[:10]
         avg_platform_rating = Feedback.objects.aggregate(avg=Avg('rating'))['avg'] or 0
         
-        return Response({
+        response_data = {
             'dashboard_type': 'platform_admin',
             'user': {
                 'id': user.id,
@@ -11083,10 +11128,18 @@ class DashboardViewSet(viewsets.ViewSet):
                 'created_at': f.created_at
             } for f in recent_feedback],
             'timestamp': timezone.now().isoformat()
-        })
+        }
+
+        cache.set(cache_key, response_data, 60 * 2)
+        return Response(response_data)
     
     def _school_owner_dashboard(self, user):
         """Generate school owner dashboard (all schools)"""
+        cache_key = get_dashboard_cache_key(user.id, user.role, 'overview')
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
         today = timezone.now().date()
         week_ago = today - timedelta(days=7)
         
@@ -11162,7 +11215,7 @@ class DashboardViewSet(viewsets.ViewSet):
             date__date=today
         )
         
-        return Response({
+        response_data = {
             'dashboard_type': 'school_owner',
             'user': {
                 'id': user.id,
@@ -11189,7 +11242,10 @@ class DashboardViewSet(viewsets.ViewSet):
             'schools': school_summaries,
             'best_performing_school': school_summaries[0] if school_summaries else None,
             'timestamp': timezone.now().isoformat()
-        })
+        }
+    
+        cache.set(cache_key, response_data, 60 * 2)
+        return Response(response_data)
     
     def _single_school_dashboard(self, user, school_id):
         """Generate dashboard for a single school"""

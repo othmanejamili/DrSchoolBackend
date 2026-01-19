@@ -305,7 +305,13 @@ REST_FRAMEWORK = {
         'school_analytic_predictions':'40/hour',
         'school_analytic_export':'30/hour',
         'school_analytic_summary':'15/hour',
-        'school_analytic_system_health':'60/hour'
+        'school_analytic_system_health':'60/hour',
+
+        # Dashboard
+        'dashboard_overview': '60/min',
+        'dashboard_detailed': '30/min',
+        'dashboard_quick_stats': '100/min',
+        'dashboard_notifications': '50/min',
     },
     
     # Filtering
