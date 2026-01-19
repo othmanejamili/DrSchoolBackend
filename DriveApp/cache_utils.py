@@ -1288,7 +1288,106 @@ def invalidate_all_analytics_caches():
     
     for pattern in patterns:
         delete_pattern_with_fallback(pattern)
-        
+
+# ============================================
+# REPORT CACHE KEYS
+# ============================================
+
+def get_report_weekly_cache_key(school_id, end_date):
+    """Generate cache key for weekly report"""
+    date_str = end_date.isoformat() if end_date else 'latest'
+    return f'report_weekly_school_{school_id}_date_{date_str}'
+
+def get_report_monthly_cache_key(school_id, month_str):
+    """Generate cache key for monthly report"""
+    return f'report_monthly_school_{school_id}_month_{month_str or "current"}'
+
+def get_report_instructor_performance_cache_key(school_id, instructor_id, start_date, end_date):
+    """Generate cache key for instructor performance report"""
+    instructor_suffix = f'_instructor_{instructor_id}' if instructor_id else '_all'
+    return f'report_instructor_perf_school_{school_id}{instructor_suffix}_{start_date}_{end_date}'
+
+def get_report_student_progress_cache_key(school_id, status_filter, min_progress):
+    """Generate cache key for student progress report"""
+    status_suffix = f'_status_{status_filter}' if status_filter else ''
+    progress_suffix = f'_min_{min_progress}' if min_progress else ''
+    return f'report_student_progress_school_{school_id}{status_suffix}{progress_suffix}'
+
+def get_report_financial_summary_cache_key(school_id, start_date, end_date):
+    """Generate cache key for financial summary report"""
+    return f'report_financial_school_{school_id}_{start_date}_{end_date}'
+
+def get_report_export_cache_key(school_id, report_type, export_format):
+    """Generate cache key for report export"""
+    return f'report_export_school_{school_id}_type_{report_type}_format_{export_format}'
+
+
+# ============================================
+# REPORT CACHE INVALIDATION
+# ============================================
+
+def invalidate_report_cache(school_id):
+    """Invalidate all report caches for a specific school"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'report_weekly_school_{school_id}_*',
+        f'report_monthly_school_{school_id}_*',
+        f'report_instructor_perf_school_{school_id}_*',
+        f'report_student_progress_school_{school_id}_*',
+        f'report_financial_school_{school_id}_*',
+        f'report_export_school_{school_id}_*',
+        f'*report*school_{school_id}*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_all_report_caches():
+    """Invalidate all report caches (use sparingly)"""
+    patterns = [
+        'report_weekly_*',
+        'report_monthly_*',
+        'report_instructor_*',
+        'report_student_*',
+        'report_financial_*',
+        'report_export_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_instructor_report_caches(school_id, instructor_id):
+    """Invalidate instructor-specific report caches"""
+    if not school_id or not instructor_id:
+        return
+    
+    patterns = [
+        f'report_instructor_perf_school_{school_id}_instructor_{instructor_id}_*',
+        f'report_weekly_school_{school_id}_*',  # Weekly reports include instructor data
+        f'report_monthly_school_{school_id}_*'  # Monthly reports include instructor data
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern)
+
+
+def invalidate_student_report_caches(school_id):
+    """Invalidate student-specific report caches"""
+    if not school_id:
+        return
+    
+    patterns = [
+        f'report_student_progress_school_{school_id}_*',
+        f'report_weekly_school_{school_id}_*',
+        f'report_monthly_school_{school_id}_*'
+    ]
+    
+    for pattern in patterns:
+        delete_pattern_with_fallback(pattern) 
 # ============================================
 # CACHE PATTERN UTILITIES
 # ============================================

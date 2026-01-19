@@ -56,7 +56,9 @@ from .throttles import (
         AutomatedMessageStatisticsThrottle,AutomatedMessageScheduleThrottle,SchoolAnalyticsListThrottle, SchoolAnalyticsCreateThrottle,
         SchoolAnalyticsUpdateThrottle, SchoolAnalyticsUpdateThrottle, SchoolAnalyticsDashboardThrottle, SchoolAnalyticsGenerateDailyThrottle,
         SchoolAnalyticsBulkGenerateThrottle, SchoolAnalyticsTrendsThrottle, SchoolAnalyticsComparisonThrottle, SchoolAnalyticsExportThrottle,
-        SchoolAnalyticsAlertsThrottle, SchoolAnalyticsPredictionsThrottle, SchoolAnalyticsSummaryThrottle, SchoolAnalyticsSystemHealthThrottle
+        SchoolAnalyticsAlertsThrottle, SchoolAnalyticsPredictionsThrottle, SchoolAnalyticsSummaryThrottle, SchoolAnalyticsSystemHealthThrottle,
+        ReportWeeklyThrottle, ReportMonthlyThrottle, ReportSendWeeklyThrottle, ReportInstructorPerformanceThrottle, ReportStudentProgressThrottle, 
+        ReportFinancialSummaryThrottle, ReportExportThrottle
     )
 from .cache_utils import (get_student_profile_cache_key, invalidate_student_profile_cache, 
                             get_user_queryset_cache_key, invalidate_user_caches, invalidate_school_caches, get_user_stats_cache_key,
@@ -89,7 +91,8 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             get_message_statistics_cache_key, get_my_messages_cache_key, get_school_analytics_queryset_cache_key, invalidate_school_analytics_cache, 
                             invalidate_school_analytics_queryset_caches, get_analytics_dashboard_cache_key, invalidate_school_analytics_cache,invalidate_school_specific_analytics_caches,
                             get_analytics_system_health_cache_key, get_analytics_summary_cache_key, get_analytics_predictions_cache_key, get_analytics_alerts_cache_key, get_analytics_comparison_cache_key,
-                            get_analytics_trends_cache_key,
+                            get_analytics_trends_cache_key,get_report_weekly_cache_key, get_report_monthly_cache_key, get_report_instructor_performance_cache_key, get_report_student_progress_cache_key,
+                            get_report_financial_summary_cache_key, get_report_export_cache_key, invalidate_report_cache
 
                             )
 
@@ -9218,6 +9221,24 @@ class ReportViewSet(viewsets.ViewSet):
     """
     
     permission_classes = [IsAuthenticated]
+    throttle_classes = [UserRateThrottle]  # Default throttle
+
+    def get_throttles(self):
+        """Apply different rate limits based on action"""
+        throttle_map = {
+            'weekly_report': ReportWeeklyThrottle,
+            'monthly_report': ReportMonthlyThrottle,
+            'send_weekly_report': ReportSendWeeklyThrottle,
+            'instructor_performance': ReportInstructorPerformanceThrottle,
+            'student_progress': ReportStudentProgressThrottle,
+            'financial_summary': ReportFinancialSummaryThrottle,
+            'export_report': ReportExportThrottle,
+        }
+        
+        throttle_class = throttle_map.get(self.action)
+        if throttle_class:
+            return [throttle_class()]
+        return super().get_throttles()
     
     def get_permissions(self):
         """Define permissions per action"""
@@ -9232,7 +9253,8 @@ class ReportViewSet(viewsets.ViewSet):
         
         return [IsAuthenticated()]
     
-    @action(detail=False, methods=['get'], url_path='report-weekly', url_name='report-weekly')
+    @action(detail=False, methods=['get'], url_path='report-weekly', url_name='report-weekly',
+    throttle_classes=[ReportWeeklyThrottle])
     def weekly_report(self, request):
         """
         Generate weekly report for a school.
@@ -9278,6 +9300,16 @@ class ReportViewSet(viewsets.ViewSet):
                 )
         else:
             end_date = timezone.now().date()
+        
+
+        # Generate cache key
+        cache_key = get_report_weekly_cache_key(school_id, end_date)
+        cached_report = cache.get(cache_key)
+        
+        if cached_report is not None:
+            # Add cache hit indicator
+            cached_report['cache_hit'] = True
+            return Response(cached_report)
         
         start_date = end_date - timedelta(days=6)  # 7 days total
         
@@ -9475,9 +9507,13 @@ class ReportViewSet(viewsets.ViewSet):
             'generated_at': timezone.now().isoformat()
         }
         
+        # Cache for 2 hours
+        cache.set(cache_key, report, 60 * 120)
+        
         return Response(report)
     
-    @action(detail=False, methods=['get'], url_name='report-monthly', url_path='report-monthly')
+    @action(detail=False, methods=['get'], url_name='report-monthly', url_path='report-monthly',
+    throttle_classes=[ReportMonthlyThrottle])
     def monthly_report(self, request):
         """
         Generate monthly report for a school.
@@ -9526,6 +9562,14 @@ class ReportViewSet(viewsets.ViewSet):
             today = timezone.now().date()
             start_date = date(today.year, today.month, 1)
         
+        # Generate cache key
+        cache_key = get_report_monthly_cache_key(school_id, month_str)
+        cached_report = cache.get(cache_key)
+        
+        if cached_report is not None:
+            cached_report['cache_hit'] = True
+            return Response(cached_report)
+
         # Calculate end date (last day of month)
         if start_date.month == 12:
             end_date = date(start_date.year + 1, 1, 1) - timedelta(days=1)
@@ -9793,9 +9837,13 @@ class ReportViewSet(viewsets.ViewSet):
             'generated_at': timezone.now().isoformat()
         }
         
+        # Cache for 6 hours
+        cache.set(cache_key, report, 60 * 360)
+        
         return Response(report)
     
-    @action(detail=False, methods=['post'], url_path='report-send-weekly', url_name='report-send-weekly')
+    @action(detail=False, methods=['post'], url_path='report-send-weekly', url_name='report-send-weekly',
+    throttle_classes=[ReportSendWeeklyThrottle])
     def send_weekly_report(self, request):
         """
         Generate and send weekly report via email.
@@ -9866,7 +9914,7 @@ class ReportViewSet(viewsets.ViewSet):
                 'email_sent': False
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    @action(detail=False, methods=['get'], )
+    @action(detail=False, methods=['get'], throttle_classes=[ReportInstructorPerformanceThrottle])
     def instructor_performance(self, request):
         """
         Generate instructor performance report.
@@ -9944,6 +9992,16 @@ class ReportViewSet(viewsets.ViewSet):
                 student_profiles__school=school,
                 student_profiles__status='A'
             ).distinct()
+        
+        # Generate cache key
+        cache_key = get_report_instructor_performance_cache_key(
+            school_id, instructor_id, start_date, end_date
+        )
+        cached_report = cache.get(cache_key)
+        
+        if cached_report is not None:
+            cached_report['cache_hit'] = True
+            return Response(cached_report)
         
         # Generate performance data for each instructor
         instructor_reports = []
@@ -10050,7 +10108,7 @@ class ReportViewSet(viewsets.ViewSet):
         avg_completion_rate = sum(r['lesson_metrics']['completion_rate'] for r in instructor_reports) / total_instructors if total_instructors > 0 else 0
         avg_rating_overall = sum(r['feedback_metrics']['average_rating'] for r in instructor_reports) / total_instructors if total_instructors > 0 else 0
         
-        return Response({
+        report = {
             'report_type': 'instructor_performance',
             'school': {
                 'id': school.id,
@@ -10069,8 +10127,14 @@ class ReportViewSet(viewsets.ViewSet):
             'instructor_reports': instructor_reports,
             'top_performers': instructor_reports[:3] if len(instructor_reports) >= 3 else instructor_reports,
             'generated_at': timezone.now().isoformat()
-        })
+        }
 
+                
+        # Cache for 1 hour
+        cache.set(cache_key, report, 60 * 60)
+        
+        return Response(report)
+    
     @action(detail=False, methods=['get'])
     def student_progress(self, request):
         """
@@ -10121,6 +10185,16 @@ class ReportViewSet(viewsets.ViewSet):
         # Apply filters
         if status_filter:
             students = students.filter(status=status_filter)
+        
+        # Generate cache key
+        cache_key = get_report_student_progress_cache_key(
+            school_id, status_filter, min_progress
+        )
+        cached_report = cache.get(cache_key)
+        
+        if cached_report is not None:
+            cached_report['cache_hit'] = True
+            return Response(cached_report)
         
         # Generate student reports
         student_reports = []
@@ -10191,7 +10265,7 @@ class ReportViewSet(viewsets.ViewSet):
         on_track = [s for s in student_reports if 20 <= s['progress']['average'] < 80]
         excelling = [s for s in student_reports if s['progress']['average'] >= 80]
         
-        return Response({
+        report = {
             'report_type': 'student_progress',
             'school': {
                 'id': school.id,
@@ -10213,9 +10287,14 @@ class ReportViewSet(viewsets.ViewSet):
                 'excelling': excelling
             },
             'generated_at': timezone.now().isoformat()
-        })
+        }
+    
+            # Cache for 30 minutes
+        cache.set(cache_key, report, 60 * 30)
+        
+        return Response(report)
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], throttle_classes=[ReportFinancialSummaryThrottle])
     def financial_summary(self, request):
         """
         Generate financial summary report.
@@ -10270,6 +10349,16 @@ class ReportViewSet(viewsets.ViewSet):
             end_date = timezone.now().date()
             start_date = end_date - timedelta(days=30)
         
+        # Generate cache key
+        cache_key = get_report_financial_summary_cache_key(
+            school_id, start_date, end_date
+        )
+        cached_report = cache.get(cache_key)
+        
+        if cached_report is not None:
+            cached_report['cache_hit'] = True
+            return Response(cached_report)
+        
         # Get analytics data
         analytics = SchoolAnalytics.objects.filter(
             school=school,
@@ -10320,7 +10409,7 @@ class ReportViewSet(viewsets.ViewSet):
                 
                 current_month = next_month
         
-        return Response({
+        report = {
             'report_type': 'financial_summary',
             'school': {
                 'id': school.id,
@@ -10346,8 +10435,13 @@ class ReportViewSet(viewsets.ViewSet):
             'daily_revenue': daily_revenue,
             'monthly_breakdown': monthly_breakdown if monthly_breakdown else None,
             'generated_at': timezone.now().isoformat()
-        })
-
+        }
+        
+        # Cache for 2 hours
+        cache.set(cache_key, report, 60 * 120)
+        
+        return Response(report)
+    
     @action(detail=False, methods=['get'], url_path='export')
     def export_report(self, request):
         """
@@ -10376,6 +10470,16 @@ class ReportViewSet(viewsets.ViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
+            # Generate cache key
+            cache_key = get_report_export_cache_key(school_id, report_type, export_format)
+            
+            # For JSON, check cache
+            if export_format == 'json':
+                cached_export = cache.get(cache_key)
+                if cached_export is not None:
+                    cached_export['cache_hit'] = True
+                    return Response(cached_export)
+                
             # Generate report data based on type
             if report_type == 'weekly':
                 report_data = ReportService.generate_weekly_report(
@@ -10421,6 +10525,9 @@ class ReportViewSet(viewsets.ViewSet):
                 
                 return response
             else:  # json
+                report_data['cache_hit'] = False
+                # Cache JSON exports for 1 hour
+                cache.set(cache_key, report_data, 60 * 60)
                 return Response(report_data)
         
         except PermissionError as e:
