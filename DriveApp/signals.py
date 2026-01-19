@@ -8,7 +8,7 @@ from django.core.cache import cache
 from .models import (User, StudentProfile, DrivingSchool, Lesson, Schedule,
                       Feedback, Attendance, Vehicle, VehiclePicture, Achievement,
                       CommunicationTemplate, AutomatedMessage, SchoolAnalytics,
-                          User, StudentProfile, DrivingSchool, Lesson, Schedule,
+                          User, StudentProfile, DrivingSchool, Lesson, Schedule, SubscriptionPlan, SchoolSubscription
                       )
 from .cache_utils import (
     invalidate_lesson_cache,
@@ -42,6 +42,11 @@ from .cache_utils import (
     invalidate_dashboard_caches,
     # Other cache utilities you might have
     invalidate_report_cache,
+    invalidate_subscription_cache,invalidate_school_subscription_caches, invalidate_school_subscription_caches,
+    invalidate_plan_cache, invalidate_subscription_plan_caches
+
+
+
     
 )
 
@@ -921,3 +926,32 @@ def connect_all_dashboard_signals():
     # All @receiver decorators have already connected the signals
     # This function is for clarity and future extensibility
     print("Dashboard signals connected")
+
+# ============================================
+# SUBSCRIPTION PLAN SIGNALS
+# ============================================
+
+@receiver(post_save, sender=SubscriptionPlan)
+def subscription_plan_post_save(sender, instance, created, **kwargs):
+    """Invalidate plan caches after save"""
+    invalidate_plan_cache(instance.id)
+
+@receiver(post_delete, sender=SubscriptionPlan)
+def subscription_plan_post_delete(sender, instance, **kwargs):
+    """Invalidate plan caches after delete"""
+    invalidate_subscription_plan_caches()
+
+# ============================================
+# SCHOOL SUBSCRIPTION SIGNALS
+# ============================================
+
+@receiver(post_save, sender=SchoolSubscription)
+def school_subscription_post_save(sender, instance, created, **kwargs):
+    """Invalidate subscription caches after save"""
+    invalidate_subscription_cache(instance.id)
+    invalidate_school_subscription_caches(instance.school_id)
+
+@receiver(post_delete, sender=SchoolSubscription)
+def school_subscription_post_delete(sender, instance, **kwargs):
+    """Invalidate subscription caches after delete"""
+    invalidate_school_subscription_caches(instance.school_id)

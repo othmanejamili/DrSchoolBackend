@@ -312,6 +312,19 @@ REST_FRAMEWORK = {
         'dashboard_detailed': '30/min',
         'dashboard_quick_stats': '100/min',
         'dashboard_notifications': '50/min',
+
+        # Subscription Plan rates
+        'subscription_plan_list': '100/hour',
+        'subscription_plan_create': '10/hour',
+        'subscription_plan_update': '30/hour',
+        'subscription_plan_statistics': '60/hour',
+        
+        # School Subscription rates
+        'school_subscription_list': '100/hour',
+        'school_subscription_create': '5/hour',
+        'school_subscription_update': '20/hour',
+        'school_subscription_action': '15/hour',  # cancel, renew, upgrade
+        'school_subscription_usage': '100/hour',  # usage stats, limits
     },
     
     # Filtering
