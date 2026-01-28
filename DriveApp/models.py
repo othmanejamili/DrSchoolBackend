@@ -16,7 +16,7 @@ class User(AbstractUser):
         regex=r'^\+?1?\d{9,15}$',
         message="Phone number must be entered in the format: '+999999999'. Up to 15 digits allowed."
         )
-    role = models.CharField(max_length=1, choices=ROLE_CHOICES, blank=True, null=True, default='S')
+    role = models.CharField(max_length=1, choices=ROLE_CHOICES, blank=True, null=True)
     phone_number = models.CharField(max_length=16, blank=True, null=True, validators=[phone_validator])
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -66,7 +66,7 @@ class DrivingSchool(models.Model):
         ]
 
     def __str__(self):
-        return self.name
+        return self.name or f"DrivingSchool {self.id}"
     
 #This Model For Table Student Profile
 class StudentProfile(models.Model):

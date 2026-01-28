@@ -16,6 +16,15 @@ __pycache__/
 secrets/
 credentials/
 
+.env
+*.pyc
+__pycache__/
+db.sqlite3
+/media/
+/staticfiles/
+/logs/
+
+*.http
 # IDE / OS
 .vscode/
 .idea/
