@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 import os
+import sys
+from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -19,17 +21,23 @@ import cloudinary.api
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Load environment variables from .env file
+load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-1tty#9$2&-+8ay(y3e99odwcmv-)y=#%m@pt=8ysevn4a*93i8'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-fallback-key-change-this')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+APPEND_SLASH = True
+
+# Testing flag
+TESTING = 'test' in sys.argv
 
 
 # Application definition
@@ -41,56 +49,41 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
-    'debug_toolbar',
     'django_ratelimit',
     'django_filters',
     'django_extensions',
     'cloudinary',
-    'cloudinary_storage',  
-    'DriveApp',
+    'cloudinary_storage',
+
+    'DriveApp.apps.DriveAppConfig',
 ]
 
+
 # Cloudinary Configuration
-
-
 cloudinary.config(
-    cloud_name="dsfgsdjgz",
-    api_key="551648374292981",
-    api_secret="KmgyWi_QVc4xmvNj4Fe9Pj1JDyU",
+    cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME', 'dsfgsdjgz'),
+    api_key=os.getenv('CLOUDINARY_API_KEY', '551648374292981'),
+    api_secret=os.getenv('CLOUDINARY_API_SECRET', 'KmgyWi_QVc4xmvNj4Fe9Pj1JDyU'),
     secure=True
 )
 
 DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+STATICFILES_STORAGE = 'cloudinary_storage.storage.StaticHashedCloudinaryStorage'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 SESSION_SERIALIZER = 'django.contrib.sessions.serializers.JSONSerializer'
 
-#CLOUDINARY_STORAGE = {
-#    'CLOUD_NAME': os.getenv('CLOUDINARY_CLOUD_NAME', 'dsfgsdjgz'),
-#    'API_KEY': os.getenv('CLOUDINARY_API_KEY', '782339671282341'),
-#    'API_SECRET': os.getenv('CLOUDINARY_API_SECRET', 'OL1trqd6jLR-9G_b4gpPOfeSLbc'),
-#}
-
-#cloudinary.config(
-#    cloud_name=['CLOUD_NAME'],
-#   api_key=CLOUDINARY_STORAGE['API_KEY'],
-#   api_secret=CLOUDINARY_STORAGE['API_SECRET'],
-#    secure=True
-#)
-
-# Default file storage
-DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
-STATICFILES_STORAGE = 'cloudinary_storage.storage.StaticHashedCloudinaryStorage'
-
 
 MIDDLEWARE = [
-    'debug_toolbar.middleware.DebugToolbarMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -98,40 +91,18 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-# Debug Toolbar settings
-
-
-# OR better: Conditionally include debug_toolbar
-import sys
-TESTING = 'test' in sys.argv
-
-if not TESTING:
-    INSTALLED_APPS += ['debug_toolbar']
-    MIDDLEWARE.insert(0, 'debug_toolbar.middleware.DebugToolbarMiddleware')
-    
-TESTING = 'test' in sys.argv
-
-# Configure Debug Toolbar only when not testing
+# Debug Toolbar settings - Only in development
 if DEBUG and not TESTING:
-    INSTALLED_APPS += ['debug_toolbar']
+    INSTALLED_APPS.append('debug_toolbar')
     MIDDLEWARE.insert(0, 'debug_toolbar.middleware.DebugToolbarMiddleware')
-    
+
     DEBUG_TOOLBAR_CONFIG = {
         'SHOW_TOOLBAR_CALLBACK': lambda request: True,
         'RESULTS_CACHE_SIZE': 100,
         'SHOW_COLLAPSED': True,
     }
-    
+
     INTERNAL_IPS = ['127.0.0.1', 'localhost']
-else:
-    # Disable debug toolbar during tests
-    DEBUG_TOOLBAR_CONFIG = {
-        'IS_RUNNING_TESTS': True,  # This bypasses the toolbar check
-    }
-
-INTERNAL_IPS = ['127.0.0.1']
-
-
 
 
 ROOT_URLCONF = 'Drive.urls'
@@ -143,6 +114,7 @@ TEMPLATES = [
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
+                'django.template.context_processors.debug',
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
@@ -160,26 +132,24 @@ WSGI_APPLICATION = 'Drive.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'SaasDjango',
-        'USER': 'root',
-        'PASSWORD': 'Othmane491!',
-        'HOST': '127.0.0.1',
-        'PORT': '3306',
-        'CONN_MAX_AGE':600,
+        'NAME': os.getenv('DB_NAME', 'SaasDjango'),
+        'USER': os.getenv('DB_USER', 'root'),
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'OPTIONS': {
             'connect_timeout': 10,
-        }
-
+        },
     }
 }
 
 
-
 # CORS Settings
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-]
+CORS_ALLOWED_ORIGINS = os.getenv(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://localhost:5173'
+).split(',')
+
+CORS_ALLOW_CREDENTIALS = True
+
 
 # REST Framework Settings
 REST_FRAMEWORK = {
@@ -191,7 +161,6 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',
-        # 'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
     
     # Permissions
@@ -205,107 +174,110 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
-        # General rates
-        'anon': '100/hour',          # Anonymous users
-        'user': '1000/hour',         # Authenticated users
         
-        # Specific endpoint rates
-        'login': '5/minute',         # Login attempts (prevent brute force)
-        'register': '10/hour',       # Student registration
-        'stats': '30/minute',        # Statistics endpoints
-        'school_users': '60/minute', # School user listing
-        'burst': '60/minute',        # Burst traffic allowance
-        'school':'200/hour',
-        'school_list':'300/hour',
-        'school_create':'10/hour',
-        'student_progress': '100/hour',              # View student progress ✅ FIXED
-        'student_progress_update': '30/hour',        # Update progress (instructors) ✅ FIXED
-        'student_performance_prediction': '50/hour', # Performance predictions ✅ FIXED
-        # IP-BASED RATE LIMITING (Optional)
-        'ip_based': '500/hour',  # Per-IP rate limit (DDoS prevention)
+        'anon': '100/minute',
 
-        'lesson_list': '300/hour',          # Lesson listing
-        'lesson_create': '50/hour',         # Lesson creation
-        'lesson_update': '100/hour',        # Lesson updates
-        'mark_attendance': '100/hour',      # Marking attendance (instructors)
-        'complete_lesson': '50/hour',       # Completing lessons
-        'lesson_stats': '60/minute',        # Lesson statistics
-        'lesson_feedback': '100/hour',      # Viewing feedback
+        # General rates        
+        'user': '200/minute',
+        'register_student': '10/hour',
+        'school_users': '100/hour',
+        'stats': '60/hour',
+        'school_list': '100/hour',
+        'school_create': '10/hour',
+        'student_progress': '100/hour',
+        'student_progress_update': '50/hour',
+        'student_performance_prediction': '30/hour',
+        
+        # Authentication
+        'login': '5/minute',
+        'register': '10/hour',
+        'burst': '60/minute',
+        'school': '200/hour',
+        'ip_based': '500/hour',
 
-        # Attendance management
+        # Lessons
+        'lesson_list': '300/hour',
+        'lesson_create': '50/hour',
+        'lesson_update': '100/hour',
+        'mark_attendance': '100/hour',
+        'complete_lesson': '50/hour',
+        'lesson_stats': '60/minute',
+        'lesson_feedback': '100/hour',
+
+        # Attendance
         'attendance_list': '100/min',
         'attendance_create': '50/hour',
         'attendance_update': '60/hour',
-        'attendance_bulk_create': '10/hour',  # More restrictive
+        'attendance_bulk_create': '10/hour',
         'attendance_stats': '50/min',
 
-        # Feedback management
-        'feedback_list': '200/hour',            # Feedback listing
-        'feedback_create': '10/hour',           # Feedback creation (prevent spam)
-        'feedback_update': '20/hour',           # Feedback updates
-        'feedback_lesson_view': '100/hour',     # Viewing lesson feedback
-        'feedback_my_view': '50/hour',          # Student viewing own feedback
-        'feedback_instructor_view': '60/minute', # Instructor viewing feedback
+        # Feedback
+        'feedback_list': '200/hour',
+        'feedback_create': '10/hour',
+        'feedback_update': '20/hour',
+        'feedback_lesson_view': '100/hour',
+        'feedback_my_view': '50/hour',
+        'feedback_instructor_view': '60/minute',
 
-        # vehicle management
-        'vehicle_list': '300/hour',             # Vehicle listing
-        'vehicle_create': '20/hour',            # Vehicle creation
-        'vehicle_update': '100/hour',           # Vehicle updates
-        'vehicle_picture_upload': '30/hour',    # Picture uploads (file operations)
-        'vehicle_picture_manage': '50/hour',    # Picture management
-        'vehicle_maintenance': '50/hour',       # Maintenance operations
-        'vehicle_statistics': '60/minute',      # Statistics queries
-        'vehicle_history': '100/hour',          # History queries
+        # Vehicles
+        'vehicle_list': '300/hour',
+        'vehicle_create': '20/hour',
+        'vehicle_update': '100/hour',
+        'vehicle_picture_upload': '30/hour',
+        'vehicle_picture_manage': '50/hour',
+        'vehicle_maintenance': '50/hour',
+        'vehicle_statistics': '60/minute',
+        'vehicle_history': '100/hour',
 
-        # schedule management
-        'schedule_list': '400/hour',            # Schedule listing
-        'schedule_create': '50/hour',           # Schedule creation
-        'schedule_update': '100/hour',          # Schedule updates
-        'schedule_conflict_check': '200/hour',  # Conflict checking (frequent)
-        'schedule_my_schedule': '100/hour',     # My schedule queries
-        'schedule_availability': '150/hour',    # Availability queries
-        'schedule_cancel': '20/hour',           # Cancellations (safety)
-        'schedule_reschedule': '30/hour',       # Rescheduling
+        # Schedules
+        'schedule_list': '400/hour',
+        'schedule_create': '50/hour',
+        'schedule_update': '100/hour',
+        'schedule_conflict_check': '200/hour',
+        'schedule_my_schedule': '100/hour',
+        'schedule_availability': '150/hour',
+        'schedule_cancel': '20/hour',
+        'schedule_reschedule': '30/hour',
 
-        # Achievement management
-        'achievement_list': '200/hour',         # Achievement listing
-        'achievement_award': '30/hour',         # Manual awarding
-        'achievement_bulk_award': '10/hour',    # Bulk operations (low for safety)
-        'achievement_check_milestones': '50/hour', # Milestone checking
-        'achievement_leaderboard': '100/hour',  # Leaderboard queries
-        'achievement_statistics': '60/minute',  # Statistics queries
+        # Achievements
+        'achievement_list': '200/hour',
+        'achievement_award': '30/hour',
+        'achievement_bulk_award': '10/hour',
+        'achievement_check_milestones': '50/hour',
+        'achievement_leaderboard': '100/hour',
+        'achievement_statistics': '60/minute',
 
-        # Communication Template
-        'communication_template_list':'100/hour',
-        'communication_template_create':'20/hour',
-        'communication_template_update':'10/hour',
-        'communication_template_duplicate':'20/hour',
-        'communication_template_preview':'50/hour',
-        'communication_template_usage_stats':'60/minute',
-        # Communication Template
-        'automated_message_list':'100/hour',
-        'automated_message_create':'20/hour',
-        'automated_message_update':'20/hour',
-        'automated_message_bulk_create':'20/hour',
-        'automated_message_bulk_cancel':'20/hour',
-        'automated_message_send_now':'20/hour',
-        'automated_message_statistics':'20/hour',
-        'automated_message_schedule':'20/hour',
+        # Communication
+        'communication_template_list': '100/hour',
+        'communication_template_create': '20/hour',
+        'communication_template_update': '10/hour',
+        'communication_template_duplicate': '20/hour',
+        'communication_template_preview': '50/hour',
+        'communication_template_usage_stats': '60/minute',
+        
+        'automated_message_list': '100/hour',
+        'automated_message_create': '20/hour',
+        'automated_message_update': '20/hour',
+        'automated_message_bulk_create': '20/hour',
+        'automated_message_bulk_cancel': '20/hour',
+        'automated_message_send_now': '20/hour',
+        'automated_message_statistics': '20/hour',
+        'automated_message_schedule': '20/hour',
 
-        # School Analytics 
-        'school_analytic_list':'100/hour',
-        'school_analytic_create':'20/hour',
-        'school_analytic_update':'30/hour',
-        'school_analytic_dashboard':'60/hour',
-        'school_analytic_daily':'10/hour',
-        'school_analytic_bulk_generate':'5/hour',
-        'school_analytic_comparison':'50/hour',
-        'school_analytic_trends':'30/hour',
-        'school_analytic_alerts':'20/hour',
-        'school_analytic_predictions':'40/hour',
-        'school_analytic_export':'30/hour',
-        'school_analytic_summary':'15/hour',
-        'school_analytic_system_health':'60/hour',
+        # Analytics
+        'school_analytic_list': '100/hour',
+        'school_analytic_create': '20/hour',
+        'school_analytic_update': '30/hour',
+        'school_analytic_dashboard': '60/hour',
+        'school_analytic_daily': '10/hour',
+        'school_analytic_bulk_generate': '5/hour',
+        'school_analytic_comparison': '50/hour',
+        'school_analytic_trends': '30/hour',
+        'school_analytic_alerts': '20/hour',
+        'school_analytic_predictions': '40/hour',
+        'school_analytic_export': '30/hour',
+        'school_analytic_summary': '15/hour',
+        'school_analytic_system_health': '60/hour',
 
         # Dashboard
         'dashboard_overview': '60/min',
@@ -313,20 +285,19 @@ REST_FRAMEWORK = {
         'dashboard_quick_stats': '100/min',
         'dashboard_notifications': '50/min',
 
-        # Subscription Plan rates
+        # Subscriptions
         'subscription_plan_list': '100/hour',
         'subscription_plan_create': '10/hour',
         'subscription_plan_update': '30/hour',
         'subscription_plan_statistics': '60/hour',
         
-        # School Subscription rates
         'school_subscription_list': '100/hour',
         'school_subscription_create': '5/hour',
         'school_subscription_update': '20/hour',
-        'school_subscription_action': '15/hour',  # cancel, renew, upgrade
-        'school_subscription_usage': '100/hour',  # usage stats, limits
+        'school_subscription_action': '15/hour',
+        'school_subscription_usage': '100/hour',
 
-        # Student Document ViewSet rates
+        # Documents
         'student_document_list': '100/hour',
         'student_document_create': '20/hour',
         'student_document_update': '30/hour',
@@ -335,7 +306,6 @@ REST_FRAMEWORK = {
         'student_document_my_documents': '60/hour',
         'student_document_student_docs': '40/hour',
         'student_document_statistics': '30/hour',
-        
     },
     
     # Filtering
@@ -355,8 +325,6 @@ REST_FRAMEWORK = {
 }
 
 # Password validation
-# https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -374,84 +342,52 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # Internationalization
-# https://docs.djangoproject.com/en/5.2/topics/i18n/
-
 LANGUAGE_CODE = 'en-us'
-
-TIME_ZONE = 'UTC'
-
+TIME_ZONE = os.getenv('TIME_ZONE', 'UTC')
 USE_I18N = True
-
 USE_TZ = True
 
 
 # Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
-
-
 STATIC_URL = '/static/'
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
 
 # Default primary key field type
-# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
-
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AUTH_USER_MODEL = 'DriveApp.User'
 
 
-
 # ===== CELERY CONFIGURATION =====
-CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
+CELERY_TIMEZONE = TIME_ZONE
 CELERY_ENABLE_UTC = True
-
-# Task result expiration
-CELERY_RESULT_EXPIRES = 3600  
-
-# Task configuration
+CELERY_RESULT_EXPIRES = 3600
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_SEND_SENT_EVENT = True
 CELERY_WORKER_SEND_TASK_EVENTS = True
 
-# Email configuration for notifications
-# ===== CORRECT EMAIL CONFIGURATION =====
+
+# ===== EMAIL CONFIGURATION =====
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'custom_email_backend.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER)
 
 
-# Email configuration
-# settings.py - For testing
-
-
-# In settings.py
-# settings.py or your Django settings file
-
-
-# Email configuration
-EMAIL_BACKEND = 'custom_email_backend.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'othmanejamili19@gmail.com'
-EMAIL_HOST_PASSWORD = 'xldajgfebylgdhsa'
-DEFAULT_FROM_EMAIL = 'othmanejamili19@gmail.com'
-
-# ================ CORRECT EMAIL CONFIGURATION ================
-
-# Rate limiting configuration
-RATELIMIT_ENABLE = True  # Set to False to disable in development
-RATELIMIT_USE_CACHE = 'default'
-
-
-# Cache configuration (choose one based on your needs)
+# ===== CACHE CONFIGURATION =====
 CACHES = {
     'default': {
         'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/1'),
+        'LOCATION': os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'),
         'OPTIONS': {
             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
             'CONNECTION_POOL_KWARGS': {
@@ -461,25 +397,19 @@ CACHES = {
             'SOCKET_CONNECT_TIMEOUT': 5,
             'SOCKET_TIMEOUT': 5,
             'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
-            'IGNORE_EXCEPTIONS': True,  # Don't break the app if Redis is down
+            'IGNORE_EXCEPTIONS': True,
         },
         'KEY_PREFIX': 'driving_school',
-        'TIMEOUT': 300,  # Default 5 minutes
+        'TIMEOUT': 300,
     }
 }
 
+# Rate limiting configuration
+RATELIMIT_ENABLE = os.getenv('RATELIMIT_ENABLE', 'True') == 'True'
+RATELIMIT_USE_CACHE = 'default'
 
-# ============================================
-# LOGGING CONFIGURATION
-# ============================================
 
-# ============================================
-# LOGGING CONFIGURATION (FIXED)
-# ============================================
-
-import os
-
-# Create logs directory if it doesn't exist
+# ===== LOGGING CONFIGURATION =====
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(LOGS_DIR, exist_ok=True)
 
@@ -527,7 +457,7 @@ LOGGING = {
         },
         'django.db.backends': {
             'handlers': ['console'],
-            'level': 'WARNING',  # DEBUG to see SQL queries
+            'level': 'WARNING' if not DEBUG else 'DEBUG',
             'propagate': False,
         },
         'django.request': {
@@ -542,7 +472,7 @@ LOGGING = {
         },
         'django.core.cache': {
             'handlers': ['console', 'cache_file'],
-            'level': 'DEBUG',
+            'level': 'DEBUG' if DEBUG else 'WARNING',
             'propagate': False,
         },
     },
@@ -554,133 +484,117 @@ LOGGING = {
 }
 
 
-
-if DEBUG:
-    # Enable more verbose logging for debugging
-    LOGGING['loggers']['django.db.backends']['level'] = 'DEBUG'
-    LOGGING['loggers']['django.core.cache'] = {
-        'handlers': ['console'],
-        'level': 'DEBUG',
-    }
-# ============================================
-# SECURITY SETTINGS
-# ============================================
+# ===== SECURITY SETTINGS =====
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
 
+
+# ===== CACHE TIMEOUTS =====
 CACHE_TIMEOUTS = {
     # User-related caches
-    'user_queryset': 60 * 5,           # 5 minutes
-    'user_stats': 60 * 10,             # 10 minutes
-    'school_users': 60 * 3,            # 3 minutes
+    'user_queryset': 60 * 5,
+    'user_stats': 60 * 10,
+    'school_users': 60 * 3,
     
     # School-related caches
-    'schools_queryset': 60 * 5,        # 5 minutes
-    'school_data': 60 * 30,            # 30 minutes
-    'school_student_count': 60 * 5,    # 5 minutes
+    'schools_queryset': 60 * 5,
+    'school_data': 60 * 30,
+    'school_student_count': 60 * 5,
     
     # Student profile caches
-    'student_profile': 60 * 5,         # 5 minutes
-    'student_progress': 60 * 2,        # 2 minutes (changes frequently)
-    'student_prediction': 60 * 10,     # 10 minutes (expensive to compute)
-    'my_profile': 60 * 3,              # 3 minutes
+    'student_profile': 60 * 5,
+    'student_progress': 60 * 2,
+    'student_prediction': 60 * 10,
+    'my_profile': 60 * 3,
 
     # Lesson-related caches
-    'lessons_queryset': 60 * 3,         # 3 minutes
-    'lesson_detail': 60 * 5,            # 5 minutes
-    'lesson_attendance': 60 * 2,        # 2 minutes (changes frequently)
-    'lesson_feedback': 60 * 3,          # 3 minutes
-    'lesson_schedule': 60 * 5,          # 5 minutes
-    'upcoming_lessons': 60 * 2,         # 2 minutes
-    'my_lessons': 60 * 3,               # 3 minutes
-    'lesson_statistics': 60 * 5,        # 5 minutes (expensive calculation)
+    'lessons_queryset': 60 * 3,
+    'lesson_detail': 60 * 5,
+    'lesson_attendance': 60 * 2,
+    'lesson_feedback': 60 * 3,
+    'lesson_schedule': 60 * 5,
+    'upcoming_lessons': 60 * 2,
+    'my_lessons': 60 * 3,
+    'lesson_statistics': 60 * 5,
 
-    'attendance_queryset': 60 * 3,      # 3 minutes for attendance lists
-    'attendance_detail': 60 * 5,        # 5 minutes for single attendance record
-    
-    # Custom Attendance Endpoints
-    'my_attendance': 60 * 2,            # 2 minutes for student's own attendance
-    'lesson_attendance_summary': 60 * 3, # 3 minutes for lesson summaries
-    'student_attendance_summary': 60 * 3, # 3 minutes for student summaries
-    'attendance_statistics': 60 * 5,    # 5 minutes for statistics (expensive queries)
-    
-    # Bulk Operations Cache
-    'attendance_bulk_operations': 60 * 10, # 10 minutes for bulk operation results
-    
-    # Filters and Search Results
-    'attendance_filters': 60 * 2,       # 2 minutes for filtered results
+    # Attendance caches
+    'attendance_queryset': 60 * 3,
+    'attendance_detail': 60 * 5,
+    'my_attendance': 60 * 2,
+    'lesson_attendance_summary': 60 * 3,
+    'student_attendance_summary': 60 * 3,
+    'attendance_statistics': 60 * 5,
+    'attendance_bulk_operations': 60 * 10,
+    'attendance_filters': 60 * 2,
 
     # Feedback-related caches
-    'feedback_queryset': 60 * 5,        # 5 minutes
-    'feedback_detail': 60 * 5,          # 5 minutes
-    'lesson_feedback': 60 * 5,          # 5 minutes (with stats)
-    'my_feedback': 60 * 3,              # 3 minutes
-    'instructor_feedback': 60 * 5,      # 5 minutes (with stats)
-    'lesson_feedback_stats': 60 * 5,    # 5 minutes
-    'instructor_feedback_stats': 60 * 5, # 5 minutes 
+    'feedback_queryset': 60 * 5,
+    'feedback_detail': 60 * 5,
+    'lesson_feedback': 60 * 5,
+    'my_feedback': 60 * 3,
+    'instructor_feedback': 60 * 5,
+    'lesson_feedback_stats': 60 * 5,
+    'instructor_feedback_stats': 60 * 5,
     
     # Vehicle-related caches
-    'vehicles_queryset': 60 * 5,        # 5 minutes
-    'vehicle_detail': 60 * 5,           # 5 minutes
-    'vehicle_pictures': 60 * 5,         # 5 minutes
-    'vehicles_available': 60 * 3,       # 3 minutes (changes frequently)
-    'vehicles_maintenance_due': 60 * 10, # 10 minutes (changes slowly)
-    'vehicle_statistics': 60 * 10,      # 10 minutes (expensive query)
-    'vehicle_history': 60 * 5,          # 5 minutes
-    'my_school_vehicles': 60 * 3,       # 3 minutes
+    'vehicles_queryset': 60 * 5,
+    'vehicle_detail': 60 * 5,
+    'vehicle_pictures': 60 * 5,
+    'vehicles_available': 60 * 3,
+    'vehicles_maintenance_due': 60 * 10,
+    'vehicle_statistics': 60 * 10,
+    'vehicle_history': 60 * 5,
+    'my_school_vehicles': 60 * 3,
 
-    # schedule-related caches
-    'schedules_queryset': 60 * 3,           # 3 minutes (changes frequently)
-    'my_schedule': 60 * 2,                  # 2 minutes
-    'upcoming_schedules': 60 * 3,           # 3 minutes
-    'instructor_availability': 60 * 5,      # 5 minutes
-    'vehicle_availability': 60 * 5,         # 5 minutes
-    'my_schedule_mobile': 60 * 2,           # 2 minutes
+    # Schedule-related caches
+    'schedules_queryset': 60 * 3,
+    'my_schedule': 60 * 2,
+    'upcoming_schedules': 60 * 3,
+    'instructor_availability': 60 * 5,
+    'vehicle_availability': 60 * 5,
+    'my_schedule_mobile': 60 * 2,
 
     # Achievement-related caches
-    'achievements_queryset': 60 * 5,        # 5 minutes
-    'my_achievements': 60 * 3,              # 3 minutes
-    'leaderboard': 60 * 5,                  # 5 minutes (competitive)
-    'achievement_stats': 60 * 10,           # 10 minutes
-    'student_progress': 60 * 5,             # 5 minutes
-    'badges': 60 * 10,                      # 10 minutes (rarely changes)
+    'achievements_queryset': 60 * 5,
+    'my_achievements': 60 * 3,
+    'leaderboard': 60 * 5,
+    'achievement_stats': 60 * 10,
+    'student_progress': 60 * 5,
+    'badges': 60 * 10,
 
     # Communication-related caches
-    'communication_templates_queryset': 60 * 5,      # 5 minutes (list views)
-    'communication_template_detail': 60 * 10,        # 10 minutes (single template)
-    'templates_by_type': 60 * 5,                     # 5 minutes (grouped view)
-    'template_usage_stats': 60 * 10,                 # 10 minutes (expensive query)
-    'my_school_templates': 60 * 3,                   # 3 minutes (frequently accessed)
-    
-    # Communication variables and metadata
-    'available_variables': 60 * 60,                  # 1 hour (rarely changes)
-    'template_variables': 60 * 30,                   # 30 minutes
+    'communication_templates_queryset': 60 * 5,
+    'communication_template_detail': 60 * 10,
+    'templates_by_type': 60 * 5,
+    'template_usage_stats': 60 * 10,
+    'my_school_templates': 60 * 3,
+    'available_variables': 60 * 60,
+    'template_variables': 60 * 30,
     
     # Message-related caches
-    'automated_messages_queryset': 60 * 2,           # 2 minutes (changes frequently)
-    'automated_message_detail': 60 * 5,              # 5 minutes
-    'message_statistics': 60 * 10,                   # 10 minutes (expensive query)
-    'scheduled_messages': 60 * 1,                    # 1 minute (very dynamic)
-    'sent_messages': 60 * 5,                         # 5 minutes
-    'message_history': 60 * 10,                      # 10 minutes
-    
-    # Communication preview caches
-    'template_preview': 60 * 2,                      # 2 minutes (short-lived)
-    
-    # Communication analytics
-    'communication_analytics': 60 * 15,              # 15 minutes
-    'message_delivery_stats': 60 * 10,               # 10 minutes
-    'template_effectiveness': 60 * 30,               # 30 minutes (rarely changes)
-    
-    # Bulk communication operations
-    'bulk_message_operations': 60 * 5,               # 5 minutes
-    
-    # Student communication history
-    'student_messages': 60 * 3,                      # 3 minutes
-    'my_messages': 60 * 2,                           # 2 minutes (student's own)
-    'unread_messages_count': 60 * 1,                 # 1 minute (very dynamic)    
+    'automated_messages_queryset': 60 * 2,
+    'automated_message_detail': 60 * 5,
+    'message_statistics': 60 * 10,
+    'scheduled_messages': 60 * 1,
+    'sent_messages': 60 * 5,
+    'message_history': 60 * 10,
+    'template_preview': 60 * 2,
+    'communication_analytics': 60 * 15,
+    'message_delivery_stats': 60 * 10,
+    'template_effectiveness': 60 * 30,
+    'bulk_message_operations': 60 * 5,
+    'student_messages': 60 * 3,
+    'my_messages': 60 * 2,
+    'unread_messages_count': 60 * 1,
 
     # Analytics
     'analytics_queryset': 60 * 5,
@@ -693,13 +607,12 @@ CACHE_TIMEOUTS = {
     'analytics_system_health': 60 * 2,
     
     # Reports
-    'report_weekly': 60 * 120,  # 2 hours
-    'report_monthly': 60 * 360,  # 6 hours
-    'report_instructor_performance': 60 * 60,  # 1 hour
-    'report_student_progress': 60 * 30,  # 30 minutes
-    'report_financial_summary': 60 * 120,  # 2 hours
-    'report_export': 60 * 60,  # 1 hour
-    
+    'report_weekly': 60 * 120,
+    'report_monthly': 60 * 360,
+    'report_instructor_performance': 60 * 60,
+    'report_student_progress': 60 * 30,
+    'report_financial_summary': 60 * 120,
+    'report_export': 60 * 60,
 
     # Student Documents
     'student_document_queryset': 60 * 5,
@@ -709,7 +622,6 @@ CACHE_TIMEOUTS = {
     'document_download': 60 * 10,
     'document_statistics': 60 * 15,
 
-
-    #Default 
+    # Default
     'default': 60 * 5,
 }

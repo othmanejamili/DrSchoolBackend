@@ -15,6 +15,7 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
+from django.conf import settings
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from DriveApp.views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
@@ -22,17 +23,18 @@ from DriveApp.views import (UserViewSet, DrivingSchoolViewSet, StudentProfileVie
                             ScheduleViewSet,AchievemtViewSet,CommunicationTemplateViewSet,
                             AutomatedMessageViewSet,SchoolAnalyticsViewSet,ReportViewSet,
                             DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet,
-                            StudentDocumentViewSet)
+                            StudentDocumentViewSet, login_view, logout_view, register_view, verify_token
+                        )
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
 router.register(r'drivingschool', DrivingSchoolViewSet, basename='drivingschool')
 router.register(r'studentprofile', StudentProfileViewSet, basename='studentprofile')
 router.register(r'lesson',LessonViewSet, basename='lesson')
-router.register(r'attendance',AttendanceViewSet,basename='attendance')
+router.register(r'attendance',AttendanceViewSet, basename='attendance')
 router.register(r'feedback',FeedbackViewSet, basename='feedback')
 router.register(r'vehicle',VehicleViewSet, basename='vehicle')
-router.register(r'schedule',ScheduleViewSet,basename='schedule')
+router.register(r'schedule',ScheduleViewSet, basename='schedule')
 router.register(r'achievement',AchievemtViewSet, basename='achievement')
 router.register(r'communicationtemplate',CommunicationTemplateViewSet, basename='communicationtemplate')
 router.register(r'automatedmessage',AutomatedMessageViewSet, basename='automatedmessage')
@@ -42,7 +44,22 @@ router.register(r'dashboard',DashboardViewSet, basename='dashboard')
 router.register(r'subscriptionplan',SubscriptionPlanViewSet, basename='subscriptionplan')
 router.register(r'schoolsubscription',SchoolSubscriptionViewSet, basename='schoolsubscription')
 router.register(r'studentdocument',StudentDocumentViewSet, basename='studentdocument')
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    # Authentication endpoints
+    path('api/auth/login/', login_view, name='login'),
+    path('api/auth/logout/', logout_view, name='logout'),
+    path('api/auth/register/', register_view, name='register'),
+    path('api/auth/verify/', verify_token, name='verify-token'),
     path('api/', include(router.urls)),
+    path('api/drivingschool/<str:name>/', 
+        DrivingSchoolViewSet.as_view({'get': 'retrieve'}),
+        name='drivingschool-by-name'),
 ]+ router.urls
+
+if settings.DEBUG:
+    import debug_toolbar
+    urlpatterns += [
+        path('__debug__/', include(debug_toolbar.urls)),
+    ]

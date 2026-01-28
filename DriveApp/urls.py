@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.conf import settings
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
@@ -6,7 +7,8 @@ from .views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
                     ScheduleViewSet,AchievemtViewSet, CommunicationTemplateViewSet,
                     AutomatedMessageViewSet, SchoolAnalyticsViewSet, ReportViewSet,
                     DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet,
-                    StudentDocumentViewSet)
+                    StudentDocumentViewSet, login_view, logout_view, register_view, verify_token
+                )
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -26,7 +28,22 @@ router.register(r'dashboard',DashboardViewSet, basename='dashboard')
 router.register(r'subscriptionplan',SubscriptionPlanViewSet, basename='subscriptionplan')
 router.register(r'schoolsubscription',SchoolSubscriptionViewSet, basename='schoolsubscription')
 router.register(r'studentdocument',StudentDocumentViewSet, basename='studentdocument')
+
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include(router.urls)),
+    # Authentication endpoints
+    path('api/auth/login/', login_view, name='login'),
+    path('api/auth/logout/', logout_view, name='logout'),
+    path('api/auth/register/', register_view, name='register'),
+    path('api/auth/verify/', verify_token, name='verify-token'),
+    path('api/', include(router.urls)), 
+    path('api/drivingschool/<str:name>/', 
+        DrivingSchoolViewSet.as_view({'get': 'retrieve'}),
+        name='drivingschool-by-name'),
 ]+ router.urls
+
+if settings.DEBUG:
+    import debug_toolbar
+    urlpatterns += [
+        path('__debug__/', include(debug_toolbar.urls)),
+    ]

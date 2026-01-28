@@ -104,9 +104,211 @@ from .cache_utils import (get_student_profile_cache_key, invalidate_student_prof
                             invalidate_student_documents_caches
                             )
 
+from rest_framework.authtoken.models import Token
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework import status
+from django.contrib.auth import authenticate
+from rest_framework.throttling import AnonRateThrottle
+
 User = get_user_model()
 
+class LoginThrottle(AnonRateThrottle):
+    """Custom throttle for login attempts"""
+    rate = '5/minute'
+    scope = 'login'
 
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([LoginThrottle])
+def login_view(request):
+    """
+    Login endpoint that returns authentication token.
+    
+    Request:
+    {
+        "username": "your_username",
+        "password": "your_password"
+    }
+    
+    Response:
+    {
+        "token": "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b",
+        "user_id": 1,
+        "username": "john_doe",
+        "email": "john@example.com",
+        "role": "S"
+    }
+    """
+    username = request.data.get('username')
+    password = request.data.get('password')
+    
+    if not username or not password:
+        return Response(
+            {'error': 'Please provide both username and password'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Authenticate user
+    user = authenticate(username=username, password=password)
+    
+    if user is None:
+        return Response(
+            {'error': 'Invalid credentials'},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+    
+    if not user.is_active:
+        return Response(
+            {'error': 'Account is deactivated'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    # Get or create token
+    token, created = Token.objects.get_or_create(user=user)
+    
+    return Response({
+        'token': token.key,
+        'user_id': user.id,
+        'username': user.username,
+        'email': user.email,
+        'role': user.role,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def logout_view(request):
+    """
+    Logout endpoint that deletes the user's token.
+    
+    Request Headers:
+    Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b
+    """
+    if request.user.is_authenticated:
+        # Delete the user's token
+        try:
+            request.user.auth_token.delete()
+            return Response(
+                {'message': 'Successfully logged out'},
+                status=status.HTTP_200_OK
+            )
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    return Response(
+        {'error': 'Not authenticated'},
+        status=status.HTTP_400_BAD_REQUEST
+    )
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([LoginThrottle])
+def register_view(request):
+    """
+    Public registration endpoint for new users.
+    Creates a basic user account (students should be registered via admin).
+    
+    Request:
+    {
+        "username": "new_user",
+        "email": "user@example.com",
+        "password": "secure_password",
+        "first_name": "John",
+        "last_name": "Doe",
+        "phone_number": "+1234567890"
+    }
+    """
+    from django.contrib.auth import get_user_model
+    
+    User = get_user_model()
+    
+    required_fields = ['username', 'email', 'password']
+    for field in required_fields:
+        if not request.data.get(field):
+            return Response(
+                {'error': f'{field} is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    # Check if username exists
+    if User.objects.filter(username=request.data['username']).exists():
+        return Response(
+            {'error': 'Username already exists'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Check if email exists
+    if User.objects.filter(email=request.data['email']).exists():
+        return Response(
+            {'error': 'Email already exists'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        # Create user
+        user = User.objects.create_user(
+            username=request.data['username'],
+            email=request.data['email'],
+            password=request.data['password'],
+            first_name=request.data.get('first_name', ''),
+            last_name=request.data.get('last_name', ''),
+            phone_number=request.data.get('phone_number', ''),
+            role='S'  # Default to Student role
+        )
+        
+        # Create token
+        token = Token.objects.create(user=user)
+        
+        return Response({
+            'message': 'User created successfully',
+            'token': token.key,
+            'user_id': user.id,
+            'username': user.username,
+            'email': user.email,
+        }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        return Response(
+            {'error': str(e)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+
+@api_view(['GET'])
+def verify_token(request):
+    """
+    Verify if the current token is valid.
+    
+    Request Headers:
+    Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b
+    
+    Response:
+    {
+        "valid": true,
+        "user_id": 1,
+        "username": "john_doe"
+    }
+    """
+    if request.user.is_authenticated:
+        return Response({
+            'valid': True,
+            'user_id': request.user.id,
+            'username': request.user.username,
+            'email': request.user.email,
+            'role': request.user.role,
+        })
+    
+    return Response(
+        {'valid': False},
+        status=status.HTTP_401_UNAUTHORIZED
+    )
 
 # ============================================
 # USER VIEWSET WITH CACHING & RATE LIMITING
@@ -157,11 +359,11 @@ class UserViewSet(viewsets.ModelViewSet):
                 return cached_queryset
         
         # Build queryset based on role
-        if user.role == 'A' and user.is_active:
+        if user.role == 'A' and user.is_staff:
             # Platform Admin sees all users
             queryset = User.objects.all()
         
-        elif user.role == 'A' and not user.is_active:
+        elif user.role == 'A' and not user.is_staff:
             # School owners can see only their school users
             if hasattr(user, 'driving_schools') and user.driving_schools.exists():
                 school = user.driving_schools.first()
@@ -450,27 +652,31 @@ class UserViewSet(viewsets.ModelViewSet):
         Get user statistics across the platform.
         Heavily cached since stats don't change frequently.
         """
+        user = self.request.user
         cache_key = get_user_stats_cache_key()
         stats = cache.get(cache_key)
         
-        if stats is None:
-            # Calculate stats (expensive operation)
-            stats = {
-                'total_users': User.objects.count(),
-                'active_users': User.objects.filter(is_active=True).count(),
-                'users_by_role': dict(
-                    User.objects.values('role')
-                    .annotate(count=Count('id'))
-                    .values_list('role', 'count')
-                ),
-                'recent_registrations': User.objects.filter(
-                    created_at__gte=timezone.now() - timedelta(days=30)
-                ).count(),
-                'inactive_users': User.objects.filter(is_active=False).count(),
-            }
-            
-            # Cache for 10 minutes
-            cache.set(cache_key, stats, 60 * 10)
+        if user.role == "A" and user.is_staff:
+            if stats is None:
+                # Calculate stats (expensive operation)
+                stats = {
+                    'total_users': User.objects.count(),
+                    'active_users': User.objects.filter(is_active=True).count(),
+                    'users_by_role': dict(
+                        User.objects.values('role')
+                        .annotate(count=Count('id'))
+                        .values_list('role', 'count')
+                    ),
+                    'recent_registrations': User.objects.filter(
+                        created_at__gte=timezone.now() - timedelta(days=30)
+                    ).count(),
+                    'inactive_users': User.objects.filter(is_active=False).count(),
+                }
+                
+                # Cache for 10 minutes
+                cache.set(cache_key, stats, 60 * 10)
+        else:
+            return Response("You don't have permission to see stats")            
         
         return Response(stats)
     
@@ -536,11 +742,10 @@ class DrivingSchoolViewSet(viewsets.ModelViewSet):
                 return cached_queryset
         
         # Determine queryset based on role
-        if user.role == 'A':  # Admin
-            if user.is_staff:  # Platform admin
-                queryset = DrivingSchool.objects.all()
-            else:  # School owner admin
-                queryset = DrivingSchool.objects.filter(owner=user)
+        if user.role == 'A' and user.is_staff:  # Admin
+            queryset = DrivingSchool.objects.all()
+        elif user.role =='A' and not user.is_staff:  # School owner admin
+            queryset = DrivingSchool.objects.filter(owner=user)
         elif user.role in ['I', 'S']:  # Instructor or Student
             # Get user's school through their student profile
             student_profile = user.student_profiles.filter(status='A').first()
@@ -664,9 +869,65 @@ class DrivingSchoolViewSet(viewsets.ModelViewSet):
         
         return Response(response_data)
     
+    @action(detail=True, methods=['get'],
+            permission_classes=[IsAuthenticated, IsPlatformAdminOrSchoolOwner],
+            throttle_classes=[SchoolListThrottle],
+            url_path='students/(?P<student_id>[0-9]+)')
+    def get_student_by_id(self, request, pk=None, student_id=None):
+        """Get specific student by ID in a school"""
+        school = self.get_object()
+        user = self.request.user
+
+        # Permission check
+        if user.role != 'A' and school.owner != user:
+            raise PermissionDenied(
+                "Only platform admins and school owners can view student details."
+            )
+        
+        # Check cache
+        cache_key = f'school_{school.id}_student_{student_id}'
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
+        
+        # Get student profile
+        try:
+            student_profile = school.student_profiles.filter(
+                id=student_id,
+                user__role='S',
+                status='A'
+            ).select_related('user').first()
+            
+            if not student_profile:
+                return Response(
+                    {'error': 'Student not found in this school'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            serializer = StudentProfileSerializer(student_profile)
+            response_data = {
+                'school': {
+                    'id': school.id,
+                    'name': school.name
+                },
+                'student': serializer.data
+            }
+            
+            # Cache for 3 minutes
+            cache.set(cache_key, response_data, 60 * 3)
+            
+            return Response(response_data)
+            
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
     @action(detail=True, methods=['get'], 
             permission_classes=[IsAuthenticated], 
-            throttle_classes=[StatsThrottle])
+            throttle_classes=[IsPlatformAdminOrSchoolOwner])
     def stats(self, request, pk=None):
         """Get school statistics."""
         school = self.get_object()
