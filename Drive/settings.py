@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
+import smtplib
+import ssl
+import certifi
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -62,6 +65,10 @@ INSTALLED_APPS = [
     'DriveApp.apps.DriveAppConfig',
 ]
 
+AUTHENTICATION_BACKENDS = [
+    'DriveApp.backends.EmailBackend',   # ← your custom backend
+    'django.contrib.auth.backends.ModelBackend',  # ← keep as fallback
+]
 
 # Cloudinary Configuration
 cloudinary.config(
@@ -81,9 +88,9 @@ SESSION_SERIALIZER = 'django.contrib.sessions.serializers.JSONSerializer'
 
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -135,9 +142,14 @@ DATABASES = {
         'NAME': os.getenv('DB_NAME', 'SaasDjango'),
         'USER': os.getenv('DB_USER', 'root'),
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        'HOST': os.getenv('DB_HOST', '127.0.0.1'),  # force TCP, not socket
+        'PORT': os.getenv('DB_PORT', '3306'),
         'OPTIONS': {
             'connect_timeout': 10,
+            'charset': 'utf8mb4',
         },
+        'CONN_MAX_AGE': 0,          # no persistent connections
+        'CONN_HEALTH_CHECKS': True, # Django 4.1+ validates before reuse
     }
 }
 
@@ -145,11 +157,18 @@ DATABASES = {
 # CORS Settings
 CORS_ALLOWED_ORIGINS = os.getenv(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://localhost:5173'
+    'https://drive-oj.vercel.app,http://127.0.0.1:5173'  # string, not tuple
 ).split(',')
 
 CORS_ALLOW_CREDENTIALS = True
 
+# Frontend URL (used in reset link)
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://127.0.0.1:5173')
+
+# Redis config (separate DB from Celery broker)
+REDIS_HOST = os.getenv('REDIS_HOST', '127.0.0.1')
+REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
+REDIS_RESET_DB = 2   # DB 0 = Celery broker, DB 2 = reset tokens
 
 # REST Framework Settings
 REST_FRAMEWORK = {
@@ -157,12 +176,11 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 50,
     
-    # Authentication
     'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework_simplejwt.authentication.JWTAuthentication',  
         'rest_framework.authentication.SessionAuthentication',
-        'rest_framework.authentication.TokenAuthentication',
+
     ],
-    
     # Permissions
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
@@ -324,6 +342,12 @@ REST_FRAMEWORK = {
     ],
 }
 
+from datetime import timedelta
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME':  timedelta(minutes=30),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+}
+
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -374,15 +398,31 @@ CELERY_WORKER_SEND_TASK_EVENTS = True
 
 
 # ===== EMAIL CONFIGURATION =====
-EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'custom_email_backend.EmailBackend')
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
 EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
 EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
-EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'   # True
+EMAIL_USE_SSL = os.getenv('EMAIL_USE_SSL', 'False') == 'True'  # False
 EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER)
 
 
+# Override SSL context to use certifi certificates
+
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+
+
+# Monkey-patch ssl to use certifi
+_original_create_default_context = ssl.create_default_context
+def _certifi_create_default_context(*args, **kwargs):
+    kwargs.setdefault('cafile', certifi.where())
+    return _original_create_default_context(*args, **kwargs)
+ssl.create_default_context = _certifi_create_default_context
 # ===== CACHE CONFIGURATION =====
 CACHES = {
     'default': {

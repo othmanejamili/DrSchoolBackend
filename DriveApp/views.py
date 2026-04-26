@@ -36,6 +36,7 @@ from decimal import Decimal
 from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
 from django.views.decorators.cache import cache_page
 from django.utils.decorators import method_decorator
+from rest_framework_simplejwt.tokens import RefreshToken
 from .throttles import (
         RegisterStudentThrottle,StatsThrottle,SchoolUsersThrottle,
         SchoolListThrottle,SchoolCreateThrottle,StudentProgressThrottle,
@@ -114,6 +115,200 @@ from rest_framework.throttling import AnonRateThrottle
 
 User = get_user_model()
 
+import redis
+import random
+import string
+import logging
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+
+from rest_framework import status
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .tasks import send_reset_code_email
+
+User = get_user_model()
+logger = logging.getLogger(__name__)
+
+# Redis client — DB 2 dedicated for reset codes
+redis_client = redis.Redis(
+    host=getattr(settings, 'REDIS_HOST', 'localhost'),
+    port=getattr(settings, 'REDIS_PORT', 6379),
+    db=2,
+    decode_responses=True,
+)
+
+RESET_CODE_EXPIRY = 600  # 10 minutes in seconds
+
+
+def _generate_code(length=6) -> str:
+    """Generate a 6-digit numeric OTP"""
+    return ''.join(random.choices(string.digits, k=length))
+
+
+# ─────────────────────────────────────────────
+# STEP 1 — Request reset code
+# POST /auth/password-reset/request/
+# Body: { "email": "user@example.com" }
+# ─────────────────────────────────────────────
+class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+
+        if not email:
+            return Response(
+                {'error': 'Email is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            user = User.objects.get(email=email)
+
+            # Generate 6-digit OTP
+            code = _generate_code()
+
+            # Store in Redis:
+            # Key 1 — the code itself (expires in 10 min)
+            redis_client.setex(f"reset_code:{email}", RESET_CODE_EXPIRY, code)
+            # Key 2 — verified flag (set after step 2, used in step 3)
+            redis_client.delete(f"reset_verified:{email}")
+
+            # Send email async via Celery
+            send_reset_code_email.delay(
+                recipient_email=email,
+                code=code,
+                user_name=user.first_name or user.username,
+            )
+
+            logger.info(f"Reset code generated for {email}")
+
+        except User.DoesNotExist:
+            # Don't reveal whether the email exists (security)
+            pass
+
+        # Always return success (prevents email enumeration)
+        return Response(
+            {'message': 'If this email is registered, a reset code has been sent.'},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ─────────────────────────────────────────────
+# STEP 2 — Verify the OTP code
+# POST /auth/password-reset/verify/
+# Body: { "email": "...", "code": "123456" }
+# ─────────────────────────────────────────────
+class PasswordResetVerifyView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        code  = request.data.get('code', '').strip()
+
+        if not email or not code:
+            return Response(
+                {'error': 'Email and code are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Get stored code from Redis
+        stored_code = redis_client.get(f"reset_code:{email}")
+        if not stored_code:
+            return Response(
+                {'error': 'Code has expired. Please request a new one.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if stored_code != code:
+            return Response(
+                {'error': 'Invalid verification code.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Mark this email as verified in Redis (10 min window to complete reset)
+        redis_client.setex(f"reset_verified:{email}", 600, '1')
+        logger.info(f"Reset code verified for {email}")
+
+        return Response(
+            {'message': 'Code verified. You may now reset your password.'},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ─────────────────────────────────────────────
+# STEP 3 — Confirm new password
+# POST /auth/password-reset/confirm/
+# Body: { "email": "...", "code": "...", "new_password": "..." }
+# ─────────────────────────────────────────────
+class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email        = request.data.get('email', '').strip().lower()
+        code         = request.data.get('code', '').strip()
+        new_password = request.data.get('new_password', '')
+
+        if not all([email, code, new_password]):
+            return Response(
+                {'error': 'Email, code, and new password are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 1. Check code is still valid in Redis
+        stored_code = redis_client.get(f"reset_code:{email}")
+        if not stored_code or stored_code != code:
+            return Response(
+                {'error': 'Invalid or expired code.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 2. Check step 2 was completed (verified flag must exist)
+        verified = redis_client.get(f"reset_verified:{email}")
+        if not verified:
+            return Response(
+                {'error': 'Please verify your code first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 3. Get user
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # 4. Validate password strength
+        try:
+            validate_password(new_password, user)
+        except ValidationError as e:
+            return Response(
+                {'error': list(e.messages)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 5. Set new password
+        user.set_password(new_password)
+        user.save()
+
+        # 6. Clean up Redis — invalidate all keys (one-time use)
+        redis_client.delete(f"reset_code:{email}")
+        redis_client.delete(f"reset_verified:{email}")
+
+        logger.info(f"Password reset successful for {email}")
+
+        return Response(
+            {'message': 'Password reset successfully. You can now log in.'},
+            status=status.HTTP_200_OK,
+        )
 class LoginThrottle(AnonRateThrottle):
     """Custom throttle for login attempts"""
     rate = '5/minute'
@@ -141,17 +336,17 @@ def login_view(request):
         "role": "S"
     }
     """
-    username = request.data.get('username')
     password = request.data.get('password')
-    
-    if not username or not password:
+    email = request.data.get('email')
+
+    if not email or not password :
         return Response(
             {'error': 'Please provide both username and password'},
             status=status.HTTP_400_BAD_REQUEST
         )
     
     # Authenticate user
-    user = authenticate(username=username, password=password)
+    user = authenticate( email=email ,password=password)
     
     if user is None:
         return Response(
@@ -166,21 +361,22 @@ def login_view(request):
         )
     
     # Get or create token
-    token, created = Token.objects.get_or_create(user=user)
+    refresh = RefreshToken.for_user(user)
     
     return Response({
-        'token': token.key,
-        'user_id': user.id,
-        'username': user.username,
-        'email': user.email,
-        'role': user.role,
+        'access':     str(refresh.access_token),
+        'refresh':    str(refresh),
+        'user_id':    user.id,
+        'username':   user.username,
+        'email':      user.email,
+        'role':       user.role,
         'first_name': user.first_name,
-        'last_name': user.last_name,
-    }, status=status.HTTP_200_OK)
+        'last_name':  user.last_name,
+    },status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def logout_view(request):
     """
     Logout endpoint that deletes the user's token.

@@ -9,6 +9,8 @@ from django.utils import timezone
 from django.db.models import Count, Q
 from datetime import timedelta, datetime
 import logging
+from django.core.mail import send_mail
+from django.conf import settings
 from .models import (DrivingSchool, SchoolAnalytics, AutomatedMessage,
                       StudentProfile, CommunicationTemplate,Lesson)
 from .services import (
@@ -22,6 +24,38 @@ from .services import (
 )
 logger = logging.getLogger(__name__)
 
+
+# tasks.py  (add this alongside your existing tasks)
+
+
+@shared_task(name='send_reset_code_email', bind=True, max_retries=3)
+def send_reset_code_email(self, recipient_email: str, code: str, user_name: str = ''):
+    try:
+        send_mail(
+            subject='Your Password Reset Code — Driving School',
+            message=f'''
+Hello {user_name or 'there'},
+
+Your password reset verification code is:
+
+    {code}
+
+This code expires in 10 minutes. Do not share it with anyone.
+
+If you did not request this, ignore this email.
+
+Best regards,
+Driving School Team
+            '''.strip(),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[recipient_email],
+            fail_silently=False,
+        )
+        logger.info(f"✅ Reset code sent to {recipient_email}")
+        return {'success': True}
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=60)
+    
 # ========== ANALYTICS TASKS ==========
 
 @shared_task(name='generate_daily_analytics')
@@ -732,47 +766,3 @@ def retry_failed_messages(message_id):
 
 # tasks.py - Add this test task at the bottom
 
-@shared_task(name='test_email_task')
-def test_email_task(recipient_email):
-    """Simple test task to verify email sending works"""
-    from django.core.mail import send_mail
-    import logging
-    
-    logger = logging.getLogger(__name__)
-    
-    try:
-        result = send_mail(
-            subject='🚗 Driving School - Celery Test Email',
-            message='''
-            Hello!
-            
-            This is a TEST email from your Driving School Management System.
-            
-            If you receive this email, it means:
-            ✅ Celery worker is running
-            ✅ Email configuration is correct
-            ✅ Background tasks are working
-            
-            Time sent: {}
-            
-            Best regards,
-            Driving School System
-            '''.format(timezone.now()),
-            from_email='jamilothmane5@gmail.com',
-            recipient_list=[recipient_email],
-            fail_silently=False,
-        )
-        
-        logger.info(f"Test email sent successfully to {recipient_email}")
-        return {
-            'success': True,
-            'recipient': recipient_email,
-            'time': timezone.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to send test email: {str(e)}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
