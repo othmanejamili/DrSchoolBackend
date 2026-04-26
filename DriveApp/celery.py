@@ -1,6 +1,14 @@
 # your_project/celery.py
 
 
+# your_project/celery.py
+import ssl
+import certifi
+import os
+# Fix macOS SSL issue
+ssl._create_default_https_context = ssl.create_default_context
+os.environ.setdefault('SSL_CERT_FILE', certifi.where())
+
 import os
 from celery import Celery
 from celery.schedules import crontab
@@ -17,13 +25,7 @@ app.config_from_object('django.conf:settings', namespace='CELERY')
 # Auto-discover tasks from all installed apps
 app.autodiscover_tasks()
 
-# Periodic task schedule
-app.conf.beat_schedule = {
-    'test-every-minute': {
-        'task': 'test_email_task',
-        'schedule': crontab(minute='*/1'),  # Every minute for testing
-    },
-}
+
 
 app.conf.timezone = 'UTC'
 
@@ -32,6 +34,7 @@ app.conf.timezone = 'UTC'
 def debug_task(self):
     print(f'Request: {self.request!r}')
 
+app.conf.broker_connection_retry_on_startup = True
 
 
 
@@ -48,4 +51,4 @@ def debug_task(self):
 #celery -A DriveApp beat -l info
 
 # Run both together (development only)
-#celery -A your_project worker -B -l info
+#celery -A DriveApp worker -B -l info

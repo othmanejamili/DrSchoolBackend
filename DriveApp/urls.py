@@ -7,7 +7,8 @@ from .views import (UserViewSet, DrivingSchoolViewSet, StudentProfileViewSet,
                     ScheduleViewSet,AchievemtViewSet, CommunicationTemplateViewSet,
                     AutomatedMessageViewSet, SchoolAnalyticsViewSet, ReportViewSet,
                     DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet,
-                    StudentDocumentViewSet, login_view, logout_view, register_view, verify_token
+                    StudentDocumentViewSet, login_view, logout_view, register_view, verify_token,
+                    PasswordResetRequestView,PasswordResetVerifyView,PasswordResetConfirmView,
                 )
 
 router = DefaultRouter()
@@ -36,6 +37,9 @@ urlpatterns = [
     path('api/auth/logout/', logout_view, name='logout'),
     path('api/auth/register/', register_view, name='register'),
     path('api/auth/verify/', verify_token, name='verify-token'),
+    path('api/auth/password-reset/request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
+    path('api/auth/password-reset/verify/',  PasswordResetVerifyView.as_view(),  name='password-reset-verify'),
+    path('api/auth/password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
     path('api/', include(router.urls)), 
     path('api/drivingschool/<str:name>/', 
         DrivingSchoolViewSet.as_view({'get': 'retrieve'}),

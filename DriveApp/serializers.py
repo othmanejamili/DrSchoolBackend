@@ -20,6 +20,57 @@ from .services import (AnalyticsService, StudentProgressService, StudentProfileS
 import os
 import re
 from django.utils.text import slugify
+
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password
+
+User = get_user_model()
+
+
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        # Always return without revealing if email exists (security)
+        return value.lower().strip()
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, min_length=8)
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError({
+                'confirm_password': 'Passwords do not match.'
+            })
+        # Run Django's built-in password validators
+        validate_password(data['new_password'])
+        return data
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """For logged-in users who want to change their password"""
+    old_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True, min_length=8)
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate_old_password(self, value):
+        user = self.context['request'].user
+        if not user.check_password(value):
+            raise serializers.ValidationError('Old password is incorrect.')
+        return value
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError({
+                'confirm_password': 'Passwords do not match.'
+            })
+        validate_password(data['new_password'])
+        return data
+    
 # Serializer For Model User
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True,
