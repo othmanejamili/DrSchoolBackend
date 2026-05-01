@@ -25,6 +25,7 @@ from DriveApp.views import (UserViewSet, DrivingSchoolViewSet, StudentProfileVie
                             DashboardViewSet,SubscriptionPlanViewSet,SchoolSubscriptionViewSet,
                             StudentDocumentViewSet, login_view, logout_view, register_view, verify_token,
                             PasswordResetRequestView,PasswordResetVerifyView,PasswordResetConfirmView,
+                            RegisterView
                         )
 
 router = DefaultRouter()
@@ -51,7 +52,7 @@ urlpatterns = [
     # Authentication endpoints
     path('api/auth/login/', login_view, name='login'),
     path('api/auth/logout/', logout_view, name='logout'),
-    path('api/auth/register/', register_view, name='register'),
+    path('api/auth/register/', RegisterView.as_view(), name='register'),
     path('api/auth/verify/', verify_token, name='verify-token'),
     path('api/auth/password-reset/request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
     path('api/auth/password-reset/verify/',  PasswordResetVerifyView.as_view(),  name='password-reset-verify'),

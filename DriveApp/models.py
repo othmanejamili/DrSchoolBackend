@@ -12,11 +12,21 @@ class User(AbstractUser):
         ('S','Student'),
         ('I','Instructor')
     ]
+    VERIFICATION_STATUS = [
+        ('pending', 'Pending Review'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
     phone_validator = RegexValidator(
         regex=r'^\+?1?\d{9,15}$',
         message="Phone number must be entered in the format: '+999999999'. Up to 15 digits allowed."
         )
     role = models.CharField(max_length=1, choices=ROLE_CHOICES, blank=True, null=True)
+    verification_status = models.CharField(
+        max_length=20,
+        choices=VERIFICATION_STATUS,
+        default='pending'
+    )
     phone_number = models.CharField(max_length=16, blank=True, null=True, validators=[phone_validator])
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

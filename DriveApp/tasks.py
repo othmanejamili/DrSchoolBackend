@@ -56,6 +56,291 @@ Driving School Team
     except Exception as exc:
         raise self.retry(exc=exc, countdown=60)
     
+
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_approval_email(self, user_id, school_id):
+    """
+    Send approval email to school owner.
+    Retries up to 3 times with 60s delay if it fails.
+    """
+    from .models import User, DrivingSchool   # local import avoids circular imports
+ 
+    try:
+        user   = User.objects.get(id=user_id)
+        school = DrivingSchool.objects.select_related('subscriptions__plan').get(id=school_id)
+ 
+        login_url = f"{settings.FRONTEND_URL1}/login"
+ 
+        subject = f"🎉 Your school has been approved — {school.name}"
+ 
+        # Plain text fallback
+        plain_message = f"""
+Hi {user.first_name},
+ 
+Great news! Your driving school "{school.name}" has been approved on DriveSchool.
+ 
+You can now log in and start managing your school:
+{login_url}
+ 
+Your login credentials:
+  Email:    {user.email}
+  Password: The password you chose during registration
+ 
+What you can do now:
+  - Add instructors to your school
+  - Register students
+  - Track progress and sessions
+ 
+If you have any questions, reply to this email.
+ 
+Welcome aboard,
+The DriveSchool Team
+        """.strip()
+ 
+        # HTML email
+        html_message = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:40px 20px;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
+ 
+          <!-- Header -->
+          <tr>
+            <td style="background:#1d4ed8;padding:36px 40px;text-align:center;">
+              <div style="display:inline-flex;align-items:center;gap:10px;">
+                <span style="font-size:24px;font-weight:900;color:#ffffff;letter-spacing:-0.5px;">DriveSchool</span>
+              </div>
+            </td>
+          </tr>
+ 
+          <!-- Green approved banner -->
+          <tr>
+            <td style="background:#ecfdf5;border-bottom:1px solid #d1fae5;padding:24px 40px;text-align:center;">
+              <div style="font-size:40px;margin-bottom:8px;">🎉</div>
+              <h1 style="margin:0;font-size:22px;font-weight:800;color:#065f46;">Your school is approved!</h1>
+              <p style="margin:8px 0 0;font-size:14px;color:#6b7280;">{school.name} is now live on DriveSchool</p>
+            </td>
+          </tr>
+ 
+          <!-- Body -->
+          <tr>
+            <td style="padding:36px 40px;">
+              <p style="margin:0 0 20px;font-size:15px;color:#374151;line-height:1.6;">
+                Hi <strong>{user.first_name}</strong>,
+              </p>
+              <p style="margin:0 0 28px;font-size:15px;color:#374151;line-height:1.6;">
+                We've reviewed your application and your driving school has been approved.
+                You can now log in and start managing your school right away.
+              </p>
+ 
+              <!-- Login details box -->
+              <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px;margin-bottom:28px;">
+                <p style="margin:0 0 12px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9ca3af;">Your login details</p>
+                <table width="100%" cellpadding="4" cellspacing="0">
+                  <tr>
+                    <td style="font-size:13px;color:#6b7280;width:80px;">Email</td>
+                    <td style="font-size:13px;font-weight:600;color:#111827;">{user.email}</td>
+                  </tr>
+                  <tr>
+                    <td style="font-size:13px;color:#6b7280;">Password</td>
+                    <td style="font-size:13px;color:#6b7280;font-style:italic;">The password you chose at registration</td>
+                  </tr>
+                </table>
+              </div>
+ 
+              <!-- What's next -->
+              <p style="margin:0 0 16px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;">What you can do now</p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+                {''.join(f"""
+                <tr>
+                  <td style="padding:10px 0;border-bottom:1px solid #f1f5f9;">
+                    <table cellpadding="0" cellspacing="0">
+                      <tr>
+                        <td style="font-size:18px;width:36px;">{icon}</td>
+                        <td>
+                          <div style="font-size:14px;font-weight:600;color:#111827;">{title}</div>
+                          <div style="font-size:12px;color:#9ca3af;margin-top:2px;">{desc}</div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                """ for icon, title, desc in [
+                    ('👨‍🏫', 'Add instructors', 'Invite your team to the platform'),
+                    ('👨‍🎓', 'Register students', 'Start enrolling students right away'),
+                    ('📊', 'Track progress', 'Monitor sessions and performance'),
+                ])}
+              </table>
+ 
+              <!-- CTA button -->
+              <div style="text-align:center;">
+                <a href="{login_url}"
+                   style="display:inline-block;background:#1d4ed8;color:#ffffff;font-size:15px;font-weight:700;
+                          text-decoration:none;padding:14px 36px;border-radius:10px;letter-spacing:0.01em;">
+                  Log in to my school →
+                </a>
+              </div>
+            </td>
+          </tr>
+ 
+          <!-- Footer -->
+          <tr>
+            <td style="background:#f8fafc;border-top:1px solid #f1f5f9;padding:24px 40px;text-align:center;">
+              <p style="margin:0;font-size:12px;color:#9ca3af;">
+                Questions? Reply to this email or contact our support team.<br>
+                © 2025 DriveSchool. All rights reserved.
+              </p>
+            </td>
+          </tr>
+ 
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+        """.strip()
+ 
+        send_mail(
+            subject=subject,
+            message=plain_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+ 
+        logger.info(f"Approval email sent to {user.email} for school '{school.name}'")
+        return f"Approval email sent to {user.email}"
+ 
+    except Exception as exc:
+        logger.error(f"Failed to send approval email (user={user_id}): {exc}")
+        raise self.retry(exc=exc)
+ 
+ 
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_rejection_email(self, user_id, school_id, reason=""):
+    """
+    Send rejection email to school owner with optional reason.
+    Retries up to 3 times with 60s delay if it fails.
+    """
+    from .models import User, DrivingSchool
+ 
+    try:
+        user   = User.objects.get(id=user_id)
+        school = DrivingSchool.objects.get(id=school_id)
+ 
+        subject = f"Update on your DriveSchool application — {school.name}"
+ 
+        plain_message = f"""
+Hi {user.first_name},
+ 
+Thank you for applying to DriveSchool.
+ 
+After reviewing your application for "{school.name}", we're unable to approve it at this time.
+ 
+{"Reason: " + reason if reason else ""}
+ 
+If you believe this is a mistake or would like to reapply, please contact our support team
+by replying to this email.
+ 
+Best regards,
+The DriveSchool Team
+        """.strip()
+ 
+        reason_block = f"""
+        <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:16px 20px;margin-bottom:24px;">
+          <p style="margin:0 0 6px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#ef4444;">Reason</p>
+          <p style="margin:0;font-size:14px;color:#374151;">{reason}</p>
+        </div>
+        """ if reason else ""
+ 
+        html_message = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:40px 20px;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
+          <tr>
+            <td style="background:#1d4ed8;padding:36px 40px;text-align:center;">
+              <span style="font-size:24px;font-weight:900;color:#ffffff;">DriveSchool</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#fef9f9;border-bottom:1px solid #fecaca;padding:24px 40px;text-align:center;">
+              <div style="font-size:36px;margin-bottom:8px;">📋</div>
+              <h1 style="margin:0;font-size:20px;font-weight:800;color:#991b1b;">Application Update</h1>
+              <p style="margin:8px 0 0;font-size:14px;color:#6b7280;">{school.name}</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:36px 40px;">
+              <p style="margin:0 0 20px;font-size:15px;color:#374151;line-height:1.6;">
+                Hi <strong>{user.first_name}</strong>,
+              </p>
+              <p style="margin:0 0 24px;font-size:15px;color:#374151;line-height:1.6;">
+                Thank you for your interest in DriveSchool. After reviewing your application
+                for <strong>{school.name}</strong>, we're unable to approve it at this time.
+              </p>
+              {reason_block}
+              <p style="margin:0 0 28px;font-size:15px;color:#374151;line-height:1.6;">
+                If you believe this is a mistake or would like more information,
+                please reply to this email and our team will get back to you.
+              </p>
+              <div style="text-align:center;">
+                <a href="mailto:{settings.DEFAULT_FROM_EMAIL}"
+                   style="display:inline-block;background:#374151;color:#ffffff;font-size:14px;font-weight:700;
+                          text-decoration:none;padding:12px 28px;border-radius:10px;">
+                  Contact Support
+                </a>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#f8fafc;border-top:1px solid #f1f5f9;padding:20px 40px;text-align:center;">
+              <p style="margin:0;font-size:12px;color:#9ca3af;">© 2025 DriveSchool. All rights reserved.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+        """.strip()
+ 
+        send_mail(
+            subject=subject,
+            message=plain_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+ 
+        logger.info(f"Rejection email sent to {user.email} for school '{school.name}'")
+        return f"Rejection email sent to {user.email}"
+ 
+    except Exception as exc:
+        logger.error(f"Failed to send rejection email (user={user_id}): {exc}")
+        raise self.retry(exc=exc)
+ 
+
+
+
+
 # ========== ANALYTICS TASKS ==========
 
 @shared_task(name='generate_daily_analytics')
