@@ -27,7 +27,63 @@ from django.contrib.auth.password_validation import validate_password
 
 User = get_user_model()
 
-
+from rest_framework_simplejwt.tokens import RefreshToken
+ 
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(
+        write_only=True,
+        required=True,
+        min_length=8,
+        style={'input_type': 'password'},
+    )
+    confirm_password = serializers.CharField(write_only=True, required=True)
+ 
+    class Meta:
+        model = User
+        fields = [
+            'id', 'username', 'email', 'password', 'confirm_password',
+            'first_name', 'last_name', 'phone_number',
+        ]
+        extra_kwargs = {
+            'email': {
+                'required': True,
+                'error_messages': {'unique': 'This email is already registered.'},
+            },
+            'username': {
+                'min_length': 3,
+                'error_messages': {'unique': 'This username is already taken.'},
+            },
+            'first_name': {'required': True},
+            'last_name':  {'required': True},
+        }
+ 
+    def validate(self, attrs):
+        if attrs['password'] != attrs['confirm_password']:
+            raise serializers.ValidationError({'confirm_password': "Passwords don't match."})
+ 
+        # Run Django's built-in password validators
+        try:
+            validate_password(attrs['password'])
+        except DjangoValidationError as e:
+            raise serializers.ValidationError({'password': list(e.messages)})
+ 
+        return attrs
+ 
+    @transaction.atomic
+    def create(self, validated_data):
+        validated_data.pop('confirm_password')
+        password = validated_data.pop('password')
+ 
+        user = User(
+            **validated_data,
+            role='A',                        # School owner = Admin
+            is_active=False,                 # Locked until platform admin approves
+            verification_status='pending',   # Needs review
+        )
+        user.set_password(password)
+        user.save()
+        return user
+ 
 class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
 

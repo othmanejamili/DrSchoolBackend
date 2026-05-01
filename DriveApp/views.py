@@ -2,7 +2,7 @@ from django.shortcuts import render
 from rest_framework import viewsets, status, permissions, filters
 from rest_framework.response import Response
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from .models import (User, DrivingSchool, StudentProfile, Lesson, 
@@ -11,7 +11,7 @@ from .models import (User, DrivingSchool, StudentProfile, Lesson,
                      SchoolAnalytics,SubscriptionPlan,SchoolSubscription,StudentDocument)
 from .serializers import (UserSerializer, DrivingSchoolSerializer, ScheduleSerializer, VehicleSerializer,
                           VehiclePictureSerializer,StudentProfileSerializer, LessonSerializer,AttendanceSerializer,
-                          FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer, 
+                          FeedbackSerializer, AchievementSerializer, CommunicationTemplateSerializer,RegisterSerializer,
                           AutomatedMessageSerializer, SchoolAnalyticsSerializer,SubscriptionPlanSerializer,
                           SchoolSubscriptionSerializer, StudentDocumentSerializer, StudentDocumentUploadSerializer)
 from .permissions import (IsPlatformAdmin, IsInstructor, CanUpdateStudentProfile,
@@ -129,8 +129,10 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.db import transaction
 from .tasks import send_reset_code_email
+from rest_framework import serializers
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -150,6 +152,101 @@ def _generate_code(length=6) -> str:
     """Generate a 6-digit numeric OTP"""
     return ''.join(random.choices(string.digits, k=length))
 
+
+class RegisterView(APIView):
+    """
+    Public endpoint — creates User + DrivingSchool + SchoolSubscription atomically.
+ 
+    Expected request body:
+    {
+        "first_name":    "Jane",
+        "last_name":     "Doe",
+        "username":      "janedoe",
+        "email":         "jane@example.com",
+        "password":      "secret123",
+        "confirm_password": "secret123",
+        "school_name":   "City Drive Academy",
+        "school_address":"123 Main St",
+        "school_email":  "contact@school.com",
+        "school_phone":  "+212600000000",
+        "plan_id":       1
+    }
+ 
+    Result:
+        - User:               role='A', is_active=False, verification_status='pending'
+        - DrivingSchool:      linked to user as owner
+        - SchoolSubscription: status='trialing', pending admin approval
+ 
+    No tokens returned — account cannot log in until admin approves.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+ 
+    @transaction.atomic
+    def post(self, request):
+        data = request.data
+ 
+        # ── 1. Validate and create user ──────────────────────────────────────
+        user_serializer = RegisterSerializer(
+            data={
+                'first_name':      data.get('first_name', ''),
+                'last_name':       data.get('last_name', ''),
+                'username':        data.get('username', ''),
+                'email':           data.get('email', ''),
+                'password':        data.get('password', ''),
+                'confirm_password':data.get('confirm_password', ''),
+            },
+            context={'request': request},
+        )
+        if not user_serializer.is_valid():
+            return Response(user_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+ 
+        user = user_serializer.save()   # is_active=False, role='A', verification_status='pending'
+ 
+        # ── 2. Validate plan exists ──────────────────────────────────────────
+        plan_id = data.get('plan_id')
+        if not plan_id:
+            raise serializers.ValidationError({'plan_id': 'A subscription plan is required.'})
+ 
+        try:
+            plan = SubscriptionPlan.objects.get(id=plan_id, is_active=True)
+        except SubscriptionPlan.DoesNotExist:
+            return Response(
+                {'plan_id': 'Invalid or inactive subscription plan.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+ 
+        # ── 3. Create driving school ─────────────────────────────────────────
+        school_data = {
+            'name':         data.get('school_name', ''),
+            'address':      data.get('school_address', ''),
+            'email':        data.get('school_email', ''),
+            'phone_number': data.get('school_phone', ''),
+        }
+        missing = [k for k, v in school_data.items() if not str(v).strip()]
+        if missing:
+            return Response(
+                {f'school_{k}': 'This field is required.' for k in missing},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+ 
+        school = DrivingSchool.objects.create(owner=user, **school_data)
+ 
+        # ── 4. Create subscription (trialing — locked until admin approves) ──
+        now = timezone.now()
+        SchoolSubscription.objects.create(
+            school=school,
+            plan=plan,
+            status='trialing',
+            current_period_start=now,
+            current_period_end=now + timedelta(days=plan.duration_days),
+        )
+ 
+        return Response({
+            'message': 'Registration submitted. You will receive an email once your account is approved.',
+            'email':   user.email,
+        }, status=status.HTTP_201_CREATED)
+ 
 
 # ─────────────────────────────────────────────
 # STEP 1 — Request reset code
@@ -12221,7 +12318,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         user = self.request.user
         
         if not user.is_authenticated:
-            return SubscriptionPlan.objects.none()
+            return SubscriptionPlan.objects.all()
                 
                 
         # Generate cache key
@@ -12258,9 +12355,9 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         
         elif self.action in ['list', 'retrieve', 'popular_plans', 'compare_plans', 'recommended_plan']:
             # Authenticated users can view plans
-            return [IsAuthenticated()]
+            return [AllowAny()]
         
-        return [IsAuthenticated()]
+        return [AllowAny()]
     
     def perform_create(self, serializer):
         """
@@ -12386,31 +12483,31 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        @action(detail=True, methods=['post'])
-        def deactivate(self, request, pk=None):
-            """
-            Deactivate a subscription plan.
-            Only possible if no active subscriptions exist.
-            """
-            plan = self.get_object()
+    @action(detail=True, methods=['post'])
+    def deactivate(self, request, pk=None):
+        """
+        Deactivate a subscription plan.
+        Only possible if no active subscriptions exist.
+        """
+        plan = self.get_object()
             
-            if not SubscriptionPlanService.can_deactivate_plan(plan):
-                return Response(
-                    {'error': 'Cannot deactivate plan with active subscriptions'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        if not SubscriptionPlanService.can_deactivate_plan(plan):
+            return Response(
+                {'error': 'Cannot deactivate plan with active subscriptions'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
             
-            plan.is_active = False
-            plan.save()
-            
-            return Response({
-                'message': f'Plan "{plan.name}" deactivated successfully',
-                'plan_id': plan.id,
-                'status': 'inactive'
-            })
+        plan.is_active = False
+        plan.save()
         
-        @action(detail=True, methods=['post'])
-        def activate(self, request, pk=None):
+        return Response({
+            'message': f'Plan "{plan.name}" deactivated successfully',
+            'plan_id': plan.id,
+            'status': 'inactive'
+        })
+        
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
             """
             Activate a subscription plan.
             """
@@ -12424,8 +12521,8 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
                 'status': 'active'
             })
         
-        @action(detail=True, methods=['get'])
-        def statistics(self, request, pk=None):
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
             """
             Get detailed statistics for a subscription plan.
             """
@@ -12437,8 +12534,8 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
                 'statistics': stats
             })
         
-        @action(detail=False, methods=['get'])
-        def active_plans(self, request):
+    @action(detail=False, methods=['get'])
+    def active_plans(self, request):
             """
             Get all active subscription plans.
             """
@@ -12446,8 +12543,8 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(active_plans, many=True)
             return Response(serializer.data)
         
-        @action(detail=False, methods=['get'])
-        def pricing_tiers(self, request):
+    @action(detail=False, methods=['get'])
+    def pricing_tiers(self, request):
             """
             Get plans grouped by pricing tiers.
             """
