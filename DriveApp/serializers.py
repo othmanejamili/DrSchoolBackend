@@ -340,13 +340,10 @@ class StudentProfileSerializer(serializers.ModelSerializer):
         return attrs
     
     def validate_user(self, value):
-
-        if value.role != 'S':
-            raise serializers.ValidationError("Selected user must have student role")
-        
-        if self.instance and value != self.instance.user :
+        if value.role not in ('S', 'I'):   # allow both
+            raise serializers.ValidationError("User must be a student or instructor")
+        if self.instance and value != self.instance.user:
             raise serializers.ValidationError("Cannot change the user of an existing profile")
-        
         return value
     
     def validate_school(self, value):
