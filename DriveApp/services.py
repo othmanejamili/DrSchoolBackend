@@ -47,8 +47,8 @@ class StudentProfileService:
             raise serializers.ValidationError({'user': 'Authentication required'})
         
         # Check user role
-        if user.role != 'S':
-            raise serializers.ValidationError({'user': 'Selected user must have student role'})
+        if user.role not in ('S', 'I'):
+            raise serializers.ValidationError({'user': 'Selected user must have student or instructor role'})
         
         # Check for existing enrollment
         if StudentProfile.objects.filter(user=user, school=school).exists():
