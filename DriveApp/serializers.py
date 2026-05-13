@@ -301,6 +301,7 @@ class StudentProfileSerializer(serializers.ModelSerializer):
     user_username = serializers.CharField(source='user.username', read_only=True)
     user_email = serializers.CharField(source='user.email', read_only=True)
     school_name = serializers.CharField(source='school.name', read_only=True)
+    user_role     = serializers.CharField(source='user.role',  read_only=True) 
     picture_profile = serializers.ImageField(required=False,allow_null=True)
     picture_profile_url = serializers.SerializerMethodField( read_only=True)
     completion_percentage = serializers.SerializerMethodField(read_only=True)
@@ -311,7 +312,7 @@ class StudentProfileSerializer(serializers.ModelSerializer):
                   'progress_theory','progress_driving','total_hours_theory',
                   'total_hours_driving','status','theory_start_date','driving_start_date',
                   'completion_date','joined_at','user_username','school_name',
-                  'picture_profile_url','completion_percentage','user_email']
+                  'picture_profile_url','completion_percentage','user_email','user_role']
         
         read_only_fields = ['id','joined_at','user_username','school_name','picture_profile_url',
                             'user_email','completion_percentage']

@@ -1380,7 +1380,7 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         elif self.action in ['update', 'partial_update']:
             return [IsAuthenticated(), CanUpdateStudentProfile()]
         elif self.action == 'destroy':
-            return [IsAuthenticated(), IsPlatformAdmin()]
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action == 'update_progress':
             return [IsAuthenticated(), IsInstructor()]
         return [IsAuthenticated()]
