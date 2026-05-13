@@ -752,14 +752,9 @@ class UserViewSet(viewsets.ModelViewSet):
             throttle_classes=[RegisterStudentThrottle])
     @transaction.atomic
     def register_student(self, request):
-        """
-        Endpoint for admins to register students.
-        Rate limited to prevent abuse.
-        Students must be assigned to a driving school during registration.
-        """
         data = request.data.copy()
-        data['role'] = 'S'
-        
+        data['role'] = request.data.get('role', 'S')
+
         # Validate driving school
         school_id = data.get('driving_school_id')
         if not school_id:
@@ -776,62 +771,53 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        user = request.user
-        
+        requesting_user = request.user
+
         # Authorization check
-        if user.role != 'A':
-            if not hasattr(user, 'student_profiles'):
-                return Response(
-                    {'error': 'You can only register students for your own school'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            
-            user_profile = user.student_profiles.filter(status='A').first()
+        if requesting_user.role != 'A':
+            user_profile = requesting_user.student_profiles.filter(status='A').first()
             if not user_profile or user_profile.school != school:
                 return Response(
                     {'error': 'You can only register students for your own school'},
                     status=status.HTTP_403_FORBIDDEN
                 )
-        
-        # Check subscription limits (cached to reduce DB queries)
+
+        # Check subscription limits
         cache_key = f'school_{school_id}_student_count'
         current_students = cache.get(cache_key)
-        
         if current_students is None:
             current_students = school.student_profiles.filter(
                 status='A', user__role='S'
             ).count()
-            cache.set(cache_key, current_students, 60 * 5)  # Cache for 5 minutes
-        
+            cache.set(cache_key, current_students, 60 * 5)
+
         if hasattr(school, 'subscriptions'):
             subscription = school.subscriptions
             if current_students >= subscription.plan.max_students:
                 return Response(
-                    {
-                        'error': f'This school has reached its student limit '
-                                f'({subscription.plan.max_students} students maximum). '
-                                f'Current: {current_students} students.'
-                    },
+                    {'error': f'Student limit reached ({subscription.plan.max_students} max, currently {current_students}).'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-        
-        # Create user
+
+        # Create the user
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        
-        # Create student profile
+        new_user = serializer.save()
+
+        # Create profile ONCE, with all optional fields
         StudentProfile.objects.create(
-            user=user,
+            user=new_user,
             school=school,
             joined_at=timezone.now(),
-            status='A'
+            status='A',
+            license_type=data.get('license_type') or None,
+            theory_start_date=data.get('theory_start_date') or None,
+            driving_start_date=data.get('driving_start_date') or None,
         )
-        
-        # Invalidate caches
-        invalidate_user_caches(user.id)
-        cache.delete(cache_key)  # Invalidate student count cache
-        
+
+        invalidate_user_caches(new_user.id)
+        cache.delete(cache_key)
+
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'], 
@@ -858,7 +844,7 @@ class UserViewSet(viewsets.ModelViewSet):
         role_filter = request.query_params.get('role')
         
         # Authorization check
-        if user.role not in ['A', 'I']:
+        if user.role not in ['A', 'I'] and not (user.role == 'A'):
             return Response(
                 {'error': 'Only instructors and admins can view school users'},
                 status=status.HTTP_403_FORBIDDEN
@@ -1380,7 +1366,7 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         elif self.action in ['update', 'partial_update']:
             return [IsAuthenticated(), CanUpdateStudentProfile()]
         elif self.action == 'destroy':
-            return [IsAuthenticated(), IsPlatformAdmin()]
+            return [IsAuthenticated(), IsPlatformAdminOrSchoolOwner()]
         elif self.action == 'update_progress':
             return [IsAuthenticated(), IsInstructor()]
         return [IsAuthenticated()]
