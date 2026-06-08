@@ -80,23 +80,32 @@ class DrivingSchool(models.Model):
     
 #This Model For Table Student Profile
 class StudentProfile(models.Model):
-    LICENSE_TYPES = [
-        ('C','Car'),
-        ('M','Moto')
-    ]
+    LICENSE_TYPES = [('C', 'Car'), ('M', 'Moto')]
     STATUS_CHOICES = [
         ('A', 'Active'),
         ('C', 'Completed'),
         ('P', 'Paused'),
     ]
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='student_profiles')
     school = models.ForeignKey(DrivingSchool, on_delete=models.CASCADE, related_name='student_profiles')
-    picture_profile = models.ImageField(upload_to='student_profiles/', blank=True, null=True)
+    # ✅ folder kwarg controls upload path; blank/null makes it optional
+    picture_profile = CloudinaryField(
+        'image',
+        folder='student_profiles',
+        blank=True,
+        null=True,
+    )
     license_type = models.CharField(max_length=1, choices=LICENSE_TYPES, blank=True, null=True, db_index=True)
-    progress_theory = models.DecimalField(max_digits=5, default=0, decimal_places=2, validators=[MinValueValidator(0), MaxValueValidator(100)])
-    progress_driving = models.DecimalField(max_digits=5,default=0 , decimal_places=2, validators=[MinValueValidator(0), MaxValueValidator(100)])
-    total_hours_theory = models.FloatField(default=0, validators=[MinValueValidator(0), MaxValueValidator(1000)])
-    total_hours_driving = models.FloatField(default=0, validators=[MinValueValidator(0), MaxValueValidator(1000)])
+    progress_theory = models.DecimalField(max_digits=5, decimal_places=2, default=0,
+                                          validators=[MinValueValidator(0), MaxValueValidator(100)])
+    progress_driving = models.DecimalField(max_digits=5, decimal_places=2, default=0,
+                                           validators=[MinValueValidator(0), MaxValueValidator(100)])
+    # ✅ DecimalField instead of FloatField for precision
+    total_hours_theory = models.DecimalField(max_digits=7, decimal_places=2, default=0,
+                                             validators=[MinValueValidator(0), MaxValueValidator(1000)])
+    total_hours_driving = models.DecimalField(max_digits=7, decimal_places=2, default=0,
+                                              validators=[MinValueValidator(0), MaxValueValidator(1000)])
     status = models.CharField(max_length=1, choices=STATUS_CHOICES, default='A', db_index=True)
     theory_start_date = models.DateField(blank=True, null=True)
     driving_start_date = models.DateField(blank=True, null=True)
@@ -104,15 +113,32 @@ class StudentProfile(models.Model):
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        verbose_name = "Student Profile"
+        verbose_name_plural = "Student Profiles"  # ✅ typo fixed
         indexes = [
             models.Index(fields=['school', 'status']),
         ]
 
     def __str__(self):
         return f"{self.user.username} - {self.school.name}"
+
+    def _build_url(self, **transform_options):
+        """Base helper — avoids repeating the public_id lookup."""
+        if not self.picture_profile:
+            return None
+        return cloudinary.CloudinaryImage(self.picture_profile.public_id).build_url(
+            fetch_format='auto',
+            **transform_options,
+        )
+
+    def get_thumbnail_url(self, width=300, height=200):
+        return self._build_url(width=width, height=height, crop='fill', quality='auto:good')
+
+    def get_optimized_url(self, width=1200):
+        return self._build_url(width=width, crop='limit', quality='auto:best')
     
 
-#This Model For Table Lesson
+# Add these two fields to Lesson model
 class Lesson(models.Model):
     LESSON_TYPES = [
         ('T','Theory'),
@@ -132,6 +158,17 @@ class Lesson(models.Model):
     duration = models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(480)])
     date = models.DateTimeField()
     status = models.CharField(max_length=1, choices=STATUS_CHOICES, default='S', db_index=True)
+    
+    # NEW FIELDS
+    target_license_type = models.CharField(
+        max_length=1,
+        choices=[('C', 'Car'), ('M', 'Moto'), ('A', 'All')],
+        default='A'
+    )
+    max_students = models.PositiveIntegerField(
+        default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(30)]
+    )
 
     class Meta:
         indexes = [
@@ -140,6 +177,36 @@ class Lesson(models.Model):
 
     def __str__(self):
         return f"{self.instructor.username} - {self.school.name}"
+
+
+# NEW MODEL — add after Lesson, before Attendance
+class Enrollment(models.Model):
+    student = models.ForeignKey(
+        StudentProfile,
+        on_delete=models.CASCADE,
+        related_name='enrollments'
+    )
+    lesson = models.ForeignKey(
+        Lesson,
+        on_delete=models.CASCADE,
+        related_name='enrollments'
+    )
+    enrolled_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['student', 'lesson'],
+                name='unique_student_lesson_enrollment'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['student', 'lesson']),
+        ]
+        ordering = ['-enrolled_at']
+
+    def __str__(self):
+        return f"{self.student.user.username} → {self.lesson.title}"
 
 #This Model For Table Attendance
 class Attendance(models.Model):

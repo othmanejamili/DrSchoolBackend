@@ -157,14 +157,14 @@ DATABASES = {
 # CORS Settings
 CORS_ALLOWED_ORIGINS = os.getenv(
     'CORS_ALLOWED_ORIGINS',
-    'https://drive-oj.vercel.app,http://127.0.0.1:5173'  # string, not tuple
+    'http://localhost:5173,http://127.0.0.1:5173'  # string, not tuple
 ).split(',')
 
 CORS_ALLOW_CREDENTIALS = True
 
 # Frontend URL (used in reset link)
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://127.0.0.1:5173')
-FRONTEND_URL1 = os.getenv('FRONTEND_URL1', 'https://drive-oj.vercel.app/')
+FRONTEND_URL1 = os.getenv('FRONTEND_URL1', 'http://localhost:5173')
 # Redis config (separate DB from Celery broker)
 REDIS_HOST = os.getenv('REDIS_HOST', '127.0.0.1')
 REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
