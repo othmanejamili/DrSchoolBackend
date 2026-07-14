@@ -22,7 +22,7 @@ __pycache__/
 db.sqlite3
 /media/
 /staticfiles/
-/logs/
+logs
 
 *.http
 # IDE / OS
