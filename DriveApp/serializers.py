@@ -303,7 +303,10 @@ class StudentProfileSerializer(serializers.ModelSerializer):
     user_email = serializers.CharField(source='user.email', read_only=True)
     user_role = serializers.CharField(source='user.role', read_only=True)
     school_name = serializers.CharField(source='school.name', read_only=True)
-    picture_profile_url = serializers.SerializerMethodField(read_only=True)
+    user_role     = serializers.CharField(source='user.role',  read_only=True) 
+    picture_profile = serializers.ImageField(required=False,allow_null=True)
+    picture_profile_url = serializers.SerializerMethodField( read_only=True)
+
     completion_percentage = serializers.SerializerMethodField(read_only=True)
     user_first_name = serializers.CharField(source='user.first_name', read_only=True)  
     user_last_name = serializers.CharField(source='user.last_name', read_only=True)
@@ -314,18 +317,16 @@ class StudentProfileSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StudentProfile
-        fields = [
-            'id', 'user', 'school', 'picture_profile', 'license_type',
-            'progress_theory', 'progress_driving', 'total_hours_theory',
-            'total_hours_driving', 'status', 'theory_start_date', 'driving_start_date',
-            'completion_date', 'joined_at', 'user_username', 'school_name', 'user_role',
-            'picture_profile_url', 'completion_percentage', 'user_email','user_first_name',
-            'user_last_name','user_phone_number'
-        ]
-        read_only_fields = [
-            'id', 'joined_at', 'user_username', 'school_name',
-            'picture_profile_url', 'user_email', 'completion_percentage'
-        ]
+        fields = ['id','user','school','picture_profile','license_type',
+                  'progress_theory','progress_driving','total_hours_theory',
+                  'total_hours_driving','status','theory_start_date','driving_start_date',
+                  'completion_date','joined_at','user_username','school_name',
+                  'picture_profile_url','completion_percentage','user_email','user_role']
+        
+        read_only_fields = ['id','joined_at','user_username','school_name','picture_profile_url',
+                            'user_email','completion_percentage']
+
+
 
     def get_picture_profile_url(self, obj):
         return StudentProfileService.get_profile_picture_url(obj)
