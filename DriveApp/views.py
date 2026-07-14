@@ -1533,11 +1533,7 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         """
         user = request.user
         
-        if user.role != 'S':
-            return Response(
-                {'error': 'Only students have student profiles'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+
         
         # Try cache first
         cache_key = f'student_profile_user_{user.id}'
@@ -4197,10 +4193,11 @@ class ScheduleViewSet(viewsets.ModelViewSet):
             queryset = Schedule.objects.filter(instructor=user)
         
         elif user.role == 'S':
-            # Student sees schedules in their school
+            # Student sees only schedules for lessons they're enrolled in
             student_profile = user.student_profiles.filter(status='A').first()
             if student_profile:
-                queryset = Schedule.objects.filter(lesson__school=student_profile.school)
+                enrolled_lesson_ids = student_profile.enrollments.values_list('lesson_id', flat=True)
+                queryset = Schedule.objects.filter(lesson_id__in=enrolled_lesson_ids)
             else:
                 queryset = Schedule.objects.none()
         else:

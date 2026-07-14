@@ -307,6 +307,7 @@ class StudentProfileSerializer(serializers.ModelSerializer):
     completion_percentage = serializers.SerializerMethodField(read_only=True)
     user_first_name = serializers.CharField(source='user.first_name', read_only=True)  
     user_last_name = serializers.CharField(source='user.last_name', read_only=True)
+    user_phone_number = serializers.CharField(source='user.phone_number', read_only=True)
     # ✅ Use CharField for reads; upload is handled in the service
     # CloudinaryField stores a string (public_id), not a file object after save
     picture_profile = serializers.ImageField(required=False, allow_null=True, write_only=True)
@@ -319,7 +320,7 @@ class StudentProfileSerializer(serializers.ModelSerializer):
             'total_hours_driving', 'status', 'theory_start_date', 'driving_start_date',
             'completion_date', 'joined_at', 'user_username', 'school_name', 'user_role',
             'picture_profile_url', 'completion_percentage', 'user_email','user_first_name',
-            'user_last_name'
+            'user_last_name','user_phone_number'
         ]
         read_only_fields = [
             'id', 'joined_at', 'user_username', 'school_name',
@@ -369,6 +370,7 @@ class StudentProfileSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def update(self, instance, validated_data):
         return StudentProfileService.update_student_profile(instance, validated_data)
+
 #This Serializer For Model Lesson
 class LessonSerializer(serializers.ModelSerializer):
     """Serializer for Lesson model"""
@@ -953,12 +955,13 @@ class AchievementSerializer(serializers.ModelSerializer):
     student_name = serializers.CharField(source='student.user.username', read_only=True)
     student_email = serializers.CharField(source='student.user.email', read_only=True)
     school_name = serializers.CharField(source='student.school.name', read_only=True)
+    student_role = serializers.CharField(source='student.user.role', read_only=True)
 
     class Meta:
         model = Achievement
         fields = [
             'id', 'student', 'student_name', 'student_email', 'school_name',
-            'type', 'title', 'description', 'icon', 'earned_at', 'points'
+            'type', 'title', 'description', 'icon', 'earned_at', 'points','student_role',
         ]
         read_only_fields = [
             'id', 'student_name', 'student_email', 'school_name', 'earned_at'
