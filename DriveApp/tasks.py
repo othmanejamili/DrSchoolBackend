@@ -61,45 +61,62 @@ Driving School Team
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def send_approval_email(self, user_id, school_id):
-    """
-    Send approval email to school owner.
-    Retries up to 3 times with 60s delay if it fails.
-    """
-    from .models import User, DrivingSchool   # local import avoids circular imports
- 
+    from .models import User, DrivingSchool
+
     try:
         user   = User.objects.get(id=user_id)
         school = DrivingSchool.objects.select_related('subscriptions__plan').get(id=school_id)
- 
+
         login_url = f"{settings.FRONTEND_URL1}/login"
- 
-        subject = f"🎉 Your school has been approved — {school.name}"
- 
-        # Plain text fallback
+        subject   = f"🎉 Your school has been approved — {school.name}"
+
         plain_message = f"""
 Hi {user.first_name},
- 
+
 Great news! Your driving school "{school.name}" has been approved on DriveSchool.
- 
+
 You can now log in and start managing your school:
 {login_url}
- 
+
 Your login credentials:
   Email:    {user.email}
   Password: The password you chose during registration
- 
+
 What you can do now:
   - Add instructors to your school
   - Register students
   - Track progress and sessions
- 
+
 If you have any questions, reply to this email.
- 
+
 Welcome aboard,
 The DriveSchool Team
         """.strip()
- 
-        # HTML email
+
+        # ✅ Build rows before the outer f-string
+        next_steps_rows = ''.join(
+            f"""
+            <tr>
+              <td style="padding:10px 0;border-bottom:1px solid #f1f5f9;">
+                <table cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td style="font-size:18px;width:36px;">{icon}</td>
+                    <td>
+                      <div style="font-size:14px;font-weight:600;color:#111827;">{title}</div>
+                      <div style="font-size:12px;color:#9ca3af;margin-top:2px;">{desc}</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            """
+            for icon, title, desc in [
+                ('👨‍🏫', 'Add instructors',   'Invite your team to the platform'),
+                ('👨‍🎓', 'Register students', 'Start enrolling students right away'),
+                ('📊',   'Track progress',    'Monitor sessions and performance'),
+            ]
+        )
+
         html_message = f"""
 <!DOCTYPE html>
 <html>
@@ -112,17 +129,15 @@ The DriveSchool Team
     <tr>
       <td align="center">
         <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
- 
+
           <!-- Header -->
           <tr>
             <td style="background:#1d4ed8;padding:36px 40px;text-align:center;">
-              <div style="display:inline-flex;align-items:center;gap:10px;">
-                <span style="font-size:24px;font-weight:900;color:#ffffff;letter-spacing:-0.5px;">DriveSchool</span>
-              </div>
+              <span style="font-size:24px;font-weight:900;color:#ffffff;letter-spacing:-0.5px;">DriveSchool</span>
             </td>
           </tr>
- 
-          <!-- Green approved banner -->
+
+          <!-- Approved banner -->
           <tr>
             <td style="background:#ecfdf5;border-bottom:1px solid #d1fae5;padding:24px 40px;text-align:center;">
               <div style="font-size:40px;margin-bottom:8px;">🎉</div>
@@ -130,7 +145,7 @@ The DriveSchool Team
               <p style="margin:8px 0 0;font-size:14px;color:#6b7280;">{school.name} is now live on DriveSchool</p>
             </td>
           </tr>
- 
+
           <!-- Body -->
           <tr>
             <td style="padding:36px 40px;">
@@ -141,8 +156,8 @@ The DriveSchool Team
                 We've reviewed your application and your driving school has been approved.
                 You can now log in and start managing your school right away.
               </p>
- 
-              <!-- Login details box -->
+
+              <!-- Login details -->
               <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px;margin-bottom:28px;">
                 <p style="margin:0 0 12px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9ca3af;">Your login details</p>
                 <table width="100%" cellpadding="4" cellspacing="0">
@@ -156,32 +171,14 @@ The DriveSchool Team
                   </tr>
                 </table>
               </div>
- 
+
               <!-- What's next -->
               <p style="margin:0 0 16px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;">What you can do now</p>
               <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-                {''.join(f"""
-                <tr>
-                  <td style="padding:10px 0;border-bottom:1px solid #f1f5f9;">
-                    <table cellpadding="0" cellspacing="0">
-                      <tr>
-                        <td style="font-size:18px;width:36px;">{icon}</td>
-                        <td>
-                          <div style="font-size:14px;font-weight:600;color:#111827;">{title}</div>
-                          <div style="font-size:12px;color:#9ca3af;margin-top:2px;">{desc}</div>
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-                """ for icon, title, desc in [
-                    ('👨‍🏫', 'Add instructors', 'Invite your team to the platform'),
-                    ('👨‍🎓', 'Register students', 'Start enrolling students right away'),
-                    ('📊', 'Track progress', 'Monitor sessions and performance'),
-                ])}
+                {next_steps_rows}
               </table>
- 
-              <!-- CTA button -->
+
+              <!-- CTA -->
               <div style="text-align:center;">
                 <a href="{login_url}"
                    style="display:inline-block;background:#1d4ed8;color:#ffffff;font-size:15px;font-weight:700;
@@ -191,7 +188,7 @@ The DriveSchool Team
               </div>
             </td>
           </tr>
- 
+
           <!-- Footer -->
           <tr>
             <td style="background:#f8fafc;border-top:1px solid #f1f5f9;padding:24px 40px;text-align:center;">
@@ -201,7 +198,7 @@ The DriveSchool Team
               </p>
             </td>
           </tr>
- 
+
         </table>
       </td>
     </tr>
@@ -209,7 +206,7 @@ The DriveSchool Team
 </body>
 </html>
         """.strip()
- 
+
         send_mail(
             subject=subject,
             message=plain_message,
@@ -218,14 +215,13 @@ The DriveSchool Team
             html_message=html_message,
             fail_silently=False,
         )
- 
+
         logger.info(f"Approval email sent to {user.email} for school '{school.name}'")
         return f"Approval email sent to {user.email}"
- 
+
     except Exception as exc:
         logger.error(f"Failed to send approval email (user={user_id}): {exc}")
         raise self.retry(exc=exc)
- 
  
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def send_rejection_email(self, user_id, school_id, reason=""):

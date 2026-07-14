@@ -24,6 +24,7 @@ from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from cloudinary.forms import CloudinaryFileField
 
 User = get_user_model()
 
@@ -105,7 +106,6 @@ class ResetPasswordSerializer(serializers.Serializer):
         # Run Django's built-in password validators
         validate_password(data['new_password'])
         return data
-
 
 class ChangePasswordSerializer(serializers.Serializer):
     """For logged-in users who want to change their password"""
@@ -297,14 +297,23 @@ class DrivingSchoolSerializer(serializers.ModelSerializer):
         return instance
     
 #This Serializer For Model Student Profile
+
 class StudentProfileSerializer(serializers.ModelSerializer):
     user_username = serializers.CharField(source='user.username', read_only=True)
     user_email = serializers.CharField(source='user.email', read_only=True)
+    user_role = serializers.CharField(source='user.role', read_only=True)
     school_name = serializers.CharField(source='school.name', read_only=True)
     user_role     = serializers.CharField(source='user.role',  read_only=True) 
     picture_profile = serializers.ImageField(required=False,allow_null=True)
     picture_profile_url = serializers.SerializerMethodField( read_only=True)
+
     completion_percentage = serializers.SerializerMethodField(read_only=True)
+    user_first_name = serializers.CharField(source='user.first_name', read_only=True)  
+    user_last_name = serializers.CharField(source='user.last_name', read_only=True)
+    user_phone_number = serializers.CharField(source='user.phone_number', read_only=True)
+    # ✅ Use CharField for reads; upload is handled in the service
+    # CloudinaryField stores a string (public_id), not a file object after save
+    picture_profile = serializers.ImageField(required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = StudentProfile
@@ -318,53 +327,50 @@ class StudentProfileSerializer(serializers.ModelSerializer):
                             'user_email','completion_percentage']
 
 
+
     def get_picture_profile_url(self, obj):
-        """Get full URL for profile picture"""
-        return StudentProfileService.get_profile_picture_url(obj, self.context.get('request'))
-        
+        return StudentProfileService.get_profile_picture_url(obj)
+
     def get_completion_percentage(self, obj):
         return StudentProfileService.calculate_completion_percentage(obj)
-    
+
+    def validate_user(self, value):
+        if value.role not in ('S', 'I'):
+            raise serializers.ValidationError("User must be a student or instructor")
+        if self.instance and value != self.instance.user:
+            raise serializers.ValidationError("Cannot change the user of an existing profile")
+        return value
+
+    def validate_school(self, value):
+        # ✅ Only validate school change on updates, not creation
+        # On creation there's no instance to compare against
+        if self.instance:
+            request = self.context.get('request')
+            StudentProfileService.validate_school_change(
+                value, self.instance, request.user if request else None
+            )
+        return value
+
     def validate(self, attrs):
         request = self.context.get('request')
-        user = attrs.get('user')
-        school = attrs.get('school')
+        request_user = request.user if request else None
 
-        # Use StudentProfileService for validation
-        if self.instance is None: #Creation
-            StudentProfileService.validate_student_creation(user, school, request.user if request else None)
-        else:
-            if school: # update
-                StudentProfileService.validate_school_change(school, self.instance, request.user if request else None)
+        if self.instance is None:
+            StudentProfileService.validate_student_creation(
+                attrs.get('user'), attrs.get('school'), request_user
+            )
+        
         StudentProfileService.validate_student_data(attrs, self.instance)
-
         return attrs
-    
-    def validate_user(self, value):
 
-        if value.role != 'S':
-            raise serializers.ValidationError("Selected user must have student role")
-        
-        if self.instance and value != self.instance.user :
-            raise serializers.ValidationError("Cannot change the user of an existing profile")
-        
-        return value
-    
-    def validate_school(self, value):
-        StudentProfileService.validate_school_change(value, self.instance, 
-                                                   self.context.get('request').user if self.context.get('request') else None)
-        return value
-        
     @transaction.atomic
     def create(self, validated_data):
-        """Create Profile student with user from request"""
-        return StudentProfileService.create_student_profile(validated_data, self.context.get('request').user)
-    
+        request = self.context.get('request')
+        return StudentProfileService.create_student_profile(validated_data, request.user)
+
     @transaction.atomic
     def update(self, instance, validated_data):
-        """Update Profile student with user from request"""
         return StudentProfileService.update_student_profile(instance, validated_data)
-    
 
 #This Serializer For Model Lesson
 class LessonSerializer(serializers.ModelSerializer):
@@ -856,7 +862,6 @@ class VehicleSerializer(serializers.ModelSerializer):
         
         return vehicle
     
-    
 # this Serailizer For Model Schedule
 class ScheduleSerializer(serializers.ModelSerializer):
     lesson_title = serializers.CharField(source='lesson.title', read_only=True)
@@ -898,7 +903,7 @@ class ScheduleSerializer(serializers.ModelSerializer):
 
         # Get request user safely
         request_user = request.user if request and hasattr(request, 'user') else None
-
+ 
         # Use ScheduleService for validation
         if self.instance is None:  # Creation
             ScheduleService.validate_schedule_creation(
@@ -951,12 +956,13 @@ class AchievementSerializer(serializers.ModelSerializer):
     student_name = serializers.CharField(source='student.user.username', read_only=True)
     student_email = serializers.CharField(source='student.user.email', read_only=True)
     school_name = serializers.CharField(source='student.school.name', read_only=True)
+    student_role = serializers.CharField(source='student.user.role', read_only=True)
 
     class Meta:
         model = Achievement
         fields = [
             'id', 'student', 'student_name', 'student_email', 'school_name',
-            'type', 'title', 'description', 'icon', 'earned_at', 'points'
+            'type', 'title', 'description', 'icon', 'earned_at', 'points','student_role',
         ]
         read_only_fields = [
             'id', 'student_name', 'student_email', 'school_name', 'earned_at'
@@ -1006,7 +1012,6 @@ class AchievementSerializer(serializers.ModelSerializer):
         validated_data.pop('student', None)
         return super().update(instance, validated_data)
     
-
 # ========== SCHOOL ANALYTICS SERIALIZER ==========
 class SchoolAnalyticsSerializer(serializers.ModelSerializer):
     school_name = serializers.CharField(source='school.name', read_only=True)
@@ -1104,7 +1109,6 @@ class SchoolAnalyticsSerializer(serializers.ModelSerializer):
 
         return instance
 
-
 # ========== COMMUNICATION TEMPLATE SERIALIZER ==========
 class CommunicationTemplateSerializer(serializers.ModelSerializer):
     school_name = serializers.CharField(source='school.name', read_only=True)
@@ -1201,7 +1205,6 @@ class CommunicationTemplateSerializer(serializers.ModelSerializer):
         """Update template - prevent school change"""
         validated_data.pop('school', None)
         return super().update(instance, validated_data)
-
 
 # ========== AUTOMATED MESSAGE SERIALIZER ==========
 class AutomatedMessageSerializer(serializers.ModelSerializer):

@@ -6,7 +6,7 @@ from django.db.models import Avg, Count, Sum, Q
 from .models import (SchoolAnalytics, StudentProfile, Lesson, 
                      Feedback, Attendance, Schedule, Vehicle, StudentDocument,
                      SubscriptionPlan, SchoolSubscription, AutomatedMessage, CommunicationTemplate,
-                     StudentPerformancePrediction, User, DrivingSchool)
+                     StudentPerformancePrediction, User, DrivingSchool, Enrollment)
 from django.db import transaction
 from django.db.models import Count, Avg, Sum, Max,Q, F, ExpressionWrapper, FloatField
 from django.core.cache import cache
@@ -21,17 +21,93 @@ from io import BytesIO
 import cloudinary.uploader
 import cloudinary.api
 import re
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
 
-
 class StudentProfileService:
-    """Handle all StudentProfile business logic and operations"""
-    
+    MAX_IMAGE_SIZE_MB = 5
+    MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
+    ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp']
     # Configuration
     THEORY_TARGET_HOURS = 50
     DRIVING_TARGET_HOURS = 40
+    
+    @staticmethod
+    def get_profile_picture_url(student_profile) -> Optional[str]:
+        """
+        Get Cloudinary URL for profile picture.
+        ✅ No request needed — Cloudinary URLs are already absolute.
+        """
+        if not student_profile.picture_profile:
+            return None
+        try:
+            # CloudinaryField.url returns the full https://res.cloudinary.com/... URL
+            return student_profile.picture_profile.url
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_thumbnail_url(student_profile, width=150, height=150) -> Optional[str]:
+        """Get resized thumbnail URL via Cloudinary transformations"""
+        if not student_profile.picture_profile:
+            return None
+        try:
+            return cloudinary.CloudinaryImage(
+                student_profile.picture_profile.public_id
+            ).build_url(
+                width=width,
+                height=height,
+                crop='fill',
+                gravity='face',   # ✅ face-aware cropping for profile pictures
+                quality='auto:good',
+                fetch_format='auto',
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def upload_profile_picture(image_file, student_profile_id=None) -> tuple[bool, any]:
+        """
+        Upload profile picture to Cloudinary.
+        ✅ Mirrors VehicleService.upload_to_cloudinary pattern.
+        """
+        if not image_file:
+            return False, "No image provided"
+
+        # Size check
+        if image_file.size > StudentProfileService.MAX_IMAGE_SIZE_BYTES:
+            size_mb = image_file.size / (1024 * 1024)
+            return False, f"Image size ({size_mb:.1f}MB) exceeds {StudentProfileService.MAX_IMAGE_SIZE_MB}MB limit"
+
+        # Extension check
+        ext = os.path.splitext(image_file.name)[1].lower()
+        if ext not in StudentProfileService.ALLOWED_EXTENSIONS:
+            return False, f"Extension '{ext}' not allowed. Use: {', '.join(StudentProfileService.ALLOWED_EXTENSIONS)}"
+
+        try:
+            upload_options = {
+                'folder': 'student_profiles',
+                'resource_type': 'image',
+                'quality': 'auto:good',
+                'fetch_format': 'auto',
+                'eager': [
+                    # Profile thumbnail
+                    {'width': 150, 'height': 150, 'crop': 'fill',
+                     'gravity': 'face', 'quality': 'auto:good'},
+                ],
+                'eager_async': True,
+            }
+            if student_profile_id:
+                upload_options['tags'] = [f'student_profile_{student_profile_id}']
+
+            result = cloudinary.uploader.upload(image_file, **upload_options)
+            return True, result
+
+        except Exception as e:
+            return False, f"Upload failed: {str(e)}"
+
     
     @staticmethod
     def calculate_completion_percentage(student_profile) -> float:
@@ -47,8 +123,8 @@ class StudentProfileService:
             raise serializers.ValidationError({'user': 'Authentication required'})
         
         # Check user role
-        if user.role != 'S':
-            raise serializers.ValidationError({'user': 'Selected user must have student role'})
+        if user.role not in ('S', 'I'):
+            raise serializers.ValidationError({'user': 'Selected user must have student or instructor role'})
         
         # Check for existing enrollment
         if StudentProfile.objects.filter(user=user, school=school).exists():
@@ -163,19 +239,6 @@ class StudentProfileService:
         return instance
     
     @staticmethod
-    def get_profile_picture_url(student_profile, request=None) -> Optional[str]:
-        """Get full URL for profile picture"""
-        if not student_profile.picture_profile:
-            return None
-        
-        try:
-            if request:
-                return request.build_absolute_uri(student_profile.picture_profile.url)
-            return student_profile.picture_profile.url
-        except Exception:
-            return None
-    
-    @staticmethod
     def update_progress_from_attendance(student_profile, lesson_type, hours_completed) -> None:
         """Update student progress based on attendance"""
         if lesson_type == 'T':  # Theory
@@ -209,7 +272,6 @@ class StudentProfileService:
             student_profile.status = 'C'
             student_profile.completion_date = timezone.now().date()
             student_profile.save()
-
 
 class LessonService:
     """Handle all Lesson business logic and operations"""
@@ -480,8 +542,6 @@ class LessonService:
         if user.role == 'I':
             return True
         return False
-
-
 
 class ReportService:
     """
@@ -961,8 +1021,6 @@ class ReportService:
             fail_silently=False
         )
 
-
-
 class AnalyticsService:
     """Generate comprehensive school analytics and insights with performance optimizations"""
     
@@ -1074,7 +1132,6 @@ class AnalyticsService:
             raise serializers.ValidationError({
                 'average_rating': 'Average rating must be between 0 and 5'
             })
-
 
     @staticmethod
     def generate_daily_analytics(school, date=None, force_refresh=False):
@@ -1485,7 +1542,6 @@ class AnalyticsService:
             }
         }
     
- 
 class StudentProgressService:
     """Handle comprehensive student progress tracking, predictions, and interventions"""
     
@@ -1503,10 +1559,6 @@ class StudentProgressService:
         'progress_imbalance': 30,
         'weekly_hours_min': 2
     }
-
-
-
-        
 
     @staticmethod
     def calculate_days_until_completion(prediction_obj):
@@ -1592,8 +1644,7 @@ class StudentProgressService:
         try:
             student = attendance.student
             lesson = attendance.lesson
-            hours = float(attendance.hours_completed)
-            
+            hours = Decimal(str(attendance.hours_completed))            
             if not attendance.presence or hours == 0:
                 return False
             
@@ -1722,8 +1773,6 @@ class StudentProgressService:
             logger.error(f"Error calculating completion estimate for student {student.id}: {str(e)}")
             return None
         
-        
-    
     @staticmethod
     def _calculate_comprehensive_metrics(student) -> Dict:
         """Calculate comprehensive progress metrics for prediction"""
@@ -1797,7 +1846,6 @@ class StudentProgressService:
         }
     
 
-    
     @staticmethod
     def _calculate_success_probability(student, metrics: Dict) -> float:
         """Calculate comprehensive success probability using multiple factors"""
@@ -2081,7 +2129,6 @@ class StudentProgressService:
         
         return at_risk_students
 
-
 class AchievementService:
     """Award achievements based on milestones"""
     
@@ -2160,7 +2207,6 @@ class AchievementService:
             icon=rule['icon'],
             points=rule['points']
         )
-
 
 class AttendanceService:
     """Handle all Attendance business logic and operations"""
@@ -2367,30 +2413,72 @@ class AttendanceService:
 
     @staticmethod
     def _update_student_progress(student, lesson_type, hours, operation) -> None:
-        """Update student progress based on attendance"""
-        hours_float = float(hours)
+        """
+        Update student progress based on attendance.
         
+        Args:
+            student: StudentProfile instance
+            lesson_type: 'T' for theory, 'D' for driving
+            hours: Decimal or numeric value (will be converted to Decimal)
+            operation: 'add' or 'subtract'
+        """
+        # Ensure hours is Decimal
+        if not isinstance(hours, Decimal):
+            try:
+                hours = Decimal(str(hours))
+            except (TypeError, ValueError):
+                hours = Decimal('0')
+        
+        # Define target hours based on lesson type
         if lesson_type == 'T':  # Theory
+            target_hours = Decimal(str(AttendanceService.THEORY_TARGET_HOURS))
+            
             if operation == 'add':
-                student.total_hours_theory += hours_float
-                student.progress_theory = min(100, (student.total_hours_theory / AttendanceService.THEORY_TARGET_HOURS) * 100)
+                student.total_hours_theory += hours
+                # Calculate progress as Decimal, then convert to float for percentage
+                if target_hours > 0:
+                    progress_value = (student.total_hours_theory / target_hours) * 100
+                    progress_float = float(progress_value)
+                    student.progress_theory = min(Decimal('100'), Decimal(str(progress_float)))
+                else:
+                    student.progress_theory = Decimal('0')
+                    
             else:  # subtract
-                student.total_hours_theory = max(0, student.total_hours_theory - hours_float)
-                student.progress_theory = min(100, (student.total_hours_theory / AttendanceService.THEORY_TARGET_HOURS) * 100)
-                
+                student.total_hours_theory = max(Decimal('0'), student.total_hours_theory - hours)
+                if target_hours > 0:
+                    progress_value = (student.total_hours_theory / target_hours) * 100
+                    progress_float = float(progress_value)
+                    student.progress_theory = min(Decimal('100'), Decimal(str(progress_float)))
+                else:
+                    student.progress_theory = Decimal('0')
+                    
         elif lesson_type == 'D':  # Driving
+            target_hours = Decimal(str(AttendanceService.DRIVING_TARGET_HOURS))
+            
             if operation == 'add':
-                student.total_hours_driving += hours_float
-                student.progress_driving = min(100, (student.total_hours_driving / AttendanceService.DRIVING_TARGET_HOURS) * 100)
+                student.total_hours_driving += hours
+                if target_hours > 0:
+                    progress_value = (student.total_hours_driving / target_hours) * 100
+                    progress_float = float(progress_value)
+                    student.progress_driving = min(Decimal('100'), Decimal(str(progress_float)))
+                else:
+                    student.progress_driving = Decimal('0')
+                    
             else:  # subtract
-                student.total_hours_driving = max(0, student.total_hours_driving - hours_float)
-                student.progress_driving = min(100, (student.total_hours_driving / AttendanceService.DRIVING_TARGET_HOURS) * 100)
+                student.total_hours_driving = max(Decimal('0'), student.total_hours_driving - hours)
+                if target_hours > 0:
+                    progress_value = (student.total_hours_driving / target_hours) * 100
+                    progress_float = float(progress_value)
+                    student.progress_driving = min(Decimal('100'), Decimal(str(progress_float)))
+                else:
+                    student.progress_driving = Decimal('0')
         
+        # Save the updated student profile
         student.save()
         
         # Check for auto-completion
         StudentProfileService.auto_complete_student(student)
-
+        
     @staticmethod
     def get_attendance_rate(student) -> float:
         """Calculate student's overall attendance rate"""
@@ -2679,23 +2767,19 @@ class CommunicationService:
 
     @staticmethod
     def _send_single_message(message):
-        """Actually send a single message"""
         content = CommunicationService._render_template(message.template, message.student)
-        
         from django.core.mail import send_mail
         send_mail(
             subject=content['subject'],
             message=content['body'],
-            from_email='noreply@drivingschool.com',
+            from_email=settings.DEFAULT_FROM_EMAIL,  # ← uses .env value
             recipient_list=[message.student.user.email],
             fail_silently=False
         )
 
 
-
     @staticmethod
     def _render_template(template, student):
-        """Render template with student variables"""
         context = {
             'student_name': student.user.get_full_name() or student.user.username,
             'progress_theory': student.progress_theory,
@@ -2704,26 +2788,28 @@ class CommunicationService:
             'license_type': student.get_license_type_display(),
             'total_hours_theory': student.total_hours_theory,
             'total_hours_driving': student.total_hours_driving,
+            # Add the missing ones with safe defaults
+            'instructor_name': 'Your Instructor',
+            'lesson_date': 'To be scheduled',
+            'completion_date': str(student.completion_date) if student.completion_date else 'To be determined',
         }
 
         subject = template.subject
         body = template.body
 
-        # 🔎 Find all placeholders like {variable}
         placeholders = set(re.findall(r'{(\w+)}', subject + body))
-
-        # ❌ Raise error if any variable is missing
         missing_vars = placeholders - context.keys()
-        if missing_vars:
-            raise KeyError(f"Missing template variables: {', '.join(missing_vars)}")
 
-        # ✅ Replace variables
+        # ✅ Don't raise — leave unknown vars as-is so email still sends
+        if missing_vars:
+            for var in missing_vars:
+                context[var] = f'[{var}]'  # placeholder text instead of crash
+
         for key, value in context.items():
             subject = subject.replace(f'{{{key}}}', str(value))
             body = body.replace(f'{{{key}}}', str(value))
 
         return {'subject': subject, 'body': body}
-
 
     @staticmethod
     def get_message_statistics(school=None):
@@ -3330,7 +3416,6 @@ class FeedbackService:
         
         return recommendations if recommendations else ["Maintain current quality standards and monitoring"]
     
-
 class ScheduleService:
     """Handle all Schedule business logic and operations"""
     
@@ -3616,6 +3701,130 @@ class ScheduleService:
         
         return False
 
+class EnrollmentService:
+    """Handle all Enrollment business logic and operations"""
+
+    @staticmethod
+    def auto_enroll_theory_students(lesson) -> int:
+        """
+        Auto-enroll all matching active students when a Theory lesson is created.
+        Returns the number of students enrolled.
+        """
+        if lesson.lesson_type != 'T':
+            raise ValueError("auto_enroll is only for Theory lessons")
+
+        students = StudentProfile.objects.filter(
+            school=lesson.school,
+            status='A'
+        )
+
+        if lesson.target_license_type != 'A':
+            students = students.filter(license_type=lesson.target_license_type)
+
+        created = Enrollment.objects.bulk_create([
+            Enrollment(student=student, lesson=lesson)
+            for student in students
+        ], ignore_conflicts=True)
+
+        return len(created)
+
+    @staticmethod
+    def bulk_enroll_driving_students(lesson, student_ids, request_user=None) -> dict:
+        """
+        Manually enroll students into a driving lesson (max depends on lesson.max_students).
+        Returns a dict with enrolled count and remaining slots.
+        """
+        # Only for driving lessons
+        if lesson.lesson_type == 'T':
+            raise ValueError("Theory lessons are enrolled automatically")
+
+        # School owner permission check
+        if request_user and request_user.role == 'A' and not request_user.is_staff:
+            if lesson.school.owner != request_user:
+                raise PermissionError("You can only enroll students in your own school")
+
+        # Check remaining slots
+        current_count = Enrollment.objects.filter(lesson=lesson).count()
+        remaining_slots = lesson.max_students - current_count
+
+        if remaining_slots <= 0:
+            raise ValueError(f"Lesson is full. Max {lesson.max_students} student(s) allowed")
+
+        if len(student_ids) > remaining_slots:
+            raise ValueError(
+                f"Only {remaining_slots} slot(s) remaining. "
+                f"You tried to enroll {len(student_ids)}"
+            )
+
+        # Fetch valid students — must belong to same school and be active
+        students = StudentProfile.objects.filter(
+            id__in=student_ids,
+            school=lesson.school,
+            status='A'
+        )
+
+        if not students.exists():
+            raise ValueError(
+                "No valid students found. "
+                "Make sure they belong to this school and are active"
+            )
+
+        created = Enrollment.objects.bulk_create([
+            Enrollment(student=student, lesson=lesson)
+            for student in students
+        ], ignore_conflicts=True)
+
+        return {
+            'enrolled': len(created),
+            'remaining_slots': remaining_slots - len(created),
+            'students': list(students)
+        }
+
+    @staticmethod
+    def unenroll_student(lesson, student) -> None:
+        """Remove a student from a lesson enrollment"""
+        if lesson.lesson_type == 'T' and lesson.status == 'S':
+            # Allow unenroll from theory only if lesson hasn't started
+            Enrollment.objects.filter(lesson=lesson, student=student).delete()
+        elif lesson.lesson_type == 'D':
+            Enrollment.objects.filter(lesson=lesson, student=student).delete()
+        else:
+            raise ValueError("Cannot unenroll from a completed or cancelled lesson")
+
+    @staticmethod
+    def get_student_enrollments(student, upcoming_only=False):
+        """Get all enrollments for a student"""
+        queryset = Enrollment.objects.filter(
+            student=student
+        ).select_related('lesson', 'lesson__school', 'lesson__instructor')
+
+        if upcoming_only:
+            queryset = queryset.filter(
+                lesson__date__gte=timezone.now()
+            )
+
+        return queryset
+
+    @staticmethod
+    def get_lesson_enrolled_students(lesson):
+        """Get all students enrolled in a lesson"""
+        return Enrollment.objects.filter(
+            lesson=lesson
+        ).select_related('student', 'student__user')
+
+    @staticmethod
+    def is_student_enrolled(student, lesson) -> bool:
+        """Check if a specific student is enrolled in a lesson"""
+        return Enrollment.objects.filter(
+            student=student,
+            lesson=lesson
+        ).exists()
+
+    @staticmethod
+    def get_remaining_slots(lesson) -> int:
+        """Get remaining enrollment slots for a lesson"""
+        current_count = Enrollment.objects.filter(lesson=lesson).count()
+        return lesson.max_students - current_count
 
 class VehicleService:
     """Handle all Vehicle business logic and operations"""
@@ -3629,8 +3838,8 @@ class VehicleService:
     # Image validation constants
     MAX_IMAGE_SIZE_MB = 10  # Cloudinary can handle larger files
     MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
-    MIN_IMAGE_WIDTH = 800
-    MIN_IMAGE_HEIGHT = 600
+    MIN_IMAGE_WIDTH = 600
+    MIN_IMAGE_HEIGHT = 400
     MAX_IMAGE_WIDTH = 5000
     MAX_IMAGE_HEIGHT = 5000
     ALLOWED_IMAGE_FORMATS = ['JPEG', 'PNG', 'JPG', 'WEBP']

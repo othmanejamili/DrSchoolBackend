@@ -46,7 +46,6 @@ urlpatterns = [
         DrivingSchoolViewSet.as_view({'get': 'retrieve'}),
         name='drivingschool-by-name'),
 ]+ router.urls
-
 if settings.DEBUG:
     from django.conf.urls.static import static
     import debug_toolbar
