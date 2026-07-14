@@ -22,8 +22,11 @@ __pycache__/
 db.sqlite3
 /media/
 /staticfiles/
-logs
-
+/logs/
+logs/django.log
+logs/cache.log
+/logs/django.log
+/logs/cache.log
 *.http
 # IDE / OS
 .vscode/
